@@ -1,0 +1,149 @@
+/data/users/vasiliy/pytorch/torch/_dynamo/pgo.py:455: UserWarning: dynamo_pgo force disabled by torch._inductor.config.force_disable_caches
+  warn_once(
+INFO:torch._functorch._aot_autograd.jit_compile_runtime_wrappers.__aot_joint_graph:TRACED GRAPH
+ ===== Joint graph 0 =====
+ /data/users/vasiliy/pytorch/torch/fx/_lazy_graph_module.py class joint_helper(torch.nn.Module):
+    def forward(self, primals, tangents):
+        primals_1: "bf16[8192, 4096][4096, 1]cuda:0"; primals_2: "bf16[2048, 4096][4096, 1]cuda:0"; tangents_1: "bf16[2048, 8192][8192, 1]cuda:0";
+
+        primals_1, primals_2, tangents_1, = fx_pytree.tree_flatten_spec([primals, tangents], self._in_spec)
+         # File: /data/users/vasiliy/ao/torchao/float8/float8_linear.py:335 in forward, code: weight_maybe_fp8_t = self.weight.t()
+        permute: "bf16[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.permute.default(primals_1, [1, 0]);  primals_1 = None
+
+         # File: /data/users/vasiliy/ao/torchao/float8/float8_linear.py:364 in forward, code: output = matmul_with_hp_or_float8_args.apply(
+        abs_1: "bf16[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.abs.default(primals_2)
+        max_1: "bf16[][]cuda:0" = torch.ops.aten.max.default(abs_1);  abs_1 = None
+        convert_element_type: "f64[][]cuda:0" = torch.ops.prims.convert_element_type.default(max_1, torch.float64);  max_1 = None
+        clamp_min: "f64[][]cuda:0" = torch.ops.aten.clamp_min.default(convert_element_type, 1e-12);  convert_element_type = None
+        reciprocal: "f64[][]cuda:0" = torch.ops.aten.reciprocal.default(clamp_min);  clamp_min = None
+        mul: "f64[][]cuda:0" = torch.ops.aten.mul.Tensor(reciprocal, 448.0);  reciprocal = None
+        convert_element_type_1: "f32[][]cuda:0" = torch.ops.prims.convert_element_type.default(mul, torch.float32);  mul = None
+        convert_element_type_2: "f32[2048, 4096][4096, 1]cuda:0" = torch.ops.prims.convert_element_type.default(primals_2, torch.float32)
+        mul_1: "f32[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.mul.Tensor(convert_element_type_2, convert_element_type_1);  convert_element_type_2 = None
+        clamp_min_1: "f32[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.clamp_min.default(mul_1, -448.0);  mul_1 = None
+        clamp_max: "f32[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.clamp_max.default(clamp_min_1, 448.0);  clamp_min_1 = None
+        convert_element_type_3: "f8e4m3fn[2048, 4096][4096, 1]cuda:0" = torch.ops.prims.convert_element_type.default(clamp_max, torch.float8_e4m3fn);  clamp_max = None
+        abs_2: "bf16[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.abs.default(permute)
+        max_2: "bf16[][]cuda:0" = torch.ops.aten.max.default(abs_2);  abs_2 = None
+        convert_element_type_4: "f64[][]cuda:0" = torch.ops.prims.convert_element_type.default(max_2, torch.float64);  max_2 = None
+        clamp_min_2: "f64[][]cuda:0" = torch.ops.aten.clamp_min.default(convert_element_type_4, 1e-12);  convert_element_type_4 = None
+        reciprocal_1: "f64[][]cuda:0" = torch.ops.aten.reciprocal.default(clamp_min_2);  clamp_min_2 = None
+        mul_2: "f64[][]cuda:0" = torch.ops.aten.mul.Tensor(reciprocal_1, 448.0);  reciprocal_1 = None
+        convert_element_type_5: "f32[][]cuda:0" = torch.ops.prims.convert_element_type.default(mul_2, torch.float32);  mul_2 = None
+        convert_element_type_6: "f32[4096, 8192][1, 4096]cuda:0" = torch.ops.prims.convert_element_type.default(permute, torch.float32)
+        mul_3: "f32[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.mul.Tensor(convert_element_type_6, convert_element_type_5);  convert_element_type_6 = None
+        clamp_min_3: "f32[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.clamp_min.default(mul_3, -448.0);  mul_3 = None
+        clamp_max_1: "f32[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.clamp_max.default(clamp_min_3, 448.0);  clamp_min_3 = None
+        convert_element_type_7: "f8e4m3fn[4096, 8192][1, 4096]cuda:0" = torch.ops.prims.convert_element_type.default(clamp_max_1, torch.float8_e4m3fn);  clamp_max_1 = None
+        view: "f8e4m3fn[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.view.default(convert_element_type_3, [-1, 4096]);  convert_element_type_3 = None
+        reciprocal_2: "f32[][]cuda:0" = torch.ops.aten.reciprocal.default(convert_element_type_1);  convert_element_type_1 = None
+        reciprocal_3: "f32[][]cuda:0" = torch.ops.aten.reciprocal.default(convert_element_type_5);  convert_element_type_5 = None
+        _scaled_mm: "bf16[2048, 8192][8192, 1]cuda:0" = torch.ops.aten._scaled_mm.default(view, convert_element_type_7, reciprocal_2, reciprocal_3, None, None, torch.bfloat16, True);  view = convert_element_type_7 = reciprocal_2 = reciprocal_3 = None
+        view_1: "bf16[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.view.default(_scaled_mm, [2048, 8192]);  _scaled_mm = None
+        view_2: "bf16[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.view.default(tangents_1, [-1, 8192]);  tangents_1 = None
+        abs_3: "bf16[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.abs.default(view_2)
+        max_3: "bf16[][]cuda:0" = torch.ops.aten.max.default(abs_3);  abs_3 = None
+        convert_element_type_8: "f64[][]cuda:0" = torch.ops.prims.convert_element_type.default(max_3, torch.float64);  max_3 = None
+        clamp_min_4: "f64[][]cuda:0" = torch.ops.aten.clamp_min.default(convert_element_type_8, 1e-12);  convert_element_type_8 = None
+        reciprocal_4: "f64[][]cuda:0" = torch.ops.aten.reciprocal.default(clamp_min_4);  clamp_min_4 = None
+        mul_4: "f64[][]cuda:0" = torch.ops.aten.mul.Tensor(reciprocal_4, 57344.0);  reciprocal_4 = None
+        convert_element_type_9: "f32[][]cuda:0" = torch.ops.prims.convert_element_type.default(mul_4, torch.float32);  mul_4 = None
+        convert_element_type_10: "f32[2048, 8192][8192, 1]cuda:0" = torch.ops.prims.convert_element_type.default(view_2, torch.float32)
+        mul_5: "f32[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.mul.Tensor(convert_element_type_10, convert_element_type_9);  convert_element_type_10 = None
+        clamp_min_5: "f32[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.clamp_min.default(mul_5, -57344.0);  mul_5 = None
+        clamp_max_2: "f32[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.clamp_max.default(clamp_min_5, 57344.0);  clamp_min_5 = None
+        convert_element_type_11: "f8e5m2[2048, 8192][8192, 1]cuda:0" = torch.ops.prims.convert_element_type.default(clamp_max_2, torch.float8_e5m2);  clamp_max_2 = None
+        abs_4: "bf16[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.abs.default(permute)
+        max_4: "bf16[][]cuda:0" = torch.ops.aten.max.default(abs_4);  abs_4 = None
+        convert_element_type_12: "f64[][]cuda:0" = torch.ops.prims.convert_element_type.default(max_4, torch.float64);  max_4 = None
+        clamp_min_6: "f64[][]cuda:0" = torch.ops.aten.clamp_min.default(convert_element_type_12, 1e-12);  convert_element_type_12 = None
+        reciprocal_5: "f64[][]cuda:0" = torch.ops.aten.reciprocal.default(clamp_min_6);  clamp_min_6 = None
+        mul_6: "f64[][]cuda:0" = torch.ops.aten.mul.Tensor(reciprocal_5, 448.0);  reciprocal_5 = None
+        convert_element_type_13: "f32[][]cuda:0" = torch.ops.prims.convert_element_type.default(mul_6, torch.float32);  mul_6 = None
+        convert_element_type_14: "f32[4096, 8192][1, 4096]cuda:0" = torch.ops.prims.convert_element_type.default(permute, torch.float32);  permute = None
+        mul_7: "f32[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.mul.Tensor(convert_element_type_14, convert_element_type_13);  convert_element_type_14 = None
+        clamp_min_7: "f32[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.clamp_min.default(mul_7, -448.0);  mul_7 = None
+        clamp_max_3: "f32[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.clamp_max.default(clamp_min_7, 448.0);  clamp_min_7 = None
+        convert_element_type_15: "f8e4m3fn[4096, 8192][1, 4096]cuda:0" = torch.ops.prims.convert_element_type.default(clamp_max_3, torch.float8_e4m3fn);  clamp_max_3 = None
+        permute_1: "f8e4m3fn[8192, 4096][4096, 1]cuda:0" = torch.ops.aten.permute.default(convert_element_type_15, [1, 0]);  convert_element_type_15 = None
+        permute_2: "f8e4m3fn[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.permute.default(permute_1, [1, 0]);  permute_1 = None
+        clone: "f8e4m3fn[4096, 8192][8192, 1]cuda:0" = torch.ops.aten.clone.default(permute_2, memory_format = torch.contiguous_format);  permute_2 = None
+        permute_3: "f8e4m3fn[8192, 4096][1, 8192]cuda:0" = torch.ops.aten.permute.default(clone, [1, 0]);  clone = None
+        reciprocal_6: "f32[][]cuda:0" = torch.ops.aten.reciprocal.default(convert_element_type_9);  convert_element_type_9 = None
+        reciprocal_7: "f32[][]cuda:0" = torch.ops.aten.reciprocal.default(convert_element_type_13);  convert_element_type_13 = None
+        _scaled_mm_1: "bf16[2048, 4096][4096, 1]cuda:0" = torch.ops.aten._scaled_mm.default(convert_element_type_11, permute_3, reciprocal_6, reciprocal_7, None, None, torch.bfloat16);  convert_element_type_11 = permute_3 = reciprocal_6 = reciprocal_7 = None
+        view_3: "bf16[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.view.default(_scaled_mm_1, [2048, 4096]);  _scaled_mm_1 = None
+        view_4: "bf16[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.view.default(primals_2, [-1, 4096]);  primals_2 = None
+        abs_5: "bf16[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.abs.default(view_2)
+        max_5: "bf16[][]cuda:0" = torch.ops.aten.max.default(abs_5);  abs_5 = None
+        convert_element_type_16: "f64[][]cuda:0" = torch.ops.prims.convert_element_type.default(max_5, torch.float64);  max_5 = None
+        clamp_min_8: "f64[][]cuda:0" = torch.ops.aten.clamp_min.default(convert_element_type_16, 1e-12);  convert_element_type_16 = None
+        reciprocal_8: "f64[][]cuda:0" = torch.ops.aten.reciprocal.default(clamp_min_8);  clamp_min_8 = None
+        mul_8: "f64[][]cuda:0" = torch.ops.aten.mul.Tensor(reciprocal_8, 57344.0);  reciprocal_8 = None
+        convert_element_type_17: "f32[][]cuda:0" = torch.ops.prims.convert_element_type.default(mul_8, torch.float32);  mul_8 = None
+        convert_element_type_18: "f32[2048, 8192][8192, 1]cuda:0" = torch.ops.prims.convert_element_type.default(view_2, torch.float32);  view_2 = None
+        mul_9: "f32[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.mul.Tensor(convert_element_type_18, convert_element_type_17);  convert_element_type_18 = None
+        clamp_min_9: "f32[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.clamp_min.default(mul_9, -57344.0);  mul_9 = None
+        clamp_max_4: "f32[2048, 8192][8192, 1]cuda:0" = torch.ops.aten.clamp_max.default(clamp_min_9, 57344.0);  clamp_min_9 = None
+        convert_element_type_19: "f8e5m2[2048, 8192][8192, 1]cuda:0" = torch.ops.prims.convert_element_type.default(clamp_max_4, torch.float8_e5m2);  clamp_max_4 = None
+        abs_6: "bf16[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.abs.default(view_4)
+        max_6: "bf16[][]cuda:0" = torch.ops.aten.max.default(abs_6);  abs_6 = None
+        convert_element_type_20: "f64[][]cuda:0" = torch.ops.prims.convert_element_type.default(max_6, torch.float64);  max_6 = None
+        clamp_min_10: "f64[][]cuda:0" = torch.ops.aten.clamp_min.default(convert_element_type_20, 1e-12);  convert_element_type_20 = None
+        reciprocal_9: "f64[][]cuda:0" = torch.ops.aten.reciprocal.default(clamp_min_10);  clamp_min_10 = None
+        mul_10: "f64[][]cuda:0" = torch.ops.aten.mul.Tensor(reciprocal_9, 448.0);  reciprocal_9 = None
+        convert_element_type_21: "f32[][]cuda:0" = torch.ops.prims.convert_element_type.default(mul_10, torch.float32);  mul_10 = None
+        convert_element_type_22: "f32[2048, 4096][4096, 1]cuda:0" = torch.ops.prims.convert_element_type.default(view_4, torch.float32);  view_4 = None
+        mul_11: "f32[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.mul.Tensor(convert_element_type_22, convert_element_type_21);  convert_element_type_22 = None
+        clamp_min_11: "f32[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.clamp_min.default(mul_11, -448.0);  mul_11 = None
+        clamp_max_5: "f32[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.clamp_max.default(clamp_min_11, 448.0);  clamp_min_11 = None
+        convert_element_type_23: "f8e4m3fn[2048, 4096][4096, 1]cuda:0" = torch.ops.prims.convert_element_type.default(clamp_max_5, torch.float8_e4m3fn);  clamp_max_5 = None
+        permute_4: "f8e5m2[8192, 2048][1, 8192]cuda:0" = torch.ops.aten.permute.default(convert_element_type_19, [1, 0]);  convert_element_type_19 = None
+        clone_1: "f8e5m2[8192, 2048][2048, 1]cuda:0" = torch.ops.aten.clone.default(permute_4, memory_format = torch.contiguous_format);  permute_4 = None
+        permute_5: "f8e4m3fn[4096, 2048][1, 4096]cuda:0" = torch.ops.aten.permute.default(convert_element_type_23, [1, 0]);  convert_element_type_23 = None
+        clone_2: "f8e4m3fn[4096, 2048][2048, 1]cuda:0" = torch.ops.aten.clone.default(permute_5, memory_format = torch.contiguous_format);  permute_5 = None
+        permute_6: "f8e4m3fn[2048, 4096][1, 2048]cuda:0" = torch.ops.aten.permute.default(clone_2, [1, 0]);  clone_2 = None
+        reciprocal_10: "f32[][]cuda:0" = torch.ops.aten.reciprocal.default(convert_element_type_17);  convert_element_type_17 = None
+        reciprocal_11: "f32[][]cuda:0" = torch.ops.aten.reciprocal.default(convert_element_type_21);  convert_element_type_21 = None
+        _scaled_mm_2: "bf16[8192, 4096][4096, 1]cuda:0" = torch.ops.aten._scaled_mm.default(clone_1, permute_6, reciprocal_10, reciprocal_11, None, None, torch.bfloat16);  clone_1 = permute_6 = reciprocal_10 = reciprocal_11 = None
+        permute_7: "bf16[4096, 8192][1, 4096]cuda:0" = torch.ops.aten.permute.default(_scaled_mm_2, [1, 0]);  _scaled_mm_2 = None
+
+         # File: /data/users/vasiliy/ao/torchao/float8/float8_linear.py:335 in forward, code: weight_maybe_fp8_t = self.weight.t()
+        permute_8: "bf16[8192, 4096][4096, 1]cuda:0" = torch.ops.aten.permute.default(permute_7, [1, 0]);  permute_7 = None
+        return pytree.tree_unflatten([view_1, permute_8, view_3], self._out_spec)
+
+
+Compile is set to       | True
+model_type is set to    | linear
+scaling_repr is set to  | dyn_dyn_dyn
+enable_activation_checkpointing is set to False
+profiling float8
+saved profiling trace to /home/vasiliy/local/tmp/20241230_test_linear_float8_compile_True_dyn_dyn_dyn.json
+Sync time ms: 0.0
+
+Summary of GPU time by CPU kernel
+
+    experiment  ... bw_gpbs
+7    1_float8  ...    None
+2    1_float8  ...    None
+8    1_float8  ...    None
+6    1_float8  ...    None
+11   1_float8  ...    None
+0    1_float8  ...    None
+10   1_float8  ...    None
+5    1_float8  ...    None
+1    1_float8  ...    None
+3    1_float8  ...    None
+4    1_float8  ...    None
+9    1_float8  ...    None
+
+[12 rows x 6 columns]
+
+Summary of time (ms) by kernel category
+
+ experiment     1_float8
+category
+0_gemm            0.361
+1_f8_overhead     0.461
+2_other           0.015
+All               0.838
