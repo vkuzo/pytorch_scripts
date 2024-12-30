@@ -12,6 +12,9 @@ fname = 'input_aot_graphs.txt'
 # aot_joint_graph and aot_graphs
 fname = 'input_aot_joint_graph_and_aot_graphs.txt'
 
+# also output_code
+fname = 'input_aot_joint_graph_aot_graphs_output_code.txt'
+
 def parse_graph(
     list_of_lines: List[str],
     start_idx: int,
@@ -157,6 +160,7 @@ def fname_to_graphs(
 
         cur_captured_graph_id = None
         joint_start_idx, forward_start_idx, backward_start_idx, end_idx = None, None, None, None
+        triton_start_idx, triton_end_idx = None, None
 
         for idx, line in enumerate(lines):
 
@@ -199,30 +203,80 @@ def fname_to_graphs(
                 joint_start_idx, forward_start_idx, backward_start_idx, end_idx = None, None, None, None
                 continue
 
-            # End of aot_forward or aot_backward
+            # End of aot_forward or aot_backward or triton kernel wrappers
             end_of_aot_forward_graph_re = re.compile('.*return \(.*\)')
             if end_of_aot_forward_graph_re.match(line):
                 end_idx = idx
                 if forward_start_idx is not None:
                     aot_graph_id_to_graphs[cur_captured_graph_id]['forward'] = forward_start_idx, end_idx
-                else:
-                    assert backward_start_idx is not None
+                elif backward_start_idx is not None:
                     aot_graph_id_to_graphs[cur_captured_graph_id]['backward'] = backward_start_idx, end_idx
+                else:
+                    # triton kernel wrappers, for now we skip these
+                    pass
                 cur_captured_graph_id = None
                 joint_start_idx, forward_start_idx, backward_start_idx, end_idx = None, None, None, None
                 continue
 
+            # TODO(next): save the aot_id and fwd/bwd to triton graph fragments and maybe kernels,
+            # and display correspondence
+
+            # triton kernel to aot_id fwd/bwd mapping
+            # # AOT ID: ['0_forward']
+            triton_to_aot_id = re.compile('# AOT ID: \[(.*)\]')
+            res = triton_to_aot_id.match(line)
+            if res:
+                contents = res.group(1).replace("'", "").split('_')
+                aot_id, fwd_or_bwd = contents
+                print('aot_id', contents, aot_id, fwd_or_bwd)
+
+            # Start of triton kernel graph fragment
+            # Graph fragment:
+            start_of_triton_graph_fragment = re.compile('.*Graph fragment.*')
+            if start_of_triton_graph_fragment.match(line):
+                print('triton start', idx)
+
+
+            # End of triton kernel graph fragment
+            # triton_red_fused_abs_max_0 = async_compile.triton('triton_red_fused_abs_max_0', '''
+            end_of_triton_graph_fragment = re.compile('.* = async_compile.triton.*')
+            if end_of_triton_graph_fragment.match(line):
+                print('triton end', idx)
+
     print(aot_graph_id_to_graphs)
+    return
 
-    # aot_graph = parse_graph(lines, start_idx, end_idx)
+    joint_graph, forward_graph, backward_graph = None, None, None
 
-    for name in ('joint', 'forward', 'backward'):
-        print(name)
-        if name not in aot_graph_id_to_graphs['0']:
-            continue
-        start_idx, end_idx = aot_graph_id_to_graphs['0'][name]
-        graph = parse_graph(lines, start_idx, end_idx)
-        create_aot_joint_graph_diagram(graph, name)
+    # parse the graphs, if present
+    # TODO handle multiple joint graphs per log file
+    if 'joint' in aot_graph_id_to_graphs['0']:
+        start_idx, end_idx = aot_graph_id_to_graphs['0']['joint']
+        joint_graph = parse_graph(lines, start_idx, end_idx)
+    if 'forward' in aot_graph_id_to_graphs['0']:
+        start_idx, end_idx = aot_graph_id_to_graphs['0']['forward']
+        forward_graph = parse_graph(lines, start_idx, end_idx)
+    if 'backward' in aot_graph_id_to_graphs['0']:
+        start_idx, end_idx = aot_graph_id_to_graphs['0']['backward']
+        backward_graph = parse_graph(lines, start_idx, end_idx)
+
+    # create correspondence maps between joint, forward and backward, if applicable
+    # TODO do we need to handle multiple fwd/bwd per joint graph?
+    category_to_node_names = {}
+    if joint_graph is not None and forward_graph is not None and backward_graph is not None:
+        forward_node_names = forward_graph['nodes'].keys()
+        backward_node_names = backward_graph['nodes'].keys()
+        category_to_node_names = {
+            'forward': forward_node_names,
+            'backward': backward_node_names,
+        }
+
+    if joint_graph is not None:
+        create_diagram(joint_graph, 'joint', category_to_node_names)
+    if forward_graph is not None:
+        create_diagram(forward_graph, 'forward')
+    if backward_graph is not None:
+        create_diagram(backward_graph, 'backward')
 
 def shorten_func_name(s):
     """
@@ -234,11 +288,23 @@ def shorten_func_name(s):
     s = s.replace('.default', '')
     return s
 
-def create_aot_joint_graph_diagram(g, out_filename):
-    print('here')
+name_to_color = {
+    'forward': 'blue',
+    'backward': 'red',
+}
+
+def create_diagram(g, out_filename, category_to_node_names=None):
+    print('create_diagram', out_filename)
 
     dot = Digraph(comment='aot_joint_graph')
     dot.attr(fontsize='9')
+
+    # convert from category -> node_name to node_name -> {categories}
+    node_name_to_categories = defaultdict(list)
+    if category_to_node_names is not None:
+        for category, node_names in category_to_node_names.items():
+            for node_name in node_names:
+                node_name_to_categories[node_name].append(category)
 
     # Add the start nodes
     dot.node('input', 'input', shape='oval')
@@ -248,10 +314,23 @@ def create_aot_joint_graph_diagram(g, out_filename):
 
     # Add the intermediate nodes
     for node_name, (func_name, args) in g['nodes'].items():
+
+        category_str = ""
+        if False:
+            # TODO(future): currently this match is slightly incorrect because the
+            # node names can differ between joint and fwd/bwd graphs, so lets
+            # not display it
+            categories = node_name_to_categories[node_name]
+            for category in categories:
+                color = name_to_color[category]
+                category_str += f"<font color='{color}'>{category}</font>"
         # Add the node
         # use HTML syntax to make things easier to read
-        node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}>"
-        dot.node(node_name, node_comment, shape='rectangle')
+        node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}<br/>{category_str}>"
+        fillcolor='white'
+        for category in categories:
+            pass
+        dot.node(node_name, node_comment, shape='rectangle', color='black')
 
         # Add edges to args
         for arg_name in args:
