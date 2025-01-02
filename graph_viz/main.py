@@ -35,9 +35,9 @@ def parse_graph(
     #   'outputs': ['output0, ...]
     # }
     g = {
-        'inputs': None,
+        'inputs': [],
         'nodes': {},
-        'outputs': None,
+        'outputs': [],
     }
 
     for line in list_of_lines[start_idx:end_idx+1]:
@@ -115,6 +115,91 @@ def parse_graph(
 
     return g
 
+def parse_triton_graph(
+    list_of_lines: List[str],
+    start_idx: int,
+    end_idx: int,
+):
+    # format:
+    # {
+    #   'inputs': ['input0', ...],
+    #   'nodes': {
+    #     'node_n': ['func', ['arg_0', 'arg_1']],
+    #     ...
+    #   },
+    #   'outputs': ['output0, ...]
+    # }
+    g = {
+        'inputs': [],
+        'nodes': {},
+        'outputs': [],
+    }
+
+    for line in list_of_lines[start_idx:end_idx+1]:
+        # %mul : [num_users=1] = call_function[target=torch.ops.aten.mul.Tensor](args = (%reciprocal, 448.0), kwargs = {})
+        # TODO also parse kwargs
+        triton_graph_re = re.compile('#   (\%.*)+ : .*args = \((.*)\), kwargs.*')
+        res = triton_graph_re.search(line)
+        if res:
+            target_node = res.group(1).replace('%', '')
+            args = res.group(2).split(', ')
+            args = [s.replace('%', '').replace(',', '') for s in args]
+
+            g['nodes'][target_node] = ['', args]
+            # TODO future parse the func as well
+            # TODO(future): inputs and outputs
+
+    # populate the inputs and outputs by:
+    # 1. for each node n, count the number of parent and children nodes
+    # 2. for each node n with 0 parents, add it to inputs
+    # 3. for each node n with 0 children, add it to outputs
+    # note that for joint/fwd/bwd graph we parse inputs/outputs from the graph
+    # printout, but for triton kernels we only have the graph fragment so we
+    # have to resort to this hack
+
+    # B: '', [A]
+    # C: '', [A, B]
+    # D: '', [C]
+    # traversing B: A add one child, B add one parent
+    # traversing C: A and B add one child, C add one parent
+    # traversing D: C add one child, D add one parent
+
+    # TODO(future): make this also handle kwargs
+    node_name_to_num_parents_children = defaultdict(lambda: [0, 0])
+    for node_name, (func, args) in g['nodes'].items():
+        for arg in args:
+            # increment child counter
+            node_name_to_num_parents_children[arg][1] += 1
+        # increment parent counter
+        node_name_to_num_parents_children[node_name][0] += len(args)
+
+    inputs = []
+    outputs = []
+    starts_with_az = re.compile('^[a-zA-Z]+.*')
+    for node_name, (num_parents, num_children) in node_name_to_num_parents_children.items():
+
+        # Currently args can be variables (foo_1), numbers (1e12), torch constants (torch.bfloat16), etc
+        # we don't know which one because this is all done with string parsing. For now,
+        # do a hacky filter of vars only by restricting the first character to be a-zA-Z, and discarding
+        # the things that look like `torch.`.  This is pretty brittle.
+        if not(
+            starts_with_az.search(node_name)
+            and not node_name.startswith('torch')
+            and not node_name == 'None'
+        ):
+            continue
+        if num_parents == 0:
+            inputs.append(node_name)
+        elif num_children == 0:
+            outputs.append(node_name)
+
+    g['inputs'] = inputs
+    g['outputs'] = outputs
+
+    # verify captured information is valid
+    assert len(g['nodes']) > 0
+    return g
+
 def fname_to_graphs(
     fname: str,
 ):
@@ -161,6 +246,18 @@ def fname_to_graphs(
         cur_captured_graph_id = None
         joint_start_idx, forward_start_idx, backward_start_idx, end_idx = None, None, None, None
         triton_start_idx, triton_end_idx = None, None
+
+        # {
+        #   '0': {
+        #     'forward': [[123, 126, None], [128, 134, None], ...],
+        #     'backward': [[245, 256, None], ...]
+        #   },
+        # }
+        #
+        # The `None` entries are for the parsed graphs, which will be filled in later
+        graph_id_to_fwdbwd_to_triton_idxs_and_graphs = defaultdict(lambda: defaultdict(list))
+
+        cur_aot_id, cur_fwd_bwd = None, None
 
         for idx, line in enumerate(lines):
 
@@ -228,23 +325,22 @@ def fname_to_graphs(
             if res:
                 contents = res.group(1).replace("'", "").split('_')
                 aot_id, fwd_or_bwd = contents
-                print('aot_id', contents, aot_id, fwd_or_bwd)
+                cur_aot_id = aot_id
+                cur_fwd_bwd = fwd_or_bwd
 
             # Start of triton kernel graph fragment
             # Graph fragment:
             start_of_triton_graph_fragment = re.compile('.*Graph fragment.*')
             if start_of_triton_graph_fragment.match(line):
-                print('triton start', idx)
-
+                triton_start_idx = idx
 
             # End of triton kernel graph fragment
             # triton_red_fused_abs_max_0 = async_compile.triton('triton_red_fused_abs_max_0', '''
             end_of_triton_graph_fragment = re.compile('.* = async_compile.triton.*')
             if end_of_triton_graph_fragment.match(line):
-                print('triton end', idx)
+                triton_end_idx = idx
 
-    print(aot_graph_id_to_graphs)
-    return
+                graph_id_to_fwdbwd_to_triton_idxs_and_graphs[cur_aot_id][cur_fwd_bwd].append([triton_start_idx, triton_end_idx, None])
 
     joint_graph, forward_graph, backward_graph = None, None, None
 
@@ -260,23 +356,35 @@ def fname_to_graphs(
         start_idx, end_idx = aot_graph_id_to_graphs['0']['backward']
         backward_graph = parse_graph(lines, start_idx, end_idx)
 
-    # create correspondence maps between joint, forward and backward, if applicable
-    # TODO do we need to handle multiple fwd/bwd per joint graph?
-    category_to_node_names = {}
-    if joint_graph is not None and forward_graph is not None and backward_graph is not None:
-        forward_node_names = forward_graph['nodes'].keys()
-        backward_node_names = backward_graph['nodes'].keys()
-        category_to_node_names = {
-            'forward': forward_node_names,
-            'backward': backward_node_names,
-        }
+    # triton kernels
+    if 'forward' in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']:
+        for entry in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['forward']:
+            start_idx, end_idx, _ = entry
+            triton_graph = parse_triton_graph(lines, start_idx, end_idx)
+            entry[2] = triton_graph
 
     if joint_graph is not None:
-        create_diagram(joint_graph, 'joint', category_to_node_names)
+        create_diagram(
+            [joint_graph],
+            'joint',
+        )
     if forward_graph is not None:
-        create_diagram(forward_graph, 'forward')
+        create_diagram(
+            [forward_graph],
+            'forward',
+            triton_idxs_and_graphs=graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['forward']
+        )
     if backward_graph is not None:
-        create_diagram(backward_graph, 'backward')
+        create_diagram(
+            [backward_graph],
+            'backward',
+        )
+
+    triton_forward_graphs = [g for _, __, g in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['forward']]
+    create_diagram(
+        triton_forward_graphs,
+        'triton_forward',
+    )
 
 def shorten_func_name(s):
     """
@@ -288,59 +396,59 @@ def shorten_func_name(s):
     s = s.replace('.default', '')
     return s
 
-name_to_color = {
-    'forward': 'blue',
-    'backward': 'red',
-}
-
-def create_diagram(g, out_filename, category_to_node_names=None):
+def create_diagram(
+    graphs,
+    out_filename,
+    triton_idxs_and_graphs=None,
+):
     print('create_diagram', out_filename)
+    print(triton_idxs_and_graphs)
 
     dot = Digraph(comment='aot_joint_graph')
-    dot.attr(fontsize='9')
+    # dot.attr(fontsize='9')
+    dot.attr(label=out_filename)
+    dot.attr(labelloc='t')
 
-    # convert from category -> node_name to node_name -> {categories}
-    node_name_to_categories = defaultdict(list)
-    if category_to_node_names is not None:
-        for category, node_names in category_to_node_names.items():
-            for node_name in node_names:
-                node_name_to_categories[node_name].append(category)
+    for g_idx, g in enumerate(graphs):
 
-    # Add the start nodes
-    dot.node('input', 'input', shape='oval')
-    for input_name in g['inputs']:
-        dot.node(input_name, input_name, shape='oval')
-        dot.edge('input', input_name, '')
+        # note: subgraph name must start with cluster_ for graphviz to render a border
+        with dot.subgraph(name=f"cluster_{str(g_idx)}") as c:
+            c.attr(label=f"label: {str(g_idx)}\nasdfasdf\nasdfasd")
 
-    # Add the intermediate nodes
-    for node_name, (func_name, args) in g['nodes'].items():
+            # 'b' is label at the bottom of subgraph, 't' is at top
+            c.attr(labelloc='b')
 
-        category_str = ""
-        if False:
-            # TODO(future): currently this match is slightly incorrect because the
-            # node names can differ between joint and fwd/bwd graphs, so lets
-            # not display it
-            categories = node_name_to_categories[node_name]
-            for category in categories:
-                color = name_to_color[category]
-                category_str += f"<font color='{color}'>{category}</font>"
-        # Add the node
-        # use HTML syntax to make things easier to read
-        node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}<br/>{category_str}>"
-        fillcolor='white'
-        for category in categories:
-            pass
-        dot.node(node_name, node_comment, shape='rectangle', color='black')
+            # Add the start nodes
+            if len(g['inputs']):
+                dot.node('input', 'input', shape='oval')
+            for input_name in g['inputs']:
+                input_name_with_idx = f"{g_idx}_{input_name}"
+                c.node(input_name_with_idx, input_name, shape='oval')
+                dot.edge('input', input_name_with_idx, '', color='lightgray')
 
-        # Add edges to args
-        for arg_name in args:
-            if arg_name in g['inputs'] or arg_name in g['nodes']:
-                dot.edge(arg_name, node_name, '')
+            # Add the intermediate nodes
+            for node_name, (func_name, args) in g['nodes'].items():
+                node_name_with_idx = f"{g_idx}_{node_name}"
 
-    # Create output
-    dot.node('output', 'output', shape='oval')
-    for output_name in g['outputs']:
-        dot.edge(output_name, 'output', '')
+                category_str = f"<font color='red'>test</font>"
+                # Add the node
+                # use HTML syntax to make things easier to read
+                node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}<br/>{category_str}>"
+                fillcolor='white'
+                c.node(node_name_with_idx, node_comment, shape='rectangle', color='black')
+
+                # Add edges to args
+                for arg_name in args:
+                    if arg_name in g['inputs'] or arg_name in g['nodes']:
+                        arg_name_with_idx = f"{g_idx}_{arg_name}"
+                        dot.edge(arg_name_with_idx, node_name_with_idx, '')
+
+            # Create output
+            if len(g['outputs']):
+                dot.node('output', 'output', shape='oval')
+            for output_name in g['outputs']:
+                output_name_with_idx = f"{g_idx}_{output_name}"
+                dot.edge(output_name_with_idx, 'output', '', color='lightgray')
 
     dot.render(out_filename, format='svg', cleanup=True)
 
@@ -349,7 +457,7 @@ def create_diagram(g, out_filename, category_to_node_names=None):
 def create_debug_workflow_diagram():
     # Create a new directed graph
     dot = Digraph(comment='Workflow Diagram')
-    dot.attr(rankdir='LR')  # Left to right layout
+    dot.attr(rankdir='TB')  # Left to right layout
 
     # Add nodes
     dot.node('A', 'Start', shape='oval')
