@@ -2,19 +2,20 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 import fire
 import re
+import os
 
 from typing import *
 
 from graphviz import Digraph
 
 # aot_joint_graph only (filename is misnamed)
-fname = 'input_aot_graphs.txt'
+test_fname1 = 'test_inputs/input_aot_graphs.txt'
 
 # aot_joint_graph and aot_graphs
-fname = 'input_aot_joint_graph_and_aot_graphs.txt'
+test_fname2 = 'test_inputs/input_aot_joint_graph_and_aot_graphs.txt'
 
 # also output_code
-fname = 'input_aot_joint_graph_aot_graphs_output_code.txt'
+test_fname3 = 'test_inputs/input_aot_joint_graph_aot_graphs_output_code.txt'
 
 # format:
 #   inputs: ['input0', ...],
@@ -223,10 +224,12 @@ def parse_triton_graph(
 
 def fname_to_graphs(
     fname: str,
+    output_subdir: str,
 ):
     """
     Inputs:
     * `fname`: filename with logs
+    # `output_subdir`: subdirectory of `outputs` where to store the output data
 
     Outputs:
     * aot_joint_graph
@@ -369,26 +372,32 @@ def fname_to_graphs(
             triton_graph = parse_triton_graph(lines, start_idx, end_idx)
             entry[2] = triton_graph
 
+    output_dir = os.path.join('outputs', output_subdir)
+
     if joint_graph is not None:
         create_diagram(
             [joint_graph],
+            output_dir,
             'joint',
         )
     if forward_graph is not None:
         create_diagram(
             [forward_graph],
+            output_dir,
             'forward',
             triton_idxs_and_graphs=graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['forward']
         )
     if backward_graph is not None:
         create_diagram(
             [backward_graph],
+            output_dir,
             'backward',
         )
 
     triton_forward_graphs = [g for _, __, g in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['forward']]
     create_diagram(
         triton_forward_graphs,
+        output_dir,
         'triton_forward',
     )
 
@@ -404,9 +413,11 @@ def shorten_func_name(s):
 
 def create_diagram(
     graphs,
+    output_dir,
     out_filename,
     triton_idxs_and_graphs=None,
 ):
+    print('creating diagram', output_dir, out_filename)
     dot = Digraph(comment='aot_joint_graph')
     dot.attr(label=out_filename)
     dot.attr(labelloc='t')
@@ -458,6 +469,7 @@ def create_diagram(
                 output_name_with_idx = f"{g_idx}_{output_name}"
                 dot.edge(output_name_with_idx, 'output', '', color='lightgray')
 
+    out_filename = os.path.join(output_dir, out_filename)
     dot.render(out_filename, format='svg', cleanup=True)
 
 
@@ -491,9 +503,11 @@ def create_debug_workflow_diagram():
     # Save and render
     dot.render('workflow', format='svg', cleanup=True)
 
-def run():
-    fname_to_graphs(fname)
-
+def run(
+    input_fname: str = test_fname3,
+    output_subdir: str = 'test',
+):
+    fname_to_graphs(input_fname, output_subdir)
     print('done')
 
 
