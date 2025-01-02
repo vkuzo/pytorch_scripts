@@ -1,4 +1,5 @@
 from collections import defaultdict
+from dataclasses import dataclass, field
 import fire
 import re
 
@@ -15,6 +16,31 @@ fname = 'input_aot_joint_graph_and_aot_graphs.txt'
 # also output_code
 fname = 'input_aot_joint_graph_aot_graphs_output_code.txt'
 
+# format:
+#   inputs: ['input0', ...],
+#   nodes: {
+#     'node_n': ['func', ['arg_0', 'arg_1']],
+#     ...
+#   },
+#   outputs: ['output0, ...]
+#   triton_kernel_str: """
+# @triton_heuristics.reduction(...
+#   ...
+# ''', device_str='cuda')
+#   """
+#   triton_kernel_type: reduction,
+#   triton_kernel_name: 'triton_red_fused_abs_max_0',
+@dataclass
+class ParsedGraph:
+    inputs: List[str] = field(default_factory=lambda: [])
+    nodes: Dict[str, Tuple[str, List[str]]] = field(default_factory=lambda: {})
+    outputs: List[str] = field(default_factory=lambda: [])
+    triton_kernel_str: Optional[str] = None
+    # pointwise/reduction/persistent_reduction
+    triton_kernel_type: Optional[str] = None
+    triton_kernel_name: Optional[str] = None
+
+
 def parse_graph(
     list_of_lines: List[str],
     start_idx: int,
@@ -25,20 +51,7 @@ def parse_graph(
     Output: a parsed graph
     """
 
-    # format:
-    # {
-    #   'inputs': ['input0', ...],
-    #   'nodes': {
-    #     'node_n': ['func', ['arg_0', 'arg_1']],
-    #     ...
-    #   },
-    #   'outputs': ['output0, ...]
-    # }
-    g = {
-        'inputs': [],
-        'nodes': {},
-        'outputs': [],
-    }
+    g = ParsedGraph()
 
     for line in list_of_lines[start_idx:end_idx+1]:
 
@@ -56,7 +69,7 @@ def parse_graph(
         res = primals_tangents_re.search(line)
         if res:
             inputs_list = [s.strip() for s in res.group(1).split(',')]
-            g['inputs'] = inputs_list
+            g.inputs = inputs_list
             continue
 
         # specific to forward/backward graph
@@ -77,7 +90,7 @@ def parse_graph(
                     new_res += char
             new_res = new_res.replace('"',"")
             inputs_list = [s.replace(':', '').strip() for s in new_res.split(',')]
-            g['inputs'] = inputs_list
+            g.inputs = inputs_list
 
         # function call
         # abs_1: "bf16[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.abs.default(primals_2)
@@ -86,7 +99,7 @@ def parse_graph(
         if res:
             var_name, func_name, args_str = res.group(1), res.group(2), res.group(3)
             args_list = [s.strip() for s in args_str.split(',')]
-            g['nodes'][var_name] = [func_name, args_list]
+            g.nodes[var_name] = [func_name, args_list]
             continue
 
         # return statement for aot_joint_graph
@@ -96,7 +109,7 @@ def parse_graph(
         if res:
             tokens_str = res.group(1)
             tokens_list = [s.strip() for s in tokens_str.split(',')]
-            g['outputs'] = tokens_list
+            g.outputs = tokens_list
             continue
 
         # return statement for aot_graphs
@@ -105,13 +118,13 @@ def parse_graph(
         if res:
             tokens_str = res.group(1)
             tokens_list = [s.strip() for s in tokens_str.split(',')]
-            g['outputs'] = tokens_list
+            g.outputs = tokens_list
             continue
 
     # verify captured information is valid
-    assert g['inputs'] is not None
-    assert len(g['nodes']) > 0
-    assert g['outputs'] is not None
+    assert g.inputs is not None
+    assert len(g.nodes) > 0
+    assert g.outputs is not None
 
     return g
 
@@ -120,20 +133,7 @@ def parse_triton_graph(
     start_idx: int,
     end_idx: int,
 ):
-    # format:
-    # {
-    #   'inputs': ['input0', ...],
-    #   'nodes': {
-    #     'node_n': ['func', ['arg_0', 'arg_1']],
-    #     ...
-    #   },
-    #   'outputs': ['output0, ...]
-    # }
-    g = {
-        'inputs': [],
-        'nodes': {},
-        'outputs': [],
-    }
+    g = ParsedGraph()
 
     for line in list_of_lines[start_idx:end_idx+1]:
         # %mul : [num_users=1] = call_function[target=torch.ops.aten.mul.Tensor](args = (%reciprocal, 448.0), kwargs = {})
@@ -145,9 +145,30 @@ def parse_triton_graph(
             args = res.group(2).split(', ')
             args = [s.replace('%', '').replace(',', '') for s in args]
 
-            g['nodes'][target_node] = ['', args]
+            g.nodes[target_node] = ['', args]
             # TODO future parse the func as well
-            # TODO(future): inputs and outputs
+
+    # add the triton kernel text to the graph as metadata, so we can display it later
+    # also add the kernel type and name
+    triton_kernel_start_re = re.compile('triton_heuristics.*')
+    triton_kernel_end_re = re.compile("''', device_str='cuda'.*")
+    triton_kernel_name_re = re.compile('(.*) = async_compile.*')
+    triton_kernel_start_idx, triton_kernel_end_idx = None, None
+    cur_idx = end_idx
+    while True:
+        line = list_of_lines[cur_idx]
+        if triton_kernel_start_re.search(line):
+            triton_kernel_start_idx = cur_idx
+            g.triton_kernel_type = line.replace('@triton_heuristics.', '').replace('(', '')
+        elif triton_kernel_end_re.search(line):
+            triton_kernel_end_idx = cur_idx
+            break
+        cur_idx += 1
+
+        res = triton_kernel_name_re.search(line)
+        if res:
+            g.triton_kernel_name = res.group(1)
+    g.triton_kernel_str = ''.join(list_of_lines[triton_kernel_start_idx:triton_kernel_end_idx])
 
     # populate the inputs and outputs by:
     # 1. for each node n, count the number of parent and children nodes
@@ -166,7 +187,7 @@ def parse_triton_graph(
 
     # TODO(future): make this also handle kwargs
     node_name_to_num_parents_children = defaultdict(lambda: [0, 0])
-    for node_name, (func, args) in g['nodes'].items():
+    for node_name, (func, args) in g.nodes.items():
         for arg in args:
             # increment child counter
             node_name_to_num_parents_children[arg][1] += 1
@@ -193,11 +214,11 @@ def parse_triton_graph(
         elif num_children == 0:
             outputs.append(node_name)
 
-    g['inputs'] = inputs
-    g['outputs'] = outputs
+    g.inputs = inputs
+    g.outputs = outputs
 
     # verify captured information is valid
-    assert len(g['nodes']) > 0
+    assert len(g.nodes) > 0
     return g
 
 def fname_to_graphs(
@@ -211,21 +232,6 @@ def fname_to_graphs(
     * aot_joint_graph
     * aot_graphs
     """
-
-    # format:
-    # {
-    #   'inputs': ['input0', ...],
-    #   'nodes': {
-    #     'node_n': ['func', ['arg_0', 'arg_1']],
-    #     ...
-    #   },
-    #   'outputs': ['output0, ...]
-    # }
-    aot_graph = {
-        'inputs': None,
-        'nodes': {},
-        'outputs': None,
-    }
 
     # format:
     # {
@@ -401,11 +407,7 @@ def create_diagram(
     out_filename,
     triton_idxs_and_graphs=None,
 ):
-    print('create_diagram', out_filename)
-    print(triton_idxs_and_graphs)
-
     dot = Digraph(comment='aot_joint_graph')
-    # dot.attr(fontsize='9')
     dot.attr(label=out_filename)
     dot.attr(labelloc='t')
 
@@ -413,21 +415,27 @@ def create_diagram(
 
         # note: subgraph name must start with cluster_ for graphviz to render a border
         with dot.subgraph(name=f"cluster_{str(g_idx)}") as c:
-            c.attr(label=f"label: {str(g_idx)}\nasdfasdf\nasdfasd")
+
+            # TODO(future): render `g.triton_kernel_str` if present
+            if g.triton_kernel_name is not None:
+                label = f"idx: {g_idx}\nkernel_name: {g.triton_kernel_name}\ntype:{g.triton_kernel_type}"
+                c.attr(label=label)
+            else:
+                c.attr(label=f"label: {str(g_idx)}")
 
             # 'b' is label at the bottom of subgraph, 't' is at top
             c.attr(labelloc='b')
 
             # Add the start nodes
-            if len(g['inputs']):
+            if len(g.inputs):
                 dot.node('input', 'input', shape='oval')
-            for input_name in g['inputs']:
+            for input_name in g.inputs:
                 input_name_with_idx = f"{g_idx}_{input_name}"
                 c.node(input_name_with_idx, input_name, shape='oval')
                 dot.edge('input', input_name_with_idx, '', color='lightgray')
 
             # Add the intermediate nodes
-            for node_name, (func_name, args) in g['nodes'].items():
+            for node_name, (func_name, args) in g.nodes.items():
                 node_name_with_idx = f"{g_idx}_{node_name}"
 
                 category_str = f"<font color='red'>test</font>"
@@ -439,14 +447,14 @@ def create_diagram(
 
                 # Add edges to args
                 for arg_name in args:
-                    if arg_name in g['inputs'] or arg_name in g['nodes']:
+                    if arg_name in g.inputs or arg_name in g.nodes:
                         arg_name_with_idx = f"{g_idx}_{arg_name}"
                         dot.edge(arg_name_with_idx, node_name_with_idx, '')
 
             # Create output
-            if len(g['outputs']):
+            if len(g.outputs):
                 dot.node('output', 'output', shape='oval')
-            for output_name in g['outputs']:
+            for output_name in g.outputs:
                 output_name_with_idx = f"{g_idx}_{output_name}"
                 dot.edge(output_name_with_idx, 'output', '', color='lightgray')
 
