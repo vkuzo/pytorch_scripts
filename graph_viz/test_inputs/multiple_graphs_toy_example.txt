@@ -1,0 +1,452 @@
+/data/users/vasiliy/pytorch/torch/_dynamo/pgo.py:455: UserWarning: dynamo_pgo force disabled by torch._inductor.config.force_disable_caches
+  warn_once(
+INFO:torch._functorch._aot_autograd.jit_compile_runtime_wrappers.__aot_joint_graph:TRACED GRAPH
+ ===== Joint graph 0 =====
+ /data/users/vasiliy/pytorch/torch/fx/_lazy_graph_module.py class joint_helper(torch.nn.Module):
+    def forward(self, primals, tangents):
+        primals_1: "f32[4, 4][4, 1]cuda:0"; tangents_1: "f32[4, 4][4, 1]cuda:0";
+
+        primals_1, tangents_1, = fx_pytree.tree_flatten_spec([primals, tangents], self._in_spec)
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:12 in foo, code: x = x @ x
+        mm: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mm.default(primals_1, primals_1)
+        permute: "f32[4, 4][1, 4]cuda:0" = torch.ops.aten.permute.default(primals_1, [1, 0])
+        mm_1: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mm.default(permute, tangents_1);  permute = None
+        permute_1: "f32[4, 4][1, 4]cuda:0" = torch.ops.aten.permute.default(primals_1, [1, 0]);  primals_1 = None
+        mm_2: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mm.default(tangents_1, permute_1);  tangents_1 = permute_1 = None
+
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:12 in foo, code: x = x @ x
+        add: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.add.Tensor(mm_2, mm_1);  mm_2 = mm_1 = None
+        return pytree.tree_unflatten([mm, add], self._out_spec)
+
+
+INFO:torch._functorch._aot_autograd.jit_compile_runtime_wrappers.__aot_graphs:aot_config id: 0, fw_metadata=ViewAndMutationMeta(input_info=[InputAliasInfo(is_leaf=True, mutates_data=False, mutates_metadata=False, mutations_hidden_from_autograd=True, mutations_under_no_grad_or_inference_mode=False, mutation_inductor_storage_resize=False, mutates_storage_metadata=False, requires_grad=True, keep_input_mutations=True)], output_info=[OutputAliasInfo(output_type=<OutputType.non_alias: 1>, raw_type=<class 'torch._subclasses.functional_tensor.FunctionalTensor'>, base_idx=None, dynamic_dims=set(), requires_grad=True, functional_tensor=None)], num_intermediate_bases=0, keep_input_mutations=True, traced_tangents=[FakeTensor(..., device='cuda:0', size=(4, 4))], subclass_inp_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_fw_graph_out_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_tangent_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=torch.contiguous_format)], is_train=True, traced_tangent_metas=None, num_symints_saved_for_bw=0, grad_enabled_mutation=None, deterministic=False, static_input_indices=[], tokens={}, indices_of_inputs_that_requires_grad_with_mutations_in_bw=[], bw_donated_idxs=[], num_backward_tokens=0), inner_meta=ViewAndMutationMeta(input_info=[InputAliasInfo(is_leaf=True, mutates_data=False, mutates_metadata=False, mutations_hidden_from_autograd=True, mutations_under_no_grad_or_inference_mode=False, mutation_inductor_storage_resize=False, mutates_storage_metadata=False, requires_grad=True, keep_input_mutations=True)], output_info=[OutputAliasInfo(output_type=<OutputType.non_alias: 1>, raw_type=<class 'torch._subclasses.functional_tensor.FunctionalTensor'>, base_idx=None, dynamic_dims=set(), requires_grad=True, functional_tensor=None)], num_intermediate_bases=0, keep_input_mutations=True, traced_tangents=[FakeTensor(..., device='cuda:0', size=(4, 4))], subclass_inp_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_fw_graph_out_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_tangent_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=torch.contiguous_format)], is_train=True, traced_tangent_metas=None, num_symints_saved_for_bw=0, grad_enabled_mutation=None, deterministic=False, static_input_indices=[], tokens={}, indices_of_inputs_that_requires_grad_with_mutations_in_bw=[], bw_donated_idxs=[], num_backward_tokens=0)
+INFO:torch._functorch._aot_autograd.jit_compile_runtime_wrappers.__aot_graphs:TRACED GRAPH
+ ===== Forward graph 0 =====
+ /data/users/vasiliy/pytorch/torch/fx/_lazy_graph_module.py class GraphModule(torch.nn.Module):
+    def forward(self, primals_1: "f32[4, 4][4, 1]cuda:0"):
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:12 in foo, code: x = x @ x
+        mm: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mm.default(primals_1, primals_1)
+        permute: "f32[4, 4][1, 4]cuda:0" = torch.ops.aten.permute.default(primals_1, [1, 0]);  primals_1 = None
+        return (mm, permute)
+
+
+INFO:torch._functorch._aot_autograd.jit_compile_runtime_wrappers.__aot_graphs:TRACED GRAPH
+ ===== Backward graph 0 =====
+ <eval_with_key>.1 class GraphModule(torch.nn.Module):
+    def forward(self, permute: "f32[4, 4][1, 4]cuda:0", tangents_1: "f32[4, 4][4, 1]cuda:0"):
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:12 in foo, code: x = x @ x
+        mm_1: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mm.default(permute, tangents_1)
+        mm_2: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mm.default(tangents_1, permute);  tangents_1 = permute = None
+
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:12 in foo, code: x = x @ x
+        add: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.add.Tensor(mm_2, mm_1);  mm_2 = mm_1 = None
+        return (add,)
+
+
+/data/users/vasiliy/pytorch/torch/_inductor/compile_fx.py:201: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+DEBUG:torch._inductor.codecache.__output_code:Output code:
+# AOT ID: ['0_forward']
+from ctypes import c_void_p, c_long, c_int
+import torch
+import math
+import random
+import os
+import tempfile
+from math import inf, nan
+from torch._inductor.hooks import run_intermediate_hooks
+from torch._inductor.utils import maybe_profile
+from torch._inductor.codegen.memory_planning import _align as align
+from torch import device, empty_strided
+from torch._inductor.async_compile import AsyncCompile
+from torch._inductor.select_algorithm import extern_kernels
+from torch._inductor.codegen.multi_kernel import MultiKernelCall
+
+aten = torch.ops.aten
+inductor_ops = torch.ops.inductor
+_quantized = torch.ops._quantized
+assert_size_stride = torch._C._dynamo.guards.assert_size_stride
+empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
+empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
+reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
+alloc_from_pool = torch.ops.inductor._alloc_from_pool
+async_compile = AsyncCompile()
+empty_strided_p2p = torch._C._distributed_c10d._SymmetricMemory.empty_strided_p2p
+
+
+async_compile.wait(globals())
+del async_compile
+
+def call(args):
+    primals_1, = args
+    args.clear()
+    assert_size_stride(primals_1, (4, 4), (4, 1))
+    with torch.cuda._DeviceGuard(0):
+        torch.cuda.set_device(0)
+        buf0 = empty_strided_cuda((4, 4), (4, 1), torch.float32)
+        # Topologically Sorted Source Nodes: [x], Original ATen: [aten.mm]
+        extern_kernels.mm(primals_1, primals_1, out=buf0)
+    return (buf0, reinterpret_tensor(primals_1, (4, 4), (1, 4), 0), )
+
+
+def benchmark_compiled_module(times=10, repeat=10):
+    from torch._dynamo.testing import rand_strided
+    from torch._inductor.utils import print_performance
+    primals_1 = rand_strided((4, 4), (4, 1), device='cuda:0', dtype=torch.float32)
+    fn = lambda: call([primals_1])
+    return print_performance(fn, times=times, repeat=repeat)
+
+
+if __name__ == "__main__":
+    from torch._inductor.wrapper_benchmark import compiled_module_main
+    compiled_module_main('None', benchmark_compiled_module)
+
+DEBUG:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmpt7kgir5a/63/c63bwbbtk5xf2j3qzpcc5q377otcwqml2x36z7xvfatwcgjbfbiy.py
+INFO:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmpt7kgir5a/63/c63bwbbtk5xf2j3qzpcc5q377otcwqml2x36z7xvfatwcgjbfbiy.py
+INFO:torch._functorch._aot_autograd.jit_compile_runtime_wrappers.__aot_joint_graph:TRACED GRAPH
+ ===== Joint graph 1 =====
+ /data/users/vasiliy/pytorch/torch/fx/_lazy_graph_module.py class joint_helper(torch.nn.Module):
+    def forward(self, primals, tangents):
+        primals_1: "f32[4, 4][4, 1]cuda:0"; tangents_1: "f32[4, 4][4, 1]cuda:0";
+
+        primals_1, tangents_1, = fx_pytree.tree_flatten_spec([primals, tangents], self._in_spec)
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:14 in torch_dynamo_resume_in_foo_at_13, code: x = x * x
+        mul: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mul.Tensor(primals_1, primals_1)
+
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:15 in torch_dynamo_resume_in_foo_at_13, code: x = x + 1
+        add: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.add.Tensor(mul, 1);  mul = None
+
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:14 in torch_dynamo_resume_in_foo_at_13, code: x = x * x
+        mul_1: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mul.Tensor(tangents_1, primals_1)
+        mul_2: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mul.Tensor(tangents_1, primals_1);  tangents_1 = primals_1 = None
+
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:14 in torch_dynamo_resume_in_foo_at_13, code: x = x * x
+        add_1: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.add.Tensor(mul_2, mul_1);  mul_2 = mul_1 = None
+        return pytree.tree_unflatten([add, add_1], self._out_spec)
+
+
+INFO:torch._functorch._aot_autograd.jit_compile_runtime_wrappers.__aot_graphs:aot_config id: 1, fw_metadata=ViewAndMutationMeta(input_info=[InputAliasInfo(is_leaf=False, mutates_data=False, mutates_metadata=False, mutations_hidden_from_autograd=True, mutations_under_no_grad_or_inference_mode=False, mutation_inductor_storage_resize=False, mutates_storage_metadata=False, requires_grad=True, keep_input_mutations=True)], output_info=[OutputAliasInfo(output_type=<OutputType.non_alias: 1>, raw_type=<class 'torch._subclasses.functional_tensor.FunctionalTensor'>, base_idx=None, dynamic_dims=set(), requires_grad=True, functional_tensor=None)], num_intermediate_bases=0, keep_input_mutations=True, traced_tangents=[FakeTensor(..., device='cuda:0', size=(4, 4))], subclass_inp_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_fw_graph_out_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_tangent_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=torch.contiguous_format)], is_train=True, traced_tangent_metas=None, num_symints_saved_for_bw=0, grad_enabled_mutation=None, deterministic=False, static_input_indices=[], tokens={}, indices_of_inputs_that_requires_grad_with_mutations_in_bw=[], bw_donated_idxs=[], num_backward_tokens=0), inner_meta=ViewAndMutationMeta(input_info=[InputAliasInfo(is_leaf=False, mutates_data=False, mutates_metadata=False, mutations_hidden_from_autograd=True, mutations_under_no_grad_or_inference_mode=False, mutation_inductor_storage_resize=False, mutates_storage_metadata=False, requires_grad=True, keep_input_mutations=True)], output_info=[OutputAliasInfo(output_type=<OutputType.non_alias: 1>, raw_type=<class 'torch._subclasses.functional_tensor.FunctionalTensor'>, base_idx=None, dynamic_dims=set(), requires_grad=True, functional_tensor=None)], num_intermediate_bases=0, keep_input_mutations=True, traced_tangents=[FakeTensor(..., device='cuda:0', size=(4, 4))], subclass_inp_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_fw_graph_out_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_tangent_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=torch.contiguous_format)], is_train=True, traced_tangent_metas=None, num_symints_saved_for_bw=0, grad_enabled_mutation=None, deterministic=False, static_input_indices=[], tokens={}, indices_of_inputs_that_requires_grad_with_mutations_in_bw=[], bw_donated_idxs=[], num_backward_tokens=0)
+INFO:torch._functorch._aot_autograd.jit_compile_runtime_wrappers.__aot_graphs:TRACED GRAPH
+ ===== Forward graph 1 =====
+ /data/users/vasiliy/pytorch/torch/fx/_lazy_graph_module.py class GraphModule(torch.nn.Module):
+    def forward(self, primals_1: "f32[4, 4][4, 1]cuda:0"):
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:14 in torch_dynamo_resume_in_foo_at_13, code: x = x * x
+        mul: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mul.Tensor(primals_1, primals_1)
+
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:15 in torch_dynamo_resume_in_foo_at_13, code: x = x + 1
+        add: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.add.Tensor(mul, 1);  mul = None
+        return (add, primals_1)
+
+
+INFO:torch._functorch._aot_autograd.jit_compile_runtime_wrappers.__aot_graphs:TRACED GRAPH
+ ===== Backward graph 1 =====
+ <eval_with_key>.3 class GraphModule(torch.nn.Module):
+    def forward(self, primals_1: "f32[4, 4][4, 1]cuda:0", tangents_1: "f32[4, 4][4, 1]cuda:0"):
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:14 in torch_dynamo_resume_in_foo_at_13, code: x = x * x
+        mul_1: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.mul.Tensor(tangents_1, primals_1);  tangents_1 = primals_1 = None
+
+         # File: /home/vasiliy/local/tmp/20250103_graph_break_test.py:14 in torch_dynamo_resume_in_foo_at_13, code: x = x * x
+        add_1: "f32[4, 4][4, 1]cuda:0" = torch.ops.aten.add.Tensor(mul_1, mul_1);  mul_1 = None
+        return (add_1,)
+
+
+DEBUG:torch._inductor.codecache.__output_code:Output code:
+# AOT ID: ['1_forward']
+from ctypes import c_void_p, c_long, c_int
+import torch
+import math
+import random
+import os
+import tempfile
+from math import inf, nan
+from torch._inductor.hooks import run_intermediate_hooks
+from torch._inductor.utils import maybe_profile
+from torch._inductor.codegen.memory_planning import _align as align
+from torch import device, empty_strided
+from torch._inductor.async_compile import AsyncCompile
+from torch._inductor.select_algorithm import extern_kernels
+from torch._inductor.codegen.multi_kernel import MultiKernelCall
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_heuristics import (
+    grid,
+    split_scan_grid,
+    grid_combo_kernels,
+    start_graph,
+    end_graph,
+    cooperative_reduction_grid,
+)
+from torch._C import _cuda_getCurrentRawStream as get_raw_stream
+from torch._C import _cuda_getCurrentRawStream as get_raw_stream
+
+aten = torch.ops.aten
+inductor_ops = torch.ops.inductor
+_quantized = torch.ops._quantized
+assert_size_stride = torch._C._dynamo.guards.assert_size_stride
+empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
+empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
+reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
+alloc_from_pool = torch.ops.inductor._alloc_from_pool
+async_compile = AsyncCompile()
+empty_strided_p2p = torch._C._distributed_c10d._SymmetricMemory.empty_strided_p2p
+
+
+# kernel path: /tmp/torchinductor_vasiliy/tmp8atu9orq/ym/cymlcauelexjpve3st62iw34lq5nqwuuck2eyizti6hnb2cgrxj7.py
+# Topologically Sorted Source Nodes: [x, x_1], Original ATen: [aten.mul, aten.add]
+# Source node to ATen node mapping:
+#   x => mul
+#   x_1 => add
+# Graph fragment:
+#   %mul : [num_users=1] = call_function[target=torch.ops.aten.mul.Tensor](args = (%primals_1, %primals_1), kwargs = {})
+#   %add : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%mul, 1), kwargs = {})
+triton_poi_fused_add_mul_0 = async_compile.triton('triton_poi_fused_add_mul_0', '''
+import triton
+import triton.language as tl
+from triton.compiler.compiler import AttrsDescriptor
+
+from torch._inductor.runtime import triton_helpers, triton_heuristics
+from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
+from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, DeviceProperties
+triton_helpers.set_driver_to_gpu()
+
+@triton_heuristics.pointwise(
+    size_hints={'x': 16},
+    filename=__file__,
+    triton_meta={'signature': {'in_ptr0': '*fp32', 'out_ptr0': '*fp32', 'xnumel': 'i32'}, 'device': DeviceProperties(type='cuda', index=0, multi_processor_count=132, cc=90, major=9, regs_per_multiprocessor=65536, max_threads_per_multi_processor=2048, warp_size=32), 'constants': {}, 'configs': [AttrsDescriptor.from_dict({'arg_properties': {'tt.divisibility': (0, 1, 2), 'tt.equal_to': ()}, 'cls': 'AttrsDescriptor'})]},
+    inductor_meta={'autotune_hints': set(), 'kernel_name': 'triton_poi_fused_add_mul_0', 'mutated_arg_names': [], 'optimize_mem': False, 'no_x_dim': False, 'num_load': 1, 'num_reduction': 0, 'backend_hash': '981C98416217C4AE4C7945230F4CE94258022628884F383E21AF7AD1AB57A3C9', 'are_deterministic_algorithms_enabled': False, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': True, 'dynamic_scale_rblock': True, 'max_autotune': False, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False, 'compile_id': '3/0', 'is_forward': True},
+    min_elem_per_thread=0
+)
+@triton.jit
+def triton_poi_fused_add_mul_0(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 16
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    xmask = xindex < xnumel
+    x0 = xindex
+    tmp0 = tl.load(in_ptr0 + (x0), xmask)
+    tmp1 = tmp0 * tmp0
+    tmp2 = 1.0
+    tmp3 = tmp1 + tmp2
+    tl.store(out_ptr0 + (x0), tmp3, xmask)
+''', device_str='cuda')
+
+
+async_compile.wait(globals())
+del async_compile
+
+def call(args):
+    primals_1, = args
+    args.clear()
+    assert_size_stride(primals_1, (4, 4), (4, 1))
+    with torch.cuda._DeviceGuard(0):
+        torch.cuda.set_device(0)
+        buf0 = empty_strided_cuda((4, 4), (4, 1), torch.float32)
+        # Topologically Sorted Source Nodes: [x, x_1], Original ATen: [aten.mul, aten.add]
+        stream0 = get_raw_stream(0)
+        triton_poi_fused_add_mul_0.run(primals_1, buf0, 16, grid=grid(16), stream=stream0)
+    return (buf0, primals_1, )
+
+
+def benchmark_compiled_module(times=10, repeat=10):
+    from torch._dynamo.testing import rand_strided
+    from torch._inductor.utils import print_performance
+    primals_1 = rand_strided((4, 4), (4, 1), device='cuda:0', dtype=torch.float32)
+    fn = lambda: call([primals_1])
+    return print_performance(fn, times=times, repeat=repeat)
+
+
+if __name__ == "__main__":
+    from torch._inductor.wrapper_benchmark import compiled_module_main
+    compiled_module_main('None', benchmark_compiled_module)
+
+DEBUG:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmp8atu9orq/hr/chr7ufsm7bd33t2bv6htyoh76yml62sdf7ogoqoy4ip7shkc7axt.py
+INFO:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmp8atu9orq/hr/chr7ufsm7bd33t2bv6htyoh76yml62sdf7ogoqoy4ip7shkc7axt.py
+DEBUG:torch._inductor.codecache.__output_code:Output code:
+# AOT ID: ['1_backward']
+from ctypes import c_void_p, c_long, c_int
+import torch
+import math
+import random
+import os
+import tempfile
+from math import inf, nan
+from torch._inductor.hooks import run_intermediate_hooks
+from torch._inductor.utils import maybe_profile
+from torch._inductor.codegen.memory_planning import _align as align
+from torch import device, empty_strided
+from torch._inductor.async_compile import AsyncCompile
+from torch._inductor.select_algorithm import extern_kernels
+from torch._inductor.codegen.multi_kernel import MultiKernelCall
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_heuristics import (
+    grid,
+    split_scan_grid,
+    grid_combo_kernels,
+    start_graph,
+    end_graph,
+    cooperative_reduction_grid,
+)
+from torch._C import _cuda_getCurrentRawStream as get_raw_stream
+from torch._C import _cuda_getCurrentRawStream as get_raw_stream
+
+aten = torch.ops.aten
+inductor_ops = torch.ops.inductor
+_quantized = torch.ops._quantized
+assert_size_stride = torch._C._dynamo.guards.assert_size_stride
+empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
+empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
+reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
+alloc_from_pool = torch.ops.inductor._alloc_from_pool
+async_compile = AsyncCompile()
+empty_strided_p2p = torch._C._distributed_c10d._SymmetricMemory.empty_strided_p2p
+
+
+# kernel path: /tmp/torchinductor_vasiliy/tmplc7fgnxv/g2/cg25bc74uu6gfdk5lhmrgk2l53mb5jktkkdaycowgkquwlnxv3ab.py
+# Topologically Sorted Source Nodes: [], Original ATen: [aten.mul, aten.add]
+# Source node to ATen node mapping:
+# Graph fragment:
+#   %mul_1 : [num_users=1] = call_function[target=torch.ops.aten.mul.Tensor](args = (%tangents_1, %primals_1), kwargs = {})
+#   %add_1 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%mul_1, %mul_1), kwargs = {})
+triton_poi_fused_add_mul_0 = async_compile.triton('triton_poi_fused_add_mul_0', '''
+import triton
+import triton.language as tl
+from triton.compiler.compiler import AttrsDescriptor
+
+from torch._inductor.runtime import triton_helpers, triton_heuristics
+from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
+from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, DeviceProperties
+triton_helpers.set_driver_to_gpu()
+
+@triton_heuristics.pointwise(
+    size_hints={'x': 16},
+    filename=__file__,
+    triton_meta={'signature': {'in_ptr0': '*fp32', 'in_ptr1': '*fp32', 'out_ptr0': '*fp32', 'xnumel': 'i32'}, 'device': DeviceProperties(type='cuda', index=0, multi_processor_count=132, cc=90, major=9, regs_per_multiprocessor=65536, max_threads_per_multi_processor=2048, warp_size=32), 'constants': {}, 'configs': [AttrsDescriptor.from_dict({'arg_properties': {'tt.divisibility': (0, 1, 2, 3), 'tt.equal_to': ()}, 'cls': 'AttrsDescriptor'})]},
+    inductor_meta={'autotune_hints': set(), 'kernel_name': 'triton_poi_fused_add_mul_0', 'mutated_arg_names': [], 'optimize_mem': True, 'no_x_dim': False, 'num_load': 2, 'num_reduction': 0, 'backend_hash': '981C98416217C4AE4C7945230F4CE94258022628884F383E21AF7AD1AB57A3C9', 'are_deterministic_algorithms_enabled': False, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': True, 'dynamic_scale_rblock': True, 'max_autotune': False, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False, 'compile_id': '3/0', 'is_forward': False},
+    min_elem_per_thread=0
+)
+@triton.jit
+def triton_poi_fused_add_mul_0(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 16
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    xmask = xindex < xnumel
+    x0 = xindex
+    tmp0 = tl.load(in_ptr0 + (x0), xmask)
+    tmp1 = tl.load(in_ptr1 + (x0), xmask)
+    tmp2 = tmp0 * tmp1
+    tmp3 = tmp2 + tmp2
+    tl.store(out_ptr0 + (x0), tmp3, xmask)
+''', device_str='cuda')
+
+
+async_compile.wait(globals())
+del async_compile
+
+def call(args):
+    primals_1, tangents_1 = args
+    args.clear()
+    assert_size_stride(primals_1, (4, 4), (4, 1))
+    assert_size_stride(tangents_1, (4, 4), (4, 1))
+    with torch.cuda._DeviceGuard(0):
+        torch.cuda.set_device(0)
+        buf0 = empty_strided_cuda((4, 4), (4, 1), torch.float32)
+        # Topologically Sorted Source Nodes: [], Original ATen: [aten.mul, aten.add]
+        stream0 = get_raw_stream(0)
+        triton_poi_fused_add_mul_0.run(tangents_1, primals_1, buf0, 16, grid=grid(16), stream=stream0)
+        del primals_1
+        del tangents_1
+    return (buf0, )
+
+
+def benchmark_compiled_module(times=10, repeat=10):
+    from torch._dynamo.testing import rand_strided
+    from torch._inductor.utils import print_performance
+    primals_1 = rand_strided((4, 4), (4, 1), device='cuda:0', dtype=torch.float32)
+    tangents_1 = rand_strided((4, 4), (4, 1), device='cuda:0', dtype=torch.float32)
+    fn = lambda: call([primals_1, tangents_1])
+    return print_performance(fn, times=times, repeat=repeat)
+
+
+if __name__ == "__main__":
+    from torch._inductor.wrapper_benchmark import compiled_module_main
+    compiled_module_main('None', benchmark_compiled_module)
+
+DEBUG:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmplc7fgnxv/7f/c7fd4z2p7o33bk4g2wkuqmsaocconrzetxxtfugmwhhmo6u5xuk4.py
+INFO:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmplc7fgnxv/7f/c7fd4z2p7o33bk4g2wkuqmsaocconrzetxxtfugmwhhmo6u5xuk4.py
+DEBUG:torch._inductor.codecache.__output_code:Output code:
+# AOT ID: ['0_backward']
+from ctypes import c_void_p, c_long, c_int
+import torch
+import math
+import random
+import os
+import tempfile
+from math import inf, nan
+from torch._inductor.hooks import run_intermediate_hooks
+from torch._inductor.utils import maybe_profile
+from torch._inductor.codegen.memory_planning import _align as align
+from torch import device, empty_strided
+from torch._inductor.async_compile import AsyncCompile
+from torch._inductor.select_algorithm import extern_kernels
+from torch._inductor.codegen.multi_kernel import MultiKernelCall
+
+aten = torch.ops.aten
+inductor_ops = torch.ops.inductor
+_quantized = torch.ops._quantized
+assert_size_stride = torch._C._dynamo.guards.assert_size_stride
+empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
+empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
+reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
+alloc_from_pool = torch.ops.inductor._alloc_from_pool
+async_compile = AsyncCompile()
+empty_strided_p2p = torch._C._distributed_c10d._SymmetricMemory.empty_strided_p2p
+
+
+async_compile.wait(globals())
+del async_compile
+
+def call(args):
+    permute, tangents_1 = args
+    args.clear()
+    assert_size_stride(permute, (4, 4), (1, 4))
+    assert_size_stride(tangents_1, (4, 4), (4, 1))
+    with torch.cuda._DeviceGuard(0):
+        torch.cuda.set_device(0)
+        buf0 = empty_strided_cuda((4, 4), (4, 1), torch.float32)
+        # Topologically Sorted Source Nodes: [], Original ATen: [aten.mm]
+        extern_kernels.mm(tangents_1, permute, out=buf0)
+        buf1 = empty_strided_cuda((4, 4), (4, 1), torch.float32)
+        # Topologically Sorted Source Nodes: [], Original ATen: []
+        extern_kernels.addmm(buf0, permute, tangents_1, alpha=1, beta=1, out=buf1)
+        del buf0
+        del permute
+        del tangents_1
+    return (buf1, )
+
+
+def benchmark_compiled_module(times=10, repeat=10):
+    from torch._dynamo.testing import rand_strided
+    from torch._inductor.utils import print_performance
+    permute = rand_strided((4, 4), (1, 4), device='cuda:0', dtype=torch.float32)
+    tangents_1 = rand_strided((4, 4), (4, 1), device='cuda:0', dtype=torch.float32)
+    fn = lambda: call([permute, tangents_1])
+    return print_performance(fn, times=times, repeat=repeat)
+
+
+if __name__ == "__main__":
+    from torch._inductor.wrapper_benchmark import compiled_module_main
+    compiled_module_main('None', benchmark_compiled_module)
+
+DEBUG:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmptaa304e2/wq/cwq3zat2w7jxfpauvkbp6kal7qf3klcsh6sjviajh5k7kxmeybst.py
+INFO:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmptaa304e2/wq/cwq3zat2w7jxfpauvkbp6kal7qf3klcsh6sjviajh5k7kxmeybst.py
+tensor([[6.4656, 1.2227, 2.4464, 2.8914],
+        [1.0000, 3.2270, 5.1216, 4.1036],
+        [2.5120, 1.4932, 2.3585, 1.0022],
+        [2.8270, 1.1518, 1.1548, 4.8987]], device='cuda:0',
+       grad_fn=<CompiledFunctionBackward>)
+done

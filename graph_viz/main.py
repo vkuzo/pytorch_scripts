@@ -16,6 +16,8 @@ test_fname1 = 'test_inputs/input_aot_graphs.txt'
 test_fname2 = 'test_inputs/input_aot_joint_graph_and_aot_graphs.txt'
 # also output_code
 test_fname3 = 'test_inputs/input_aot_joint_graph_aot_graphs_output_code.txt'
+# multiple graphs
+test_fname4 = 'test_inputs/multiple_graphs_toy_example.txt'
 
 TENSOR_NODE_COLOR = 'lavender'
 FUNC_NODE_COLOR = 'white'
@@ -464,7 +466,8 @@ def create_diagram(
 
 
 def run(
-    fname: str = test_fname3,
+    # fname: str = test_fname3,
+    fname: str = test_fname4,
     output_subdir: str = 'test',
 ):
     """
@@ -582,68 +585,46 @@ def run(
 
     joint_graph, forward_graph, backward_graph = None, None, None
 
-    # parse the graphs, if present
-    # TODO handle multiple joint graphs per log file
-    if 'joint' in aot_graph_id_to_graphs['0']:
-        start_idx, end_idx = aot_graph_id_to_graphs['0']['joint']
-        joint_graph = parse_graph(lines, start_idx, end_idx)
-    if 'forward' in aot_graph_id_to_graphs['0']:
-        start_idx, end_idx = aot_graph_id_to_graphs['0']['forward']
-        forward_graph = parse_graph(lines, start_idx, end_idx)
-    if 'backward' in aot_graph_id_to_graphs['0']:
-        start_idx, end_idx = aot_graph_id_to_graphs['0']['backward']
-        backward_graph = parse_graph(lines, start_idx, end_idx)
+    print(aot_graph_id_to_graphs.keys())
 
-    # graph of a triton kernel file, with nodes being the buffers passed around
-    # in the triton kernel wrapper
-    triton_region_graph_forward, triton_region_graph_backward = None, None
-    if 'forward' in graph_id_to_fwdbwd_to_triton_region_idxs['0']:
-        start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs['0']['forward']
-        triton_region_graph_forward = parse_triton_region_graph(lines, start_idx, end_idx)
-    if 'backward' in graph_id_to_fwdbwd_to_triton_region_idxs['0']:
-        start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs['0']['backward']
-        triton_region_graph_backward = parse_triton_region_graph(lines, start_idx, end_idx)
+    # parse the graphs, if present
+
+    aten_graph_id_to_name_to_graph = defaultdict(lambda: {})
+
+    for aten_graph_id, graphs in aot_graph_id_to_graphs.items():
+        if 'joint' in aot_graph_id_to_graphs[aten_graph_id]:
+            start_idx, end_idx = aot_graph_id_to_graphs[aten_graph_id]['joint']
+            joint_graph = parse_graph(lines, start_idx, end_idx)
+            aten_graph_id_to_name_to_graph[aten_graph_id]['joint'] = joint_graph
+        if 'forward' in aot_graph_id_to_graphs[aten_graph_id]:
+            start_idx, end_idx = aot_graph_id_to_graphs[aten_graph_id]['forward']
+            forward_graph = parse_graph(lines, start_idx, end_idx)
+            aten_graph_id_to_name_to_graph[aten_graph_id]['forward'] = forward_graph
+        if 'backward' in aot_graph_id_to_graphs[aten_graph_id]:
+            start_idx, end_idx = aot_graph_id_to_graphs[aten_graph_id]['backward']
+            backward_graph = parse_graph(lines, start_idx, end_idx)
+            aten_graph_id_to_name_to_graph[aten_graph_id]['backward'] = backward_graph
+
+        # graph of a triton kernel file, with nodes being the buffers passed around
+        # in the triton kernel wrapper
+        triton_region_graph_forward, triton_region_graph_backward = None, None
+        if 'forward' in graph_id_to_fwdbwd_to_triton_region_idxs[aten_graph_id]:
+            start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs[aten_graph_id]['forward']
+            triton_region_graph_forward = parse_triton_region_graph(lines, start_idx, end_idx)
+            aten_graph_id_to_name_to_graph[aten_graph_id]['triton_forward'] = triton_region_graph_forward
+        if 'backward' in graph_id_to_fwdbwd_to_triton_region_idxs[aten_graph_id]:
+            start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs[aten_graph_id]['backward']
+            triton_region_graph_backward = parse_triton_region_graph(lines, start_idx, end_idx)
+            aten_graph_id_to_name_to_graph[aten_graph_id]['triton_backward'] = triton_region_graph_backward
 
     output_dir = os.path.join('outputs', output_subdir)
 
     graph_titles = []
-
-    if joint_graph is not None:
-        create_diagram(
-            joint_graph,
-            output_dir,
-            'joint',
-        )
-        graph_titles.append('joint')
-    if forward_graph is not None:
-        create_diagram(
-            forward_graph,
-            output_dir,
-            'forward',
-        )
-        graph_titles.append('forward')
-    if backward_graph is not None:
-        create_diagram(
-            backward_graph,
-            output_dir,
-            'backward',
-        )
-        graph_titles.append('backward')
-
-    if triton_region_graph_forward is not None:
-        create_diagram(
-            triton_region_graph_forward,
-            output_dir,
-            'triton_region_forward',
-        )
-        graph_titles.append('triton_region_forward')
-    if triton_region_graph_backward is not None:
-        create_diagram(
-            triton_region_graph_backward,
-            output_dir,
-            'triton_region_backward',
-        )
-        graph_titles.append('triton_region_backward')
+    for aten_graph_id, name_to_graph in aten_graph_id_to_name_to_graph.items():
+        for name, graph in name_to_graph.items():
+            combined_name = f'{name}_{aten_graph_id}'
+            create_diagram(graph, output_dir, combined_name)
+            graph_titles.append(combined_name)
 
     create_html_summary(output_dir, graph_titles)
 
