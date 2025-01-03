@@ -19,6 +19,9 @@ test_fname2 = 'test_inputs/input_aot_joint_graph_and_aot_graphs.txt'
 # also output_code
 test_fname3 = 'test_inputs/input_aot_joint_graph_aot_graphs_output_code.txt'
 
+TENSOR_NODE_COLOR = 'lavender'
+FUNC_NODE_COLOR = 'white'
+
 @dataclass
 class Node:
     node_name: str
@@ -27,7 +30,7 @@ class Node:
     node_type: str
 
 # format:
-#   inputs: ['input0', ...],
+#   inputs: [Node(...), ...],
 #   nodes: {
 #     'node_n': Node(...),
 #     ...
@@ -35,7 +38,7 @@ class Node:
 #   outputs: ['output0, ...]
 @dataclass
 class ParsedGraph:
-    inputs: List[str] = field(default_factory=lambda: [])
+    inputs: List[Node] = field(default_factory=lambda: [])
     nodes: Dict[str, Node] = field(default_factory=lambda: {})
     outputs: List[str] = field(default_factory=lambda: [])
 
@@ -72,7 +75,9 @@ def parse_graph(
         res = primals_tangents_re.search(line)
         if res:
             inputs_list = [s.strip() for s in res.group(1).split(',')]
-            g.inputs = inputs_list
+            for input_str in inputs_list:
+                n = Node(input_str, [], metadata={}, node_type='input')
+                g.inputs.append(n)
             continue
 
         # specific to forward/backward graph
@@ -93,14 +98,21 @@ def parse_graph(
                     new_res += char
             new_res = new_res.replace('"',"")
             inputs_list = [s.replace(':', '').strip() for s in new_res.split(',')]
-            g.inputs = inputs_list
+            for input_str in inputs_list:
+                # ignore vars named `primals` and `tangents`, special cased for joint graph,
+                # since we already parse out `primals_1`, etc
+                if input_str in ('primals', 'tangents'):
+                    continue
+
+                n = Node(input_str, [], metadata={}, node_type='input')
+                g.inputs.append(n)
 
         # function call
         # abs_1: "bf16[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.abs.default(primals_2)
-        function_call_re = re.compile('[ ]+(\w+): ".* = ([\w\.]+)\((.*)\)')
+        function_call_re = re.compile('[ ]+(\w+): "(.*)" = ([\w\.]+)\((.*)\)')
         res = function_call_re.search(line)
         if res:
-            var_name, func_name, args_str = res.group(1), res.group(2), res.group(3)
+            var_name, var_hint, func_name, args_str = res.group(1), res.group(2), res.group(3), res.group(4)
 
             func_num_calls = function_name_to_num_calls[func_name]
             function_name_to_num_calls[func_name] += 1
@@ -117,7 +129,7 @@ def parse_graph(
             g.nodes[var_name] = Node(
                 var_name,
                 [cur_func_node_name],
-                metadata={},
+                metadata={'hint': var_hint},
                 node_type='args',
             )
 
@@ -195,6 +207,8 @@ def call(args):
 
     kernel_name_to_kernel_type = defaultdict(str)
 
+    node_name_to_hint = defaultdict(str)
+
     for line in list_of_lines[start_idx:end_idx+1]:
 
         # parse the kernel type
@@ -226,7 +240,43 @@ def call(args):
         res = args_re.match(line)
         if res:
             args_str = res.group(1).split(', ')
-            g.inputs = args_str
+            for arg_str in args_str:
+                n = Node(arg_str, [], metadata={}, node_type='input')
+                g.inputs.append(n)
+            continue
+
+        # parse size hint on incoming variables
+        # assert_size_stride(permute_3, (8192, 4096), (1, 8192))
+        incoming_var_size_hint_re = re.compile('[ ]+assert_size_stride\(([\w]+), (.*)\)')
+        res = incoming_var_size_hint_re.match(line)
+        if res:
+            node_name, hint = res.group(1), res.group(2)
+            node_name_to_hint[node_name] = hint
+
+            # modify the existing input node to include the size hint
+            for cur_input_node in g.inputs:
+                if cur_input_node.node_name == node_name:
+                    cur_input_node.metadata['hint'] = hint
+                    break
+
+            continue
+
+        # parse size hint on created buffers
+        # buf0 = empty_strided_cuda((512, ), (1, ), torch.float32)
+        buffer_create_re = re.compile('[ ]+([\w]+) = empty_strided_cuda\((.*)\)')
+        res = buffer_create_re.match(line)
+        if res:
+            node_name, hint = res.group(1), res.group(2)
+            node_name_to_hint[node_name] = hint
+            continue
+
+        # parse size hint on reused buffers
+        # buf5 = reinterpret_tensor(buf2, (8192, 2048), (2048, 1), 0); del buf2  # reuse
+        buffer_reuse_re = re.compile('[ ]+([\w]+) = reinterpret_tensor\(([\w]+), (.*)\);.*')
+        res = buffer_reuse_re.match(line)
+        if res:
+            node_name, _prev_node_name, hint = res.group(1), res.group(2), res.group(3)
+            node_name_to_hint[node_name] = hint
             continue
 
         # triton_red_fused_abs_max_0.run(primals_1, buf0, 512, 32768, grid=grid(512), stream=stream0)
@@ -252,9 +302,10 @@ def call(args):
             # output_1 ... output_n
 
             # look back in the parsed in_ptr / out_ptr map to categorize args into inputs/outputs
+            input_names = [n.node_name for n in g.inputs]
             for arg_idx, arg in enumerate(args):
                 category = arg_idx_to_input_output_none.get(arg_idx, None)
-                if arg in g.inputs or category == 'in_ptr':
+                if arg in input_names or category == 'in_ptr':
                     cur_node_inputs.append(arg)
                 elif category == 'out_ptr':
                     cur_node_outputs.append(arg)
@@ -271,7 +322,8 @@ def call(args):
                 node_type='func',
             )
             for cur_node_output in cur_node_outputs:
-                g.nodes[cur_node_output] = Node(cur_node_output, [cur_kernel_node_name], {}, node_type='args')
+                metadata = {'hint': node_name_to_hint[cur_node_output]}
+                g.nodes[cur_node_output] = Node(cur_node_output, [cur_kernel_node_name], metadata=metadata, node_type='args')
 
             continue
 
@@ -283,7 +335,8 @@ def call(args):
         if res:
             kernel_name = res.group(1)
             args = res.group(2).split(', ')
-            input_args = [a for a in args if a.startswith('buf') or a in g.inputs]
+            input_names = [n.node_name for n in g.inputs]
+            input_args = [a for a in args if a.startswith('buf') or a in input_names]
             output_arg = None
             for arg in args:
                 if arg.startswith('out='):
@@ -294,7 +347,8 @@ def call(args):
             cur_kernel_node_name = f'{kernel_name} {cur_kernel_num_calls}'
 
             g.nodes[cur_kernel_node_name] = Node(cur_kernel_node_name, input_args, {}, node_type='func')
-            g.nodes[output_arg] = Node(output_arg, [cur_kernel_node_name], {}, node_type='args')
+            metadata = {'hint': node_name_to_hint[output_arg]}
+            g.nodes[output_arg] = Node(output_arg, [cur_kernel_node_name], metadata=metadata, node_type='args')
 
         # parse the return values
         # return (buf9, buf5, reinterpret_tensor(buf10, (8192, 4096), (1, 8192), 0), reinterpret_tensor(buf13, (2048, 4096), (1, 2048), 0), buf14, )
@@ -379,9 +433,14 @@ def create_diagram(
     # Add the start nodes
     if len(g.inputs):
         dot.node('input', 'input', shape='oval')
-    for input_name in g.inputs:
+    for input_node in g.inputs:
+        input_name = input_node.node_name
         input_name_with_idx = f"{g_idx}_{input_name}"
-        dot.node(input_name_with_idx, input_name, shape='oval')
+
+        metadata_str = f"<font color='blue'>{input_node.metadata}</font>"
+        node_comment = f"<{input_name}<br/>{metadata_str}>"
+
+        dot.node(input_name_with_idx, node_comment, shape='rectangle', style='filled', fillcolor=TENSOR_NODE_COLOR)
         dot.edge('input', input_name_with_idx, '', color='lightgray')
 
     # Add the intermediate nodes
@@ -394,19 +453,25 @@ def create_diagram(
 
         # Add the node
         # use HTML syntax to make things easier to read
-        node_comment = f"<{shorten_func_name(node_name)}<br/>({args})<br/>{metadata_str}>"
         if node_type == 'args':
-            node_comment = node_name
+            node_comment = f"<{node_name}<br/>{metadata_str}>"
+        else:
+            node_comment = f"<{shorten_func_name(node_name)}<br/>({args})<br/>{metadata_str}>"
 
-        shape = 'oval'
+        # using shapes to distinguish between functions and tensors leads to too-large
+        # graph rendering, so use color instead
+        fillcolor = TENSOR_NODE_COLOR
         if node_type == 'func':
-            shape = 'rectangle'
+            fillcolor = FUNC_NODE_COLOR
 
-        dot.node(node_name_with_idx, node_comment, shape=shape, color='black')
+        # rectangle seems to be the most efficient shape in terms of the rendering
+        # space it takes on the screen
+        dot.node(node_name_with_idx, node_comment, shape='rectangle', color='black', style='filled', fillcolor=fillcolor)
 
         # Add edges to args
+        input_names = [n.node_name for n in g.inputs]
         for arg_name in args:
-            if arg_name in g.inputs or arg_name in g.nodes:
+            if arg_name in input_names or arg_name in g.nodes:
                 arg_name_with_idx = f"{g_idx}_{arg_name}"
                 dot.edge(arg_name_with_idx, node_name_with_idx, '')
 
