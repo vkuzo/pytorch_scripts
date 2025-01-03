@@ -467,8 +467,7 @@ def create_diagram(
 
 
 def run(
-    # fname: str = test_fname3,
-    fname: str = test_fname4,
+    fname: str = test_fname3,
     output_subdir: str = 'test',
 ):
     """
@@ -586,12 +585,8 @@ def run(
 
     joint_graph, forward_graph, backward_graph = None, None, None
 
-    print(aot_graph_id_to_graphs.keys())
-
     # parse the graphs, if present
-
     aten_graph_id_to_name_to_graph = defaultdict(lambda: {})
-
     for aten_graph_id, graphs in aot_graph_id_to_graphs.items():
         if 'joint' in aot_graph_id_to_graphs[aten_graph_id]:
             start_idx, end_idx = aot_graph_id_to_graphs[aten_graph_id]['joint']
