@@ -100,7 +100,7 @@ def parse_graph(
         if res:
             var_name, func_name, args_str = res.group(1), res.group(2), res.group(3)
             args_list = [s.strip() for s in args_str.split(',')]
-            g.nodes[var_name] = [func_name, args_list]
+            g.nodes[var_name] = [func_name, args_list, None]
             continue
 
         # return statement for aot_joint_graph
@@ -129,7 +129,7 @@ def parse_graph(
 
     return g
 
-def parse_triton_graph(
+def parse_triton_kernel_graph(
     list_of_lines: List[str],
     start_idx: int,
     end_idx: int,
@@ -146,7 +146,7 @@ def parse_triton_graph(
             args = res.group(2).split(', ')
             args = [s.replace('%', '').replace(',', '') for s in args]
 
-            g.nodes[target_node] = ['', args]
+            g.nodes[target_node] = ['', args, None]
             # TODO future parse the func as well
 
     # add the triton kernel text to the graph as metadata, so we can display it later
@@ -188,7 +188,7 @@ def parse_triton_graph(
 
     # TODO(future): make this also handle kwargs
     node_name_to_num_parents_children = defaultdict(lambda: [0, 0])
-    for node_name, (func, args) in g.nodes.items():
+    for node_name, (func, args, metadata) in g.nodes.items():
         for arg in args:
             # increment child counter
             node_name_to_num_parents_children[arg][1] += 1
@@ -220,6 +220,115 @@ def parse_triton_graph(
 
     # verify captured information is valid
     assert len(g.nodes) > 0
+    return g
+
+def parse_triton_region_graph(
+    list_of_lines: List[str],
+    start_idx: int,
+    end_idx: int,
+):
+    """
+    Example graph to parse:
+
+...
+def triton_red_fused_abs_max_0(in_ptr0, out_ptr0, out_ptr1, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+...
+def triton_per_fused__to_copy_abs_clamp_max_mul_reciprocal_1(in_ptr0, out_ptr0, out_ptr1, xnumel, r0_numel):
+...
+def call(args):
+    primals_1, primals_2 = args
+    ...
+    with torch.cuda._DeviceGuard(0):
+        ...
+        buf0 = empty_strided_cuda((512, ), (1, ), torch.float32)
+        triton_red_fused_abs_max_0.run(primals_1, buf0, 512, 32768, grid=grid(512), stream=stream0)
+        ...
+        buf1 = empty_strided_cuda((), (), torch.bfloat16)
+        buf4 = empty_strided_cuda((), (), torch.float32)
+        ...
+        triton_per_fused__to_copy_abs_clamp_max_mul_reciprocal_1.run(buf0, buf1, buf4, 1, 512, grid=grid(1), stream=stream0)
+        ...
+    return (buf8, buf4, reinterpret_tensor(buf9, (4096, 4096), (1, 4096), 0), reinterpret_tensor(buf12, (4096, 4096), (1, 4096), 0), buf13, )
+
+    """
+
+    g = ParsedGraph()
+
+    cur_empty_buffers_set = set()
+    cur_populated_buffers_set = set()
+
+    kernel_name_to_arg_idx_to_input_output_none = {}
+
+    # triton kernels can be called multiple times, keep track of
+    # number of calls so we can have unique nodes per kernel-call
+    kernel_name_to_num_calls = defaultdict(int)
+
+    for line in list_of_lines[start_idx:end_idx+1]:
+
+        # parse the individual kernel definition lines, we'll use this to map from buffer to input vs output
+        individual_kernel_def_re = re.compile('def (triton_.*)\((.*)\)')
+        res = individual_kernel_def_re.match(line)
+        if res:
+            args = res.group(2).split(', ')
+            arg_idx_to_category = {}
+            for arg_idx, arg in enumerate(args):
+                if arg.startswith('in_ptr'):
+                    arg_idx_to_category[arg_idx] = 'in_ptr'
+                elif arg.startswith('out_ptr'):
+                    arg_idx_to_category[arg_idx] = 'out_ptr'
+                else:
+                    arg_idx_to_category[arg_idx] = None
+            kernel_name_to_arg_idx_to_input_output_none[res.group(1)] = arg_idx_to_category
+
+        # primals_1, primals_2 = args
+        args_re = re.compile('[ ]+(.*) = args$')
+        res = args_re.match(line)
+        if res:
+            args_str = res.group(1).split(', ')
+            g.inputs = args_str
+            continue
+
+        # triton_red_fused_abs_max_0.run(primals_1, buf0, 512, 32768, grid=grid(512), stream=stream0)
+        triton_kernel_call_re = re.compile('[ ]+(triton_.*)\.run\((.*)\)')
+        res = triton_kernel_call_re.match(line)
+        if res:
+            # TODO: handle kwargs if needed
+            args_str = res.group(2)
+            args = args_str.split(', ')
+            kernel_name = res.group(1)
+
+            cur_node_inputs = []
+            cur_node_outputs = []
+
+            arg_idx_to_input_output_none = kernel_name_to_arg_idx_to_input_output_none[kernel_name]
+
+            # since triton kernels are often M inputs to N outputs, we create the following nodes
+            # to make the graph easy to read:
+            # input_1 ... input_n
+            #          |
+            #        kernel
+            #          |
+            # output_1 ... output_n
+
+            # look back in the parsed in_ptr / out_ptr map to categorize args into inputs/outputs
+            for arg_idx, arg in enumerate(args):
+                category = arg_idx_to_input_output_none.get(arg_idx, None)
+                if arg in g.inputs or category == 'in_ptr':
+                    cur_node_inputs.append(arg)
+                elif category == 'out_ptr':
+                    cur_node_outputs.append(arg)
+
+            cur_kernel_num_calls = kernel_name_to_num_calls[kernel_name]
+            kernel_name_to_num_calls[kernel_name] += 1
+            cur_kernel_node_name = f'{kernel_name}__{cur_kernel_num_calls}'
+
+            g.nodes[cur_kernel_node_name] = ['', cur_node_inputs, '']
+            for cur_node_output in cur_node_outputs:
+                g.nodes[cur_node_output] = ['', [cur_kernel_node_name], '']
+
+            continue
+
+    # TODO: populate graph outputs, will do later
     return g
 
 def fname_to_graphs(
@@ -254,6 +363,8 @@ def fname_to_graphs(
 
         cur_captured_graph_id = None
         joint_start_idx, forward_start_idx, backward_start_idx, end_idx = None, None, None, None
+
+        # for individual triton kernels
         triton_start_idx, triton_end_idx = None, None
 
         # {
@@ -267,6 +378,18 @@ def fname_to_graphs(
         graph_id_to_fwdbwd_to_triton_idxs_and_graphs = defaultdict(lambda: defaultdict(list))
 
         cur_aot_id, cur_fwd_bwd = None, None
+
+        aot_triton_region_start_idx, aot_triton_region_end_idx = None, None
+
+        # {
+        #   '0': {
+        #     'forward': [123, 126, None],
+        #     'backward': [245, 256, None],
+        #   },
+        # }
+        #
+        # The `None` entries are for the parsed graphs, which will be filled in later
+        graph_id_to_fwdbwd_to_triton_region_idxs = defaultdict(dict)
 
         for idx, line in enumerate(lines):
 
@@ -324,9 +447,6 @@ def fname_to_graphs(
                 joint_start_idx, forward_start_idx, backward_start_idx, end_idx = None, None, None, None
                 continue
 
-            # TODO(next): save the aot_id and fwd/bwd to triton graph fragments and maybe kernels,
-            # and display correspondence
-
             # triton kernel to aot_id fwd/bwd mapping
             # # AOT ID: ['0_forward']
             triton_to_aot_id = re.compile('# AOT ID: \[(.*)\]')
@@ -336,6 +456,7 @@ def fname_to_graphs(
                 aot_id, fwd_or_bwd = contents
                 cur_aot_id = aot_id
                 cur_fwd_bwd = fwd_or_bwd
+                aot_triton_region_start_idx = idx
 
             # Start of triton kernel graph fragment
             # Graph fragment:
@@ -351,6 +472,15 @@ def fname_to_graphs(
 
                 graph_id_to_fwdbwd_to_triton_idxs_and_graphs[cur_aot_id][cur_fwd_bwd].append([triton_start_idx, triton_end_idx, None])
 
+            # End of triton kernel file corresponding to AOT ID
+            # torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmpspdynggy/at/cathtx22pafsaeak2pf2g55j64arrziidjtpayap4wm6hlgbjx5m.py
+            end_of_triton_kernel_file = re.compile('.*Output code written to.*')
+            if end_of_triton_kernel_file.match(line) and aot_triton_region_start_idx is not None:
+                pass
+                aot_triton_region_end_idx = idx
+                graph_id_to_fwdbwd_to_triton_region_idxs[cur_aot_id][cur_fwd_bwd] = [aot_triton_region_start_idx, aot_triton_region_end_idx, None]
+                aot_triton_region_start_idx, aot_triton_region_end_idx = None, None
+
     joint_graph, forward_graph, backward_graph = None, None, None
 
     # parse the graphs, if present
@@ -365,12 +495,23 @@ def fname_to_graphs(
         start_idx, end_idx = aot_graph_id_to_graphs['0']['backward']
         backward_graph = parse_graph(lines, start_idx, end_idx)
 
-    # triton kernels
+    # graph of a triton kernel file, with nodes being the aten node names from
+    # graph fragments
     if 'forward' in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']:
         for entry in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['forward']:
             start_idx, end_idx, _ = entry
-            triton_graph = parse_triton_graph(lines, start_idx, end_idx)
+            triton_graph = parse_triton_kernel_graph(lines, start_idx, end_idx)
             entry[2] = triton_graph
+    # TODO(future): also backward
+
+    # graph of a triton kernel file, with nodes being the buffers passed around
+    # in the triton kernel wrapper
+    triton_region_graph = None
+    if 'forward' in graph_id_to_fwdbwd_to_triton_region_idxs['0']:
+        start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs['0']['forward']
+        print(start_idx, end_idx)
+        triton_region_graph = parse_triton_region_graph(lines, start_idx, end_idx)
+        print(triton_region_graph)
 
     output_dir = os.path.join('outputs', output_subdir)
 
@@ -400,6 +541,13 @@ def fname_to_graphs(
         output_dir,
         'triton_forward',
     )
+
+    if triton_region_graph is not None:
+        create_diagram(
+            [triton_region_graph],
+            output_dir,
+            'triton_region_forward',
+        )
 
 def shorten_func_name(s):
     """
@@ -446,13 +594,15 @@ def create_diagram(
                 dot.edge('input', input_name_with_idx, '', color='lightgray')
 
             # Add the intermediate nodes
-            for node_name, (func_name, args) in g.nodes.items():
+            for node_name, (func_name, args, metadata) in g.nodes.items():
                 node_name_with_idx = f"{g_idx}_{node_name}"
+                if metadata is None or metadata == '':
+                    metadata='a'
 
-                category_str = f"<font color='red'>test</font>"
+                metadata_str = f"<font color='red'>{metadata}</font>"
                 # Add the node
                 # use HTML syntax to make things easier to read
-                node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}<br/>{category_str}>"
+                node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}<br/>{metadata_str}>"
                 fillcolor='white'
                 c.node(node_name_with_idx, node_comment, shape='rectangle', color='black')
 
