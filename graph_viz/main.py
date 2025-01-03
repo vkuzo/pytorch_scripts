@@ -17,6 +17,13 @@ test_fname2 = 'test_inputs/input_aot_joint_graph_and_aot_graphs.txt'
 # also output_code
 test_fname3 = 'test_inputs/input_aot_joint_graph_aot_graphs_output_code.txt'
 
+@dataclass
+class Node:
+    node_name: str
+    func: str
+    args: List[str]
+    metadata: str
+
 # format:
 #   inputs: ['input0', ...],
 #   nodes: {
@@ -34,7 +41,7 @@ test_fname3 = 'test_inputs/input_aot_joint_graph_aot_graphs_output_code.txt'
 @dataclass
 class ParsedGraph:
     inputs: List[str] = field(default_factory=lambda: [])
-    nodes: Dict[str, Tuple[str, List[str]]] = field(default_factory=lambda: {})
+    nodes: Dict[str, Node] = field(default_factory=lambda: {})
     outputs: List[str] = field(default_factory=lambda: [])
     triton_kernel_str: Optional[str] = None
     # pointwise/reduction/persistent_reduction
@@ -100,7 +107,7 @@ def parse_graph(
         if res:
             var_name, func_name, args_str = res.group(1), res.group(2), res.group(3)
             args_list = [s.strip() for s in args_str.split(',')]
-            g.nodes[var_name] = [func_name, args_list, None]
+            g.nodes[var_name] = Node(var_name, func_name, args_list, None)
             continue
 
         # return statement for aot_joint_graph
@@ -146,7 +153,7 @@ def parse_triton_kernel_graph(
             args = res.group(2).split(', ')
             args = [s.replace('%', '').replace(',', '') for s in args]
 
-            g.nodes[target_node] = ['', args, None]
+            g.nodes[target_node] = Node(target_node, '', args, None)
             # TODO future parse the func as well
 
     # add the triton kernel text to the graph as metadata, so we can display it later
@@ -188,7 +195,10 @@ def parse_triton_kernel_graph(
 
     # TODO(future): make this also handle kwargs
     node_name_to_num_parents_children = defaultdict(lambda: [0, 0])
-    for node_name, (func, args, metadata) in g.nodes.items():
+    for node_name, node in g.nodes.items():
+        func = node.func
+        args = node.args
+        metadata = node.metadata
         for arg in args:
             # increment child counter
             node_name_to_num_parents_children[arg][1] += 1
@@ -322,9 +332,9 @@ def call(args):
             kernel_name_to_num_calls[kernel_name] += 1
             cur_kernel_node_name = f'{kernel_name}__{cur_kernel_num_calls}'
 
-            g.nodes[cur_kernel_node_name] = ['', cur_node_inputs, '']
+            g.nodes[cur_kernel_node_name] = Node(cur_kernel_node_name, '', cur_node_inputs, '')
             for cur_node_output in cur_node_outputs:
-                g.nodes[cur_node_output] = ['', [cur_kernel_node_name], '']
+                g.nodes[cur_node_output] = Node(cur_node_output, '', [cur_kernel_node_name], '')
 
             continue
 
@@ -594,7 +604,10 @@ def create_diagram(
                 dot.edge('input', input_name_with_idx, '', color='lightgray')
 
             # Add the intermediate nodes
-            for node_name, (func_name, args, metadata) in g.nodes.items():
+            for node_name, node in g.nodes.items():
+                func_name = node.func
+                args = node.args
+                metadata = node.metadata
                 node_name_with_idx = f"{g_idx}_{node_name}"
                 if metadata is None or metadata == '':
                     metadata='a'
