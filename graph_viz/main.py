@@ -228,6 +228,7 @@ def call(args):
         if res:
             args_str = res.group(1).split(', ')
             for arg_str in args_str:
+                arg_str = arg_str.replace(',', '')
                 n = Node(arg_str, [], metadata={}, node_type='input')
                 g.inputs.append(n)
             continue
