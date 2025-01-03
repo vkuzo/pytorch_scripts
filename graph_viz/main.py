@@ -12,15 +12,14 @@ from graphviz import Digraph
 
 # aot_joint_graph only (filename is misnamed)
 test_fname1 = 'test_inputs/input_aot_graphs.txt'
-
 # aot_joint_graph and aot_graphs
 test_fname2 = 'test_inputs/input_aot_joint_graph_and_aot_graphs.txt'
-
 # also output_code
 test_fname3 = 'test_inputs/input_aot_joint_graph_aot_graphs_output_code.txt'
 
 TENSOR_NODE_COLOR = 'lavender'
 FUNC_NODE_COLOR = 'white'
+INPUT_EDGE_COLOR = 'lightgray'
 
 @dataclass
 class Node:
@@ -29,13 +28,6 @@ class Node:
     metadata: Dict[str, str]
     node_type: str
 
-# format:
-#   inputs: [Node(...), ...],
-#   nodes: {
-#     'node_n': Node(...),
-#     ...
-#   },
-#   outputs: ['output0, ...]
 @dataclass
 class ParsedGraph:
     inputs: List[Node] = field(default_factory=lambda: [])
@@ -60,13 +52,6 @@ def parse_graph(
     function_name_to_num_calls = defaultdict(int)
 
     for line in list_of_lines[start_idx:end_idx+1]:
-
-        # Comment
-        # # File: /data/users/vasiliy/ao/torchao/float8/float8_linear.py:335 in forward, code: weight_maybe_fp8_t = self.weight.t()
-        # for now, skip matching
-
-        # Blank line
-        # for now, skip matching
 
         # specific to joint graph
         # set up primals and tangents
@@ -155,9 +140,9 @@ def parse_graph(
             continue
 
     # verify captured information is valid
-    assert g.inputs is not None
+    assert len(g.inputs) > 0
     assert len(g.nodes) > 0
-    assert g.outputs is not None
+    assert len(g.outputs) > 0
 
     return g
 
@@ -368,6 +353,9 @@ def call(args):
                         output_args.append(a.replace('reinterpret_tensor(', ''))
                 g.outputs = output_args
 
+    assert len(g.inputs) > 0
+    assert len(g.nodes) > 0
+    assert len(g.outputs) > 0
     return g
 
 
@@ -422,46 +410,36 @@ def create_diagram(
     print('creating diagram', output_dir, out_filename)
     dot = Digraph(comment='aot_joint_graph')
     dot.attr(label=out_filename)
+    # 'b' is label at the bottom of subgraph, 't' is at top
     dot.attr(labelloc='t')
     g_idx = 0
 
-    dot.attr(label=f"label: {str(g_idx)}")
-
-    # 'b' is label at the bottom of subgraph, 't' is at top
-    dot.attr(labelloc='b')
-
     # Add the start nodes
-    if len(g.inputs):
-        dot.node('input', 'input', shape='oval')
+    dot.node('input', 'input', shape='oval')
     for input_node in g.inputs:
-        input_name = input_node.node_name
-        input_name_with_idx = f"{g_idx}_{input_name}"
-
+        input_name_with_idx = f"{g_idx}_{input_node.node_name}"
         metadata_str = f"<font color='blue'>{input_node.metadata}</font>"
-        node_comment = f"<{input_name}<br/>{metadata_str}>"
+        node_comment = f"<{input_node.node_name}<br/>{metadata_str}>"
 
         dot.node(input_name_with_idx, node_comment, shape='rectangle', style='filled', fillcolor=TENSOR_NODE_COLOR)
-        dot.edge('input', input_name_with_idx, '', color='lightgray')
+        dot.edge('input', input_name_with_idx, '', color=INPUT_EDGE_COLOR)
 
     # Add the intermediate nodes
     for node_name, node in g.nodes.items():
-        args = node.args
-        metadata = node.metadata
-        node_type = node.node_type
         node_name_with_idx = f"{g_idx}_{node_name}"
-        metadata_str = f"<font color='blue'>{metadata}</font>"
+        metadata_str = f"<font color='blue'>{node.metadata}</font>"
 
         # Add the node
         # use HTML syntax to make things easier to read
-        if node_type == 'args':
+        if node.node_type == 'args':
             node_comment = f"<{node_name}<br/>{metadata_str}>"
         else:
-            node_comment = f"<{shorten_func_name(node_name)}<br/>({args})<br/>{metadata_str}>"
+            node_comment = f"<{shorten_func_name(node_name)}<br/>({node.args})<br/>{metadata_str}>"
 
         # using shapes to distinguish between functions and tensors leads to too-large
         # graph rendering, so use color instead
         fillcolor = TENSOR_NODE_COLOR
-        if node_type == 'func':
+        if node.node_type == 'func':
             fillcolor = FUNC_NODE_COLOR
 
         # rectangle seems to be the most efficient shape in terms of the rendering
@@ -470,17 +448,16 @@ def create_diagram(
 
         # Add edges to args
         input_names = [n.node_name for n in g.inputs]
-        for arg_name in args:
+        for arg_name in node.args:
             if arg_name in input_names or arg_name in g.nodes:
                 arg_name_with_idx = f"{g_idx}_{arg_name}"
                 dot.edge(arg_name_with_idx, node_name_with_idx, '')
 
     # Create output
-    if len(g.outputs):
-        dot.node('output', 'output', shape='oval')
+    dot.node('output', 'output', shape='oval')
     for output_name in g.outputs:
         output_name_with_idx = f"{g_idx}_{output_name}"
-        dot.edge(output_name_with_idx, 'output', '', color='lightgray')
+        dot.edge(output_name_with_idx, 'output', '', color=INPUT_EDGE_COLOR)
 
     out_filename = os.path.join(output_dir, out_filename)
     dot.render(out_filename, format='svg', cleanup=True)
@@ -495,9 +472,7 @@ def run(
     * `fname`: filename with logs
     # `output_subdir`: subdirectory of `outputs` where to store the output data
 
-    Outputs:
-    * aot_joint_graph
-    * aot_graphs
+    Outputs output_subdir/summary.html with svg graphs of the text graphs found in `fname`.
     """
 
     # format:
@@ -511,27 +486,24 @@ def run(
     # }
     aot_graph_id_to_graphs = defaultdict(dict)
 
+    cur_captured_graph_id = None
+    joint_start_idx, forward_start_idx, backward_start_idx, end_idx = None, None, None, None
+    cur_aot_id, cur_fwd_bwd = None, None
+    aot_triton_region_start_idx, aot_triton_region_end_idx = None, None
+
+    # {
+    #   '0': {
+    #     'forward': [123, 126, None],
+    #     'backward': [245, 256, None],
+    #   },
+    # }
+    #
+    # The `None` entries are for the parsed graphs, which will be filled in later
+    graph_id_to_fwdbwd_to_triton_region_idxs = defaultdict(dict)
+
     # parse the aot_joint graph
     with open(fname, 'r') as f:
-
         lines = f.readlines()
-
-        cur_captured_graph_id = None
-        joint_start_idx, forward_start_idx, backward_start_idx, end_idx = None, None, None, None
-
-        cur_aot_id, cur_fwd_bwd = None, None
-
-        aot_triton_region_start_idx, aot_triton_region_end_idx = None, None
-
-        # {
-        #   '0': {
-        #     'forward': [123, 126, None],
-        #     'backward': [245, 256, None],
-        #   },
-        # }
-        #
-        # The `None` entries are for the parsed graphs, which will be filled in later
-        graph_id_to_fwdbwd_to_triton_region_idxs = defaultdict(dict)
 
         for idx, line in enumerate(lines):
 
@@ -604,7 +576,6 @@ def run(
             # torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmpspdynggy/at/cathtx22pafsaeak2pf2g55j64arrziidjtpayap4wm6hlgbjx5m.py
             end_of_triton_kernel_file = re.compile('.*Output code written to.*')
             if end_of_triton_kernel_file.match(line) and aot_triton_region_start_idx is not None:
-                pass
                 aot_triton_region_end_idx = idx
                 graph_id_to_fwdbwd_to_triton_region_idxs[cur_aot_id][cur_fwd_bwd] = [aot_triton_region_start_idx, aot_triton_region_end_idx, None]
                 aot_triton_region_start_idx, aot_triton_region_end_idx = None, None
@@ -625,7 +596,7 @@ def run(
 
     # graph of a triton kernel file, with nodes being the buffers passed around
     # in the triton kernel wrapper
-    triton_region_graph = None
+    triton_region_graph_forward, triton_region_graph_backward = None, None
     if 'forward' in graph_id_to_fwdbwd_to_triton_region_idxs['0']:
         start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs['0']['forward']
         triton_region_graph_forward = parse_triton_region_graph(lines, start_idx, end_idx)
