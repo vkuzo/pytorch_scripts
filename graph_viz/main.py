@@ -23,6 +23,7 @@ class Node:
     func: str
     args: List[str]
     metadata: str
+    node_type: str
 
 # format:
 #   inputs: ['input0', ...],
@@ -107,7 +108,7 @@ def parse_graph(
         if res:
             var_name, func_name, args_str = res.group(1), res.group(2), res.group(3)
             args_list = [s.strip() for s in args_str.split(',')]
-            g.nodes[var_name] = Node(var_name, func_name, args_list, None)
+            g.nodes[var_name] = Node(var_name, func_name, args_list, None, node_type='func_and_args')
             continue
 
         # return statement for aot_joint_graph
@@ -153,7 +154,7 @@ def parse_triton_kernel_graph(
             args = res.group(2).split(', ')
             args = [s.replace('%', '').replace(',', '') for s in args]
 
-            g.nodes[target_node] = Node(target_node, '', args, None)
+            g.nodes[target_node] = Node(target_node, '', args, None, node_type='args')
             # TODO future parse the func as well
 
     # add the triton kernel text to the graph as metadata, so we can display it later
@@ -258,10 +259,10 @@ def call(args):
         ...
         triton_per_fused__to_copy_abs_clamp_max_mul_reciprocal_1.run(buf0, buf1, buf4, 1, 512, grid=grid(1), stream=stream0)
         ...
+        extern_kernels._scaled_mm(buf6, buf7, buf8, buf5, out_dtype=torch.bfloat16, use_fast_accum=True, out=buf9)
+        ...
     return (buf8, buf4, reinterpret_tensor(buf9, (4096, 4096), (1, 4096), 0), reinterpret_tensor(buf12, (4096, 4096), (1, 4096), 0), buf13, )
-
     """
-
     g = ParsedGraph()
 
     cur_empty_buffers_set = set()
@@ -272,6 +273,8 @@ def call(args):
     # triton kernels can be called multiple times, keep track of
     # number of calls so we can have unique nodes per kernel-call
     kernel_name_to_num_calls = defaultdict(int)
+
+    has_matched_final_return = False
 
     for line in list_of_lines[start_idx:end_idx+1]:
 
@@ -332,13 +335,51 @@ def call(args):
             kernel_name_to_num_calls[kernel_name] += 1
             cur_kernel_node_name = f'{kernel_name}__{cur_kernel_num_calls}'
 
-            g.nodes[cur_kernel_node_name] = Node(cur_kernel_node_name, '', cur_node_inputs, '')
+            g.nodes[cur_kernel_node_name] = Node(cur_kernel_node_name, '', cur_node_inputs, '', node_type='func')
             for cur_node_output in cur_node_outputs:
-                g.nodes[cur_node_output] = Node(cur_node_output, '', [cur_kernel_node_name], '')
+                g.nodes[cur_node_output] = Node(cur_node_output, '', [cur_kernel_node_name], '', node_type='args')
 
             continue
 
-    # TODO: populate graph outputs, will do later
+
+        # extern_kernels._scaled_mm(buf6, buf7, buf8, buf5, out_dtype=torch.bfloat16, use_fast_accum=True, out=buf9)
+        # TODO: other extern_kernels may have a different signature?
+        extern_kernels_re = re.compile('[ ]+(extern_kernels.*)\((.*)\)')
+        res = extern_kernels_re.match(line)
+        if res:
+            kernel_name = res.group(1)
+            args = res.group(2).split(', ')
+            input_args = [a for a in args if a.startswith('buf') or a in g.inputs]
+            output_arg = None
+            for arg in args:
+                if arg.startswith('out='):
+                    output_arg = arg.replace('out=', '')
+
+            cur_kernel_num_calls = kernel_name_to_num_calls[kernel_name]
+            kernel_name_to_num_calls[kernel_name] += 1
+            cur_kernel_node_name = f'{kernel_name}__{cur_kernel_num_calls}'
+
+            g.nodes[cur_kernel_node_name] = Node(cur_kernel_node_name, '', input_args, '', node_type='func')
+            g.nodes[output_arg] = Node(output_arg, '', [cur_kernel_node_name], '', node_type='args')
+
+        # parse the return values
+        # return (buf9, buf5, reinterpret_tensor(buf10, (8192, 4096), (1, 8192), 0), reinterpret_tensor(buf13, (2048, 4096), (1, 2048), 0), buf14, )
+        #
+        # To avoid matching other `return` statements, we only match the first return after `def call(args)`
+        if not has_matched_final_return:
+            final_return_re = re.compile('[ ]+return \((.*)\)')
+            res = final_return_re.match(line)
+            if res:
+                has_matched_final_return = True
+                output_args_tmp = res.group(1).split(', ')
+                output_args = []
+                for a in output_args_tmp:
+                    if a.startswith('buf'):
+                        output_args.append(a)
+                    elif a.startswith('reinterpret_tensor('):
+                        output_args.append(a.replace('reinterpret_tensor(', ''))
+                g.outputs = output_args
+
     return g
 
 def fname_to_graphs(
@@ -512,6 +553,11 @@ def fname_to_graphs(
             start_idx, end_idx, _ = entry
             triton_graph = parse_triton_kernel_graph(lines, start_idx, end_idx)
             entry[2] = triton_graph
+    if 'backward' in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']:
+        for entry in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['backward']:
+            start_idx, end_idx, _ = entry
+            triton_graph = parse_triton_kernel_graph(lines, start_idx, end_idx)
+            entry[2] = triton_graph
     # TODO(future): also backward
 
     # graph of a triton kernel file, with nodes being the buffers passed around
@@ -519,9 +565,10 @@ def fname_to_graphs(
     triton_region_graph = None
     if 'forward' in graph_id_to_fwdbwd_to_triton_region_idxs['0']:
         start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs['0']['forward']
-        print(start_idx, end_idx)
-        triton_region_graph = parse_triton_region_graph(lines, start_idx, end_idx)
-        print(triton_region_graph)
+        triton_region_graph_forward = parse_triton_region_graph(lines, start_idx, end_idx)
+    if 'backward' in graph_id_to_fwdbwd_to_triton_region_idxs['0']:
+        start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs['0']['backward']
+        triton_region_graph_backward = parse_triton_region_graph(lines, start_idx, end_idx)
 
     output_dir = os.path.join('outputs', output_subdir)
 
@@ -551,12 +598,24 @@ def fname_to_graphs(
         output_dir,
         'triton_forward',
     )
+    triton_backward_graphs = [g for _, __, g in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['backward']]
+    create_diagram(
+        triton_backward_graphs,
+        output_dir,
+        'triton_backward',
+    )
 
-    if triton_region_graph is not None:
+    if triton_region_graph_forward is not None:
         create_diagram(
-            [triton_region_graph],
+            [triton_region_graph_forward],
             output_dir,
             'triton_region_forward',
+        )
+    if triton_region_graph_backward is not None:
+        create_diagram(
+            [triton_region_graph_backward],
+            output_dir,
+            'triton_region_backward',
         )
 
 def shorten_func_name(s):
@@ -608,16 +667,24 @@ def create_diagram(
                 func_name = node.func
                 args = node.args
                 metadata = node.metadata
+                node_type = node.node_type
                 node_name_with_idx = f"{g_idx}_{node_name}"
                 if metadata is None or metadata == '':
                     metadata='a'
 
                 metadata_str = f"<font color='red'>{metadata}</font>"
+
                 # Add the node
                 # use HTML syntax to make things easier to read
                 node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}<br/>{metadata_str}>"
-                fillcolor='white'
-                c.node(node_name_with_idx, node_comment, shape='rectangle', color='black')
+                if node_type == 'args':
+                    node_comment = node_name
+
+                shape = 'oval'
+                if node_type == 'func':
+                    shape = 'rectangle'
+
+                c.node(node_name_with_idx, node_comment, shape=shape, color='black')
 
                 # Add edges to args
                 for arg_name in args:
