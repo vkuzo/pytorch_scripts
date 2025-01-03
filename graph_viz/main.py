@@ -54,6 +54,10 @@ def parse_graph(
 
     g = ParsedGraph()
 
+    # functions can be called multiple times, keep track of
+    # number of calls so we can have unique nodes per function-call
+    function_name_to_num_calls = defaultdict(int)
+
     for line in list_of_lines[start_idx:end_idx+1]:
 
         # Comment
@@ -99,8 +103,28 @@ def parse_graph(
         res = function_call_re.search(line)
         if res:
             var_name, func_name, args_str = res.group(1), res.group(2), res.group(3)
+
+            func_num_calls = function_name_to_num_calls[func_name]
+            function_name_to_num_calls[func_name] += 1
+            cur_func_node_name = f'{func_name} {func_num_calls}'
+
             args_list = [s.strip() for s in args_str.split(',')]
-            g.nodes[var_name] = Node(var_name, func_name, args_list, None, node_type='func_and_args')
+
+            g.nodes[cur_func_node_name] = Node(
+                cur_func_node_name,
+                '',
+                args_list,
+                metadata='',
+                node_type='func',
+            )
+            g.nodes[var_name] = Node(
+                var_name,
+                '',
+                [cur_func_node_name],
+                metadata='',
+                node_type='args',
+            )
+
             continue
 
         # return statement for aot_joint_graph
@@ -241,7 +265,7 @@ def call(args):
 
             cur_kernel_num_calls = kernel_name_to_num_calls[kernel_name]
             kernel_name_to_num_calls[kernel_name] += 1
-            cur_kernel_node_name = f'{kernel_name}__{cur_kernel_num_calls}'
+            cur_kernel_node_name = f'{kernel_name} {cur_kernel_num_calls}'
 
             kernel_type = kernel_name_to_kernel_type[kernel_name]
             g.nodes[cur_kernel_node_name] = Node(
@@ -272,7 +296,7 @@ def call(args):
 
             cur_kernel_num_calls = kernel_name_to_num_calls[kernel_name]
             kernel_name_to_num_calls[kernel_name] += 1
-            cur_kernel_node_name = f'{kernel_name}__{cur_kernel_num_calls}'
+            cur_kernel_node_name = f'{kernel_name} {cur_kernel_num_calls}'
 
             g.nodes[cur_kernel_node_name] = Node(cur_kernel_node_name, '', input_args, '', node_type='func')
             g.nodes[output_arg] = Node(output_arg, '', [cur_kernel_node_name], '', node_type='args')
