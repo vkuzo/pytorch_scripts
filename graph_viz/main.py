@@ -6,6 +6,8 @@ import os
 
 from typing import *
 
+from jinja2 import Template
+
 from graphviz import Digraph
 
 # aot_joint_graph only (filename is misnamed)
@@ -382,9 +384,158 @@ def call(args):
 
     return g
 
-def fname_to_graphs(
-    fname: str,
-    output_subdir: str,
+
+def create_html_summary(output_dir, graph_titles):
+    """
+    Creates a single html page which displays all the generated artifacts in `output_dir`
+    """
+    print('creating html summary')
+
+    html_filename = os.path.join(output_dir, 'summary.html')
+
+    template = Template("""
+<html>
+    <head>
+        <title>{{ title }}</title>
+    </head>
+    <body>
+        {% for row in titles_and_svgs %}
+            <h1>{{ row[0] }} </h1>
+            <object data="{{ row[1] }}" type="image/svg+xml"></object>
+        {% endfor %}
+    </body>
+</html>
+    """)
+
+    titles_and_svgs = [(t, f'{t}.svg') for t in graph_titles]
+
+    html = template.render(
+        title=f"Graph summary for {output_dir}",
+        titles_and_svgs=titles_and_svgs,
+    )
+
+    with open(html_filename, 'w') as f:
+        f.write(html)
+
+
+def shorten_func_name(s):
+    """
+    torch.ops.aten.abs.default -> abs
+    torch.ops.prims.convert_element_type.default -> convert_element_type
+    """
+    s = s.replace('torch.ops.aten.', '')
+    s = s.replace('torch.ops.prims.', '')
+    s = s.replace('.default', '')
+    return s
+
+def create_diagram(
+    graphs,
+    output_dir,
+    out_filename,
+    triton_idxs_and_graphs=None,
+):
+    print('creating diagram', output_dir, out_filename)
+    dot = Digraph(comment='aot_joint_graph')
+    dot.attr(label=out_filename)
+    dot.attr(labelloc='t')
+
+    for g_idx, g in enumerate(graphs):
+
+        # note: subgraph name must start with cluster_ for graphviz to render a border
+        with dot.subgraph(name=f"cluster_{str(g_idx)}") as c:
+
+            # TODO(future): render `g.triton_kernel_str` if present
+            if g.triton_kernel_name is not None:
+                label = f"idx: {g_idx}\nkernel_name: {g.triton_kernel_name}\ntype:{g.triton_kernel_type}"
+                c.attr(label=label)
+            else:
+                c.attr(label=f"label: {str(g_idx)}")
+
+            # 'b' is label at the bottom of subgraph, 't' is at top
+            c.attr(labelloc='b')
+
+            # Add the start nodes
+            if len(g.inputs):
+                dot.node('input', 'input', shape='oval')
+            for input_name in g.inputs:
+                input_name_with_idx = f"{g_idx}_{input_name}"
+                c.node(input_name_with_idx, input_name, shape='oval')
+                dot.edge('input', input_name_with_idx, '', color='lightgray')
+
+            # Add the intermediate nodes
+            for node_name, node in g.nodes.items():
+                func_name = node.func
+                args = node.args
+                metadata = node.metadata
+                node_type = node.node_type
+                node_name_with_idx = f"{g_idx}_{node_name}"
+                if metadata is None or metadata == '':
+                    metadata='a'
+
+                metadata_str = f"<font color='red'>{metadata}</font>"
+
+                # Add the node
+                # use HTML syntax to make things easier to read
+                node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}<br/>{metadata_str}>"
+                if node_type == 'args':
+                    node_comment = node_name
+
+                shape = 'oval'
+                if node_type == 'func':
+                    shape = 'rectangle'
+
+                c.node(node_name_with_idx, node_comment, shape=shape, color='black')
+
+                # Add edges to args
+                for arg_name in args:
+                    if arg_name in g.inputs or arg_name in g.nodes:
+                        arg_name_with_idx = f"{g_idx}_{arg_name}"
+                        dot.edge(arg_name_with_idx, node_name_with_idx, '')
+
+            # Create output
+            if len(g.outputs):
+                dot.node('output', 'output', shape='oval')
+            for output_name in g.outputs:
+                output_name_with_idx = f"{g_idx}_{output_name}"
+                dot.edge(output_name_with_idx, 'output', '', color='lightgray')
+
+    out_filename = os.path.join(output_dir, out_filename)
+    dot.render(out_filename, format='svg', cleanup=True)
+
+
+# from Claude
+def create_debug_workflow_diagram():
+    # Create a new directed graph
+    dot = Digraph(comment='Workflow Diagram')
+    dot.attr(rankdir='TB')  # Left to right layout
+
+    # Add nodes
+    dot.node('A', 'Start', shape='oval')
+    dot.node('B', 'Process Data', shape='box')
+    dot.node('C', 'Decision', shape='diamond')
+    dot.node('D', 'Success', shape='box')
+    dot.node('E', 'Error', shape='box')
+
+    # Add edges
+    dot.edge('A', 'B', 'begin')
+    dot.edge('B', 'C', 'evaluate')
+    dot.edge('C', 'D', 'yes')
+    dot.edge('C', 'E', 'no')
+
+    # Add subgraph for error handling
+    with dot.subgraph(name='cluster_0') as c:
+        c.attr(label='Error Handling')
+        c.node('E1', 'Log Error')
+        c.node('E2', 'Notify Admin')
+        dot.edge('E', 'E1')
+        dot.edge('E1', 'E2')
+
+    # Save and render
+    dot.render('workflow', format='svg', cleanup=True)
+
+def run(
+    fname: str = test_fname3,
+    output_subdir: str = 'test',
 ):
     """
     Inputs:
@@ -572,12 +723,15 @@ def fname_to_graphs(
 
     output_dir = os.path.join('outputs', output_subdir)
 
+    graph_titles = []
+
     if joint_graph is not None:
         create_diagram(
             [joint_graph],
             output_dir,
             'joint',
         )
+        graph_titles.append('joint')
     if forward_graph is not None:
         create_diagram(
             [forward_graph],
@@ -585,12 +739,14 @@ def fname_to_graphs(
             'forward',
             triton_idxs_and_graphs=graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['forward']
         )
+        graph_titles.append('forward')
     if backward_graph is not None:
         create_diagram(
             [backward_graph],
             output_dir,
             'backward',
         )
+        graph_titles.append('backward')
 
     triton_forward_graphs = [g for _, __, g in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['forward']]
     create_diagram(
@@ -598,12 +754,14 @@ def fname_to_graphs(
         output_dir,
         'triton_forward',
     )
+    graph_titles.append('triton_forward')
     triton_backward_graphs = [g for _, __, g in graph_id_to_fwdbwd_to_triton_idxs_and_graphs['0']['backward']]
     create_diagram(
         triton_backward_graphs,
         output_dir,
         'triton_backward',
     )
+    graph_titles.append('triton_backward')
 
     if triton_region_graph_forward is not None:
         create_diagram(
@@ -611,135 +769,16 @@ def fname_to_graphs(
             output_dir,
             'triton_region_forward',
         )
+        graph_titles.append('triton_region_forward')
     if triton_region_graph_backward is not None:
         create_diagram(
             [triton_region_graph_backward],
             output_dir,
             'triton_region_backward',
         )
+        graph_titles.append('triton_region_backward')
 
-def shorten_func_name(s):
-    """
-    torch.ops.aten.abs.default -> abs
-    torch.ops.prims.convert_element_type.default -> convert_element_type
-    """
-    s = s.replace('torch.ops.aten.', '')
-    s = s.replace('torch.ops.prims.', '')
-    s = s.replace('.default', '')
-    return s
-
-def create_diagram(
-    graphs,
-    output_dir,
-    out_filename,
-    triton_idxs_and_graphs=None,
-):
-    print('creating diagram', output_dir, out_filename)
-    dot = Digraph(comment='aot_joint_graph')
-    dot.attr(label=out_filename)
-    dot.attr(labelloc='t')
-
-    for g_idx, g in enumerate(graphs):
-
-        # note: subgraph name must start with cluster_ for graphviz to render a border
-        with dot.subgraph(name=f"cluster_{str(g_idx)}") as c:
-
-            # TODO(future): render `g.triton_kernel_str` if present
-            if g.triton_kernel_name is not None:
-                label = f"idx: {g_idx}\nkernel_name: {g.triton_kernel_name}\ntype:{g.triton_kernel_type}"
-                c.attr(label=label)
-            else:
-                c.attr(label=f"label: {str(g_idx)}")
-
-            # 'b' is label at the bottom of subgraph, 't' is at top
-            c.attr(labelloc='b')
-
-            # Add the start nodes
-            if len(g.inputs):
-                dot.node('input', 'input', shape='oval')
-            for input_name in g.inputs:
-                input_name_with_idx = f"{g_idx}_{input_name}"
-                c.node(input_name_with_idx, input_name, shape='oval')
-                dot.edge('input', input_name_with_idx, '', color='lightgray')
-
-            # Add the intermediate nodes
-            for node_name, node in g.nodes.items():
-                func_name = node.func
-                args = node.args
-                metadata = node.metadata
-                node_type = node.node_type
-                node_name_with_idx = f"{g_idx}_{node_name}"
-                if metadata is None or metadata == '':
-                    metadata='a'
-
-                metadata_str = f"<font color='red'>{metadata}</font>"
-
-                # Add the node
-                # use HTML syntax to make things easier to read
-                node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}<br/>{metadata_str}>"
-                if node_type == 'args':
-                    node_comment = node_name
-
-                shape = 'oval'
-                if node_type == 'func':
-                    shape = 'rectangle'
-
-                c.node(node_name_with_idx, node_comment, shape=shape, color='black')
-
-                # Add edges to args
-                for arg_name in args:
-                    if arg_name in g.inputs or arg_name in g.nodes:
-                        arg_name_with_idx = f"{g_idx}_{arg_name}"
-                        dot.edge(arg_name_with_idx, node_name_with_idx, '')
-
-            # Create output
-            if len(g.outputs):
-                dot.node('output', 'output', shape='oval')
-            for output_name in g.outputs:
-                output_name_with_idx = f"{g_idx}_{output_name}"
-                dot.edge(output_name_with_idx, 'output', '', color='lightgray')
-
-    out_filename = os.path.join(output_dir, out_filename)
-    dot.render(out_filename, format='svg', cleanup=True)
-
-
-# from Claude
-def create_debug_workflow_diagram():
-    # Create a new directed graph
-    dot = Digraph(comment='Workflow Diagram')
-    dot.attr(rankdir='TB')  # Left to right layout
-
-    # Add nodes
-    dot.node('A', 'Start', shape='oval')
-    dot.node('B', 'Process Data', shape='box')
-    dot.node('C', 'Decision', shape='diamond')
-    dot.node('D', 'Success', shape='box')
-    dot.node('E', 'Error', shape='box')
-
-    # Add edges
-    dot.edge('A', 'B', 'begin')
-    dot.edge('B', 'C', 'evaluate')
-    dot.edge('C', 'D', 'yes')
-    dot.edge('C', 'E', 'no')
-
-    # Add subgraph for error handling
-    with dot.subgraph(name='cluster_0') as c:
-        c.attr(label='Error Handling')
-        c.node('E1', 'Log Error')
-        c.node('E2', 'Notify Admin')
-        dot.edge('E', 'E1')
-        dot.edge('E1', 'E2')
-
-    # Save and render
-    dot.render('workflow', format='svg', cleanup=True)
-
-def run(
-    input_fname: str = test_fname3,
-    output_subdir: str = 'test',
-):
-    fname_to_graphs(input_fname, output_subdir)
-    print('done')
-
+    create_html_summary(output_dir, graph_titles)
 
 if __name__ == '__main__':
     fire.Fire(run)
