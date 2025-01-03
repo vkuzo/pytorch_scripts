@@ -22,16 +22,14 @@ test_fname3 = 'test_inputs/input_aot_joint_graph_aot_graphs_output_code.txt'
 @dataclass
 class Node:
     node_name: str
-    # TODO(future): move this to metadata
-    func: str
     args: List[str]
-    metadata: str
+    metadata: Dict[str, str]
     node_type: str
 
 # format:
 #   inputs: ['input0', ...],
 #   nodes: {
-#     'node_n': ['func', ['arg_0', 'arg_1']],
+#     'node_n': Node(...),
 #     ...
 #   },
 #   outputs: ['output0, ...]
@@ -112,16 +110,14 @@ def parse_graph(
 
             g.nodes[cur_func_node_name] = Node(
                 cur_func_node_name,
-                '',
                 args_list,
-                metadata='',
+                metadata={},
                 node_type='func',
             )
             g.nodes[var_name] = Node(
                 var_name,
-                '',
                 [cur_func_node_name],
-                metadata='',
+                metadata={},
                 node_type='args',
             )
 
@@ -270,13 +266,12 @@ def call(args):
             kernel_type = kernel_name_to_kernel_type[kernel_name]
             g.nodes[cur_kernel_node_name] = Node(
                 cur_kernel_node_name,
-                '',
                 cur_node_inputs,
-                metadata=kernel_type,
+                metadata={'kernel_type': kernel_type},
                 node_type='func',
             )
             for cur_node_output in cur_node_outputs:
-                g.nodes[cur_node_output] = Node(cur_node_output, '', [cur_kernel_node_name], '', node_type='args')
+                g.nodes[cur_node_output] = Node(cur_node_output, [cur_kernel_node_name], {}, node_type='args')
 
             continue
 
@@ -298,8 +293,8 @@ def call(args):
             kernel_name_to_num_calls[kernel_name] += 1
             cur_kernel_node_name = f'{kernel_name} {cur_kernel_num_calls}'
 
-            g.nodes[cur_kernel_node_name] = Node(cur_kernel_node_name, '', input_args, '', node_type='func')
-            g.nodes[output_arg] = Node(output_arg, '', [cur_kernel_node_name], '', node_type='args')
+            g.nodes[cur_kernel_node_name] = Node(cur_kernel_node_name, input_args, {}, node_type='func')
+            g.nodes[output_arg] = Node(output_arg, [cur_kernel_node_name], {}, node_type='args')
 
         # parse the return values
         # return (buf9, buf5, reinterpret_tensor(buf10, (8192, 4096), (1, 8192), 0), reinterpret_tensor(buf13, (2048, 4096), (1, 2048), 0), buf14, )
@@ -391,19 +386,15 @@ def create_diagram(
 
     # Add the intermediate nodes
     for node_name, node in g.nodes.items():
-        func_name = node.func
         args = node.args
         metadata = node.metadata
         node_type = node.node_type
         node_name_with_idx = f"{g_idx}_{node_name}"
-        if metadata is None or metadata == '':
-            metadata='a'
-
-        metadata_str = f"<font color='red'>{metadata}</font>"
+        metadata_str = f"<font color='blue'>{metadata}</font>"
 
         # Add the node
         # use HTML syntax to make things easier to read
-        node_comment = f"<{shorten_func_name(func_name)}({args})<br/><br/>{node_name}<br/>{metadata_str}>"
+        node_comment = f"<{shorten_func_name(node_name)}<br/>({args})<br/>{metadata_str}>"
         if node_type == 'args':
             node_comment = node_name
 
@@ -429,36 +420,6 @@ def create_diagram(
     out_filename = os.path.join(output_dir, out_filename)
     dot.render(out_filename, format='svg', cleanup=True)
 
-
-# from Claude
-def create_debug_workflow_diagram():
-    # Create a new directed graph
-    dot = Digraph(comment='Workflow Diagram')
-    dot.attr(rankdir='TB')  # Left to right layout
-
-    # Add nodes
-    dot.node('A', 'Start', shape='oval')
-    dot.node('B', 'Process Data', shape='box')
-    dot.node('C', 'Decision', shape='diamond')
-    dot.node('D', 'Success', shape='box')
-    dot.node('E', 'Error', shape='box')
-
-    # Add edges
-    dot.edge('A', 'B', 'begin')
-    dot.edge('B', 'C', 'evaluate')
-    dot.edge('C', 'D', 'yes')
-    dot.edge('C', 'E', 'no')
-
-    # Add subgraph for error handling
-    with dot.subgraph(name='cluster_0') as c:
-        c.attr(label='Error Handling')
-        c.node('E1', 'Log Error')
-        c.node('E2', 'Notify Admin')
-        dot.edge('E', 'E1')
-        dot.edge('E1', 'E2')
-
-    # Save and render
-    dot.render('workflow', format='svg', cleanup=True)
 
 def run(
     fname: str = test_fname3,
@@ -652,4 +613,3 @@ def run(
 
 if __name__ == '__main__':
     fire.Fire(run)
-    # create_debug_workflow_diagram()
