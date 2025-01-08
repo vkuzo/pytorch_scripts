@@ -36,6 +36,123 @@ class ParsedGraph:
     nodes: Dict[str, Node] = field(default_factory=lambda: {})
     outputs: List[str] = field(default_factory=lambda: [])
 
+def collapse_graph(g):
+    """
+    Attempts to collapse a graph. Specifically, assuming a graph of
+    tensors T_0..T_N and functions F_0..F_N, looks for patterns such as:
+
+    ... -> T_M-1
+    ... -> T_M -> F_M -> T_M+1 -> F_M+1 -> T_M+2
+                                        -> T_M+3
+
+    and replaces them with
+
+    ... -> T_M-1
+    ... -> T_M -> F_M_to_M+1 -> T_M+2
+                             -> T_M+3
+
+    with metadata set on F_M_to_M+1 being "F_M -> T_M+1 -> F_M+1"
+    """
+
+    # populate number of users per node
+    node_name_to_user_node_names = defaultdict(lambda: [])
+    for node_name, node in g.nodes.items():
+        for arg_name in node.args:
+            node_name_to_user_node_names[arg_name].append(node_name)
+
+    # find chains of collapsible nodes
+    # TODO(next) find bug here
+    collapsed_node_names_seen = set()
+    collapse_node_start_to_node_names = dict()
+
+    # note: the code below assumes that the nodes are in order of
+    # execution. This is true because of how we parsed the graph.
+    for node_name, node in g.nodes.items():
+        cur_node_name, cur_node = node_name, node
+        cur_users = node_name_to_user_node_names[node_name]
+        collapsible_subgraph_node_names = []
+
+        if cur_node.node_type != 'func':
+            continue
+        if node_name in collapsed_node_names_seen:
+            continue
+
+        def _get_num_node_args(n):
+            # args can be [node_name_1, 1.0, torch.float16, ...]
+            # this function returns the count of args which represent
+            # nodes in the graph
+            # this is pretty hacky
+            count = 0
+            for n_arg in n.args:
+                if n_arg in g.nodes:
+                    count += 1
+            return count
+
+        # there is definitely a better way to code the logic below, but for
+        # now this works
+        while True:
+            if (
+                cur_node.node_type in ('func', 'args')
+                and len(cur_users) == 1
+            ):
+
+                next_node_name = cur_users[0]
+                next_node = g.nodes[next_node_name]
+                cur_node_name, cur_node = next_node_name, next_node
+                cur_users = node_name_to_user_node_names[cur_node_name]
+
+                # TODO clean this up, a bit hacky
+                first_node_or_node_args_one = (
+                    # only merge if num_args is one, except the first node
+                    cur_node is node
+                    or _get_num_node_args(cur_node) == 1
+                )
+                if not first_node_or_node_args_one:
+                    break
+
+                collapsible_subgraph_node_names.append(cur_node_name)
+            else:
+                break
+
+        # the minimum length of a collapsible chain is 3 elements
+        if len(collapsible_subgraph_node_names) >= 3:
+            for name in collapsible_subgraph_node_names:
+                collapsed_node_names_seen.add(name)
+            collapse_node_start_to_node_names[node_name] = collapsible_subgraph_node_names
+
+    for node_start_name, collapsible_chain_names in collapse_node_start_to_node_names.items():
+
+        # example chain:
+        #   node_start_name == func1
+        #   collapsible_chain_names == [val1, func2, val2, func3, val3]
+        # we want to change it to a subgraph that looks like
+        #   new_node(func1..func3) -> val3
+
+        # 1. create the new node
+        # TODO(future): also add the args
+        new_node_name = f'{node_start_name}_{collapsible_chain_names[-2]}'
+        new_node_snippets = [(node_start_name, collapsible_chain_names[0])]
+        for idx in range(1, len(collapsible_chain_names) - 1, 2):
+            new_node_snippets.append((collapsible_chain_names[idx], collapsible_chain_names[idx+1]))
+        metadata = {'snippets': new_node_snippets}
+
+        # TODO: insert in the right place?
+        g.nodes[new_node_name] = Node(
+            new_node_name,
+            g.nodes[node_start_name].args,
+            metadata=metadata,
+            node_type='func',
+        )
+
+        # 2. change the args of the last node in the chain to point to this node instead
+        g.nodes[collapsible_chain_names[-1]].args = [new_node_name]
+
+        # 3. delete the orphaned nodes
+        for old_node_name in (node_start_name, *collapsible_chain_names[:-1]):
+            del g.nodes[old_node_name]
+
+        # TODO(future): ensure graph after mutation is consistent
+
 
 def parse_graph(
     list_of_lines: List[str],
@@ -430,7 +547,21 @@ def create_diagram(
     # Add the intermediate nodes
     for node_name, node in g.nodes.items():
         node_name_with_idx = f"{g_idx}_{node_name}"
-        metadata_str = f"<font color='blue'>{node.metadata}</font>"
+
+        # TODO this rendering is hacky, clean it up
+        if len(node.metadata) > 1 or 'snippets' in node.metadata:
+            metadata_str = "<font color='blue'>{"
+            for k, v in node.metadata.items():
+                if k == 'snippets':
+                    metadata_str += "snippets=["
+                    for snippet in v:
+                        metadata_str += f"{snippet},<br/>"
+                    metadata_str += "],"
+                else:
+                    metadata_str += f"{k}: {v},<br/>"
+            metadata_str += "}</font>"
+        else:
+            metadata_str = f"<font color='blue'>{node.metadata}</font>"
 
         # Add the node
         # use HTML syntax to make things easier to read
@@ -467,7 +598,7 @@ def create_diagram(
 
 
 def run(
-    fname: str = test_fname3,
+    fname: str = test_fname4,
     output_subdir: str = 'test',
 ):
     """
@@ -618,6 +749,7 @@ def run(
     graph_titles = []
     for aten_graph_id, name_to_graph in aten_graph_id_to_name_to_graph.items():
         for name, graph in name_to_graph.items():
+            collapse_graph(graph)
             combined_name = f'{name}_{aten_graph_id}'
             create_diagram(graph, output_dir, combined_name)
             graph_titles.append(combined_name)
