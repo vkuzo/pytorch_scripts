@@ -61,7 +61,6 @@ def collapse_graph(g):
             node_name_to_user_node_names[arg_name].append(node_name)
 
     # find chains of collapsible nodes
-    # TODO(next) find bug here
     collapsed_node_names_seen = set()
     collapse_node_start_to_node_names = dict()
 
@@ -129,11 +128,11 @@ def collapse_graph(g):
         #   new_node(func1..func3) -> val3
 
         # 1. create the new node
-        # TODO(future): also add the args
-        new_node_name = f'{node_start_name}_{collapsible_chain_names[-2]}'
-        new_node_snippets = [(node_start_name, collapsible_chain_names[0])]
+        new_node_name = f'{node_start_name}...{collapsible_chain_names[-2]}'
+        # snippets = [(func_node_name, func_args, resulting_node_name), ...]
+        new_node_snippets = [(node_start_name, g.nodes[node_start_name].args, collapsible_chain_names[0])]
         for idx in range(1, len(collapsible_chain_names) - 1, 2):
-            new_node_snippets.append((collapsible_chain_names[idx], collapsible_chain_names[idx+1]))
+            new_node_snippets.append((collapsible_chain_names[idx], g.nodes[collapsible_chain_names[idx]].args, collapsible_chain_names[idx+1]))
         metadata = {'snippets': new_node_snippets}
 
         # TODO: insert in the right place?
@@ -553,9 +552,10 @@ def create_diagram(
             metadata_str = "<font color='blue'>{"
             for k, v in node.metadata.items():
                 if k == 'snippets':
-                    metadata_str += "snippets=["
+                    metadata_str += "snippets=[<br/>"
                     for snippet in v:
-                        metadata_str += f"{snippet},<br/>"
+                        prev_node_name, prev_args, new_node_name = snippet
+                        metadata_str += f"{new_node_name} = {prev_node_name}({prev_args}),<br/>"
                     metadata_str += "],"
                 else:
                     metadata_str += f"{k}: {v},<br/>"
@@ -568,7 +568,8 @@ def create_diagram(
         if node.node_type == 'args':
             node_comment = f"<{node_name}<br/>{metadata_str}>"
         else:
-            node_comment = f"<{shorten_func_name(node_name)}<br/>({node.args})<br/>{metadata_str}>"
+            args_str = ', '.join(node.args)
+            node_comment = f"<{shorten_func_name(node_name)}({args_str})<br/>{metadata_str}>"
 
         # using shapes to distinguish between functions and tensors leads to too-large
         # graph rendering, so use color instead
@@ -598,7 +599,7 @@ def create_diagram(
 
 
 def run(
-    fname: str = test_fname4,
+    fname: str = test_fname3,
     output_subdir: str = 'test',
 ):
     """
