@@ -750,7 +750,8 @@ def run(
     graph_titles = []
     for aten_graph_id, name_to_graph in aten_graph_id_to_name_to_graph.items():
         for name, graph in name_to_graph.items():
-            collapse_graph(graph)
+            if 'triton' not in name:
+                collapse_graph(graph)
             combined_name = f'{name}_{aten_graph_id}'
             create_diagram(graph, output_dir, combined_name)
             graph_titles.append(combined_name)
