@@ -1,6 +1,6 @@
 start e8m0 test
 
-=== int -> e8m0 -> float32 ===
+=== test int -> e8m0 -> float32 ===
 
 description: min_representable, unbiased exponent: -127
   biased exponent: 0
@@ -51,7 +51,9 @@ description: nan, unbiased exponent: 128
   expected cast result: 3.40282e+38
 
 
-=== float32 -> e8m0 -> float32 ===
+=== test float32 -> e8m0 -> float32 ===
+
+===== manual test cases =====
 
 description: 2**-127, float32 val: 5.87747e-39
   fp32_org bits: 00000000010000000000000000000000
@@ -136,5 +138,10 @@ description: , float32 val: 0.375
   e8m0 bits:      01111110
   fp32_new bits: 00111111000000000000000000000000
   e8m0 -> float32 cast result: 0.5
+
+===== sweep =====
+
+MISMATCH: expected 1.17549e-38, got 5.87747e-39
+exponent 0 grs 5 res 5.87747e-39 pow2 5.87747e-39 pow2+1 1.17549e-38 round_up 1
 
 end e8m0 test
