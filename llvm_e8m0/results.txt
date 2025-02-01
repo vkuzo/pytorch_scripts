@@ -1,0 +1,140 @@
+start e8m0 test
+
+=== int -> e8m0 -> float32 ===
+
+description: min_representable, unbiased exponent: -127
+  biased exponent: 0
+  e8m0 bits: 00000000
+  e8m0 -> float32 cast result: 5.87747e-39
+  expected cast result: 5.87747e-39
+
+description: neg_two, unbiased exponent: -2
+  biased exponent: 125
+  e8m0 bits: 01111101
+  e8m0 -> float32 cast result: 0.25
+  expected cast result: 0.25
+
+description: neg_one, unbiased exponent: -1
+  biased exponent: 126
+  e8m0 bits: 01111110
+  e8m0 -> float32 cast result: 0.5
+  expected cast result: 0.5
+
+description: zero, unbiased exponent: 0
+  biased exponent: 127
+  e8m0 bits: 01111111
+  e8m0 -> float32 cast result: 1
+  expected cast result: 1
+
+description: one, unbiased exponent: 1
+  biased exponent: 128
+  e8m0 bits: 10000000
+  e8m0 -> float32 cast result: 2
+  expected cast result: 2
+
+description: two, unbiased exponent: 2
+  biased exponent: 129
+  e8m0 bits: 10000001
+  e8m0 -> float32 cast result: 4
+  expected cast result: 4
+
+description: max_representable, unbiased exponent: 127
+  biased exponent: 254
+  e8m0 bits: 11111110
+  e8m0 -> float32 cast result: 1.70141e+38
+  expected cast result: 1.70141e+38
+
+description: nan, unbiased exponent: 128
+  biased exponent: 255
+  e8m0 bits: 11111111
+  e8m0 -> float32 cast result: inf
+  expected cast result: 3.40282e+38
+
+
+=== float32 -> e8m0 -> float32 ===
+
+description: 2**-127, float32 val: 5.87747e-39
+  fp32_org bits: 00000000010000000000000000000000
+  e8m0 bits:      00000000
+  fp32_new bits: 00000000010000000000000000000000
+  e8m0 -> float32 cast result: 5.87747e-39
+
+description: max_denormal, float32 val: 1.17549e-38
+  fp32_org bits: 00000000011111111111111111111111
+  e8m0 bits:      00000001
+  fp32_new bits: 00000000100000000000000000000000
+  e8m0 -> float32 cast result: 1.17549e-38
+
+description: min_normal, float32 val: 1.17549e-38
+  fp32_org bits: 00000000100000000000000000000000
+  e8m0 bits:      00000001
+  fp32_new bits: 00000000100000000000000000000000
+  e8m0 -> float32 cast result: 1.17549e-38
+
+description: 0.25, float32 val: 0.25
+  fp32_org bits: 00111110100000000000000000000000
+  e8m0 bits:      01111101
+  fp32_new bits: 00111110100000000000000000000000
+  e8m0 -> float32 cast result: 0.25
+
+description: 0.5, float32 val: 0.5
+  fp32_org bits: 00111111000000000000000000000000
+  e8m0 bits:      01111110
+  fp32_new bits: 00111111000000000000000000000000
+  e8m0 -> float32 cast result: 0.5
+
+description: 1.0, float32 val: 1
+  fp32_org bits: 00111111100000000000000000000000
+  e8m0 bits:      01111111
+  fp32_new bits: 00111111100000000000000000000000
+  e8m0 -> float32 cast result: 1
+
+description: 2.0, float32 val: 2
+  fp32_org bits: 01000000000000000000000000000000
+  e8m0 bits:      10000000
+  fp32_new bits: 01000000000000000000000000000000
+  e8m0 -> float32 cast result: 2
+
+description: 4.0, float32 val: 4
+  fp32_org bits: 01000000100000000000000000000000
+  e8m0 bits:      10000001
+  fp32_new bits: 01000000100000000000000000000000
+  e8m0 -> float32 cast result: 4
+
+description: max_normal, float32 val: 3.40282e+38
+  fp32_org bits: 01111111011111111111111111111111
+  e8m0 bits:      11111111
+  fp32_new bits: 01111111100000000000000000000000
+  e8m0 -> float32 cast result: inf
+
+description: , float32 val: 6
+  fp32_org bits: 01000000110000000000000000000000
+  e8m0 bits:      10000010
+  fp32_new bits: 01000001000000000000000000000000
+  e8m0 -> float32 cast result: 8
+
+description: , float32 val: 3
+  fp32_org bits: 01000000010000000000000000000000
+  e8m0 bits:      10000001
+  fp32_new bits: 01000000100000000000000000000000
+  e8m0 -> float32 cast result: 4
+
+description: , float32 val: 1.5
+  fp32_org bits: 00111111110000000000000000000000
+  e8m0 bits:      10000000
+  fp32_new bits: 01000000000000000000000000000000
+  e8m0 -> float32 cast result: 2
+
+description: , float32 val: 0.75
+  fp32_org bits: 00111111010000000000000000000000
+  e8m0 bits:      01111111
+  fp32_new bits: 00111111100000000000000000000000
+  e8m0 -> float32 cast result: 1
+
+description: , float32 val: 0.375
+  fp32_org bits: 00111110110000000000000000000000
+  e8m0 bits:      01111110
+  fp32_new bits: 00111111000000000000000000000000
+  e8m0 -> float32 cast result: 0.5
+
+end e8m0 test
