@@ -18,6 +18,8 @@ test_fname2 = 'test_inputs/input_aot_joint_graph_and_aot_graphs.txt'
 test_fname3 = 'test_inputs/input_aot_joint_graph_aot_graphs_output_code.txt'
 # multiple graphs
 test_fname4 = 'test_inputs/multiple_graphs_toy_example.txt'
+# inference
+test_fname5 = 'test_inputs/inference.txt'
 
 TENSOR_NODE_COLOR = 'lavender'
 FUNC_NODE_COLOR = 'white'
@@ -744,6 +746,10 @@ def run(
             start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs[aten_graph_id]['backward']
             triton_region_graph_backward = parse_triton_region_graph(lines, start_idx, end_idx)
             aten_graph_id_to_name_to_graph[aten_graph_id]['triton_backward'] = triton_region_graph_backward
+        if 'inference' in graph_id_to_fwdbwd_to_triton_region_idxs[aten_graph_id]:
+            start_idx, end_idx, _ = graph_id_to_fwdbwd_to_triton_region_idxs[aten_graph_id]['inference']
+            triton_region_graph_forward = parse_triton_region_graph(lines, start_idx, end_idx)
+            aten_graph_id_to_name_to_graph[aten_graph_id]['triton_forward'] = triton_region_graph_forward
 
     output_dir = os.path.join('outputs', output_subdir)
 

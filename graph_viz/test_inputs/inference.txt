@@ -1,0 +1,300 @@
+/data/users/vasiliy/pytorch/torch/_dynamo/pgo.py:464: UserWarning: dynamo_pgo force disabled by torch._inductor.config.force_disable_caches
+  warn_once(
+DEBUG:torch._functorch._aot_autograd.dispatch_and_compile_graph.__aot_graphs:aot_config id: 0, fw_metadata=ViewAndMutationMeta(input_info=[InputAliasInfo(is_leaf=True, mutates_data=False, mutates_metadata=False, mutations_hidden_from_autograd=True, mutations_under_no_grad_or_inference_mode=False, mutation_inductor_storage_resize=False, mutates_storage_metadata=False, requires_grad=True, keep_input_mutations=True)], output_info=[OutputAliasInfo(output_type=<OutputType.non_alias: 1>, raw_type=<class 'torchao.prototype.mx_formats.mx_tensor.MXTensor'>, base_idx=None, dynamic_dims=set(), requires_grad=False, functional_tensor=None)], num_intermediate_bases=0, keep_input_mutations=True, traced_tangents=[], subclass_inp_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_fw_graph_out_meta=[SubclassCreationMeta(flat_tensor_start_idx=0, arg_count=2, included_subclass_symints=True, attrs={'_scale_e8m0': PlainTensorMeta(unwrapped_idx=1, memory_format=None), '_data': PlainTensorMeta(unwrapped_idx=2, memory_format=None)}, outer_size=torch.Size([2048, 4096]), outer_stride=(4096, 1), meta={'_elem_dtype': torch.float8_e4m3fn, '_block_size': 32, '_orig_dtype': torch.bfloat16, '_use_fp4_custom_triton_dequant_kernel': False, '_gemm_kernel_choice': <MXGemmKernelChoice.EMULATED: 'emulated'>}, original_subclass=MXTensor: elem_dtype: torch.float8_e4m3fn, s_e8m0: FakeTensor(..., device='cuda:0', size=(262144,), dtype=torch.uint8), d: FakeTensor(..., device='cuda:0', size=(2048, 4096), dtype=torch.float8_e4m3fn), d_hp: FakeTensor(..., device='cuda:0', size=(2048, 4096), dtype=torch.bfloat16), original_subclass_type=None, memory_format=None)], subclass_tangent_meta=[], is_train=False, traced_tangent_metas=None, num_symints_saved_for_bw=None, grad_enabled_mutation=None, deterministic=None, static_input_indices=[], tokens={}, indices_of_inputs_that_requires_grad_with_mutations_in_bw=[], bw_donated_idxs=None, num_backward_tokens=0),subclass_metadata=SubclassMeta(fw_metadata=ViewAndMutationMeta(input_info=[InputAliasInfo(is_leaf=True, mutates_data=False, mutates_metadata=False, mutations_hidden_from_autograd=True, mutations_under_no_grad_or_inference_mode=False, mutation_inductor_storage_resize=False, mutates_storage_metadata=False, requires_grad=True, keep_input_mutations=True)], output_info=[OutputAliasInfo(output_type=<OutputType.non_alias: 1>, raw_type=<class 'torch._subclasses.functional_tensor.FunctionalTensor'>, base_idx=None, dynamic_dims=set(), requires_grad=False, functional_tensor=None), OutputAliasInfo(output_type=<OutputType.non_alias: 1>, raw_type=<class 'torch._subclasses.functional_tensor.FunctionalTensor'>, base_idx=None, dynamic_dims=set(), requires_grad=False, functional_tensor=None)], num_intermediate_bases=0, keep_input_mutations=True, traced_tangents=[], subclass_inp_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None)], subclass_fw_graph_out_meta=[PlainTensorMeta(unwrapped_idx=0, memory_format=None), PlainTensorMeta(unwrapped_idx=1, memory_format=None)], subclass_tangent_meta=[], is_train=False, traced_tangent_metas=None, num_symints_saved_for_bw=None, grad_enabled_mutation=None, deterministic=None, static_input_indices=[], tokens={}, indices_of_inputs_that_requires_grad_with_mutations_in_bw=[], bw_donated_idxs=None, num_backward_tokens=0), grad_input_metas=None)
+INFO:torch._functorch._aot_autograd.dispatch_and_compile_graph.__aot_graphs:TRACED GRAPH
+ ===== Forward graph 0 =====
+ /data/users/vasiliy/pytorch/torch/fx/_lazy_graph_module.py class <lambda>(torch.nn.Module):
+    def forward(self, arg0_1: "bf16[2048, 4096][4096, 1]cuda:0"):
+         # File: /data/users/vasiliy/ao/torchao/prototype/mx_formats/mx_tensor.py:477 in to_mx, code: return ToMXConstrFunc.apply(
+        view: "bf16[262144, 32][32, 1]cuda:0" = torch.ops.aten.view.default(arg0_1, [-1, 32]);  arg0_1 = None
+        abs_1: "bf16[262144, 32][32, 1]cuda:0" = torch.ops.aten.abs.default(view)
+        amax: "bf16[262144][1]cuda:0" = torch.ops.aten.amax.default(abs_1, [1]);  abs_1 = None
+        eq: "b8[262144][1]cuda:0" = torch.ops.aten.eq.Scalar(amax, 0)
+        convert_element_type: "bf16[262144][1]cuda:0" = torch.ops.prims.convert_element_type.default(eq, torch.bfloat16);  eq = None
+        mul: "bf16[262144][1]cuda:0" = torch.ops.aten.mul.Tensor(convert_element_type, 1.1754943508222875e-38);  convert_element_type = None
+        add: "bf16[262144][1]cuda:0" = torch.ops.aten.add.Tensor(amax, mul);  amax = mul = None
+        log2: "bf16[262144][1]cuda:0" = torch.ops.aten.log2.default(add);  add = None
+        floor: "bf16[262144][1]cuda:0" = torch.ops.aten.floor.default(log2);  log2 = None
+        sub: "bf16[262144][1]cuda:0" = torch.ops.aten.sub.Tensor(floor, 8);  floor = None
+        convert_element_type_1: "f32[262144][1]cuda:0" = torch.ops.prims.convert_element_type.default(sub, torch.float32);  sub = None
+        clamp_min: "f32[262144][1]cuda:0" = torch.ops.aten.clamp_min.default(convert_element_type_1, -127);  convert_element_type_1 = None
+        clamp_max: "f32[262144][1]cuda:0" = torch.ops.aten.clamp_max.default(clamp_min, 127);  clamp_min = None
+        convert_element_type_2: "bf16[262144][1]cuda:0" = torch.ops.prims.convert_element_type.default(clamp_max, torch.bfloat16);  clamp_max = None
+        add_1: "bf16[262144][1]cuda:0" = torch.ops.aten.add.Tensor(convert_element_type_2, 127)
+        convert_element_type_3: "u8[262144][1]cuda:0" = torch.ops.prims.convert_element_type.default(add_1, torch.uint8);  add_1 = None
+        isnan: "b8[262144][1]cuda:0" = torch.ops.aten.isnan.default(convert_element_type_2)
+        scalar_tensor: "u8[][]cuda:0" = torch.ops.aten.scalar_tensor.default(255, dtype = torch.uint8, layout = torch.strided, device = device(type='cuda', index=0))
+        where: "u8[262144][1]cuda:0" = torch.ops.aten.where.self(isnan, scalar_tensor, convert_element_type_3);  isnan = scalar_tensor = convert_element_type_3 = None
+        full: "f32[262144][1]cuda:0" = torch.ops.aten.full.default([262144], 2.0, dtype = torch.float32, device = device(type='cuda', index=0), pin_memory = False)
+        pow_1: "f32[262144][1]cuda:0" = torch.ops.aten.pow.Tensor_Tensor(full, convert_element_type_2);  full = convert_element_type_2 = None
+        clamp_min_1: "f32[262144][1]cuda:0" = torch.ops.aten.clamp_min.default(pow_1, 1.1754943508222875e-38);  pow_1 = None
+        unsqueeze: "f32[262144, 1][1, 1]cuda:0" = torch.ops.aten.unsqueeze.default(clamp_min_1, 1);  clamp_min_1 = None
+        div: "f32[262144, 32][32, 1]cuda:0" = torch.ops.aten.div.Tensor(view, unsqueeze);  view = unsqueeze = None
+        clamp_min_2: "f32[262144, 32][32, 1]cuda:0" = torch.ops.aten.clamp_min.default(div, -448.0);  div = None
+        clamp_max_1: "f32[262144, 32][32, 1]cuda:0" = torch.ops.aten.clamp_max.default(clamp_min_2, 448.0);  clamp_min_2 = None
+        view_1: "f32[2048, 4096][4096, 1]cuda:0" = torch.ops.aten.view.default(clamp_max_1, [2048, 4096]);  clamp_max_1 = None
+        convert_element_type_4: "f8e4m3fn[2048, 4096][4096, 1]cuda:0" = torch.ops.prims.convert_element_type.default(view_1, torch.float8_e4m3fn);  view_1 = None
+        return (where, convert_element_type_4)
+        
+
+DEBUG:torch._inductor.codecache.__output_code:Output code: 
+# AOT ID: ['0_inference']
+from ctypes import c_void_p, c_long, c_int
+import torch
+import math
+import random
+import os
+import tempfile
+from math import inf, nan
+from cmath import nanj
+from torch._inductor.hooks import run_intermediate_hooks
+from torch._inductor.utils import maybe_profile
+from torch._inductor.codegen.memory_planning import _align as align
+from torch import device, empty_strided
+from torch._inductor.async_compile import AsyncCompile
+from torch._inductor.select_algorithm import extern_kernels
+from torch._inductor.codegen.multi_kernel import MultiKernelCall
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_heuristics import (
+    grid,
+    split_scan_grid,
+    grid_combo_kernels,
+    start_graph,
+    end_graph,
+    cooperative_reduction_grid,
+)
+from torch._C import _cuda_getCurrentRawStream as get_raw_stream
+from torch._C import _cuda_getCurrentRawStream as get_raw_stream
+
+aten = torch.ops.aten
+inductor_ops = torch.ops.inductor
+_quantized = torch.ops._quantized
+assert_size_stride = torch._C._dynamo.guards.assert_size_stride
+empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
+empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
+reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
+alloc_from_pool = torch.ops.inductor._alloc_from_pool
+async_compile = AsyncCompile()
+empty_strided_p2p = torch._C._distributed_c10d._SymmetricMemory.empty_strided_p2p
+
+
+# kernel path: /tmp/torchinductor_vasiliy/tmpsn15k4j9/r2/cr2hj7qvxvumci5imj23ha6iiniqvglfi4cvfiroj4ryg5ap3ay6.py
+# Topologically Sorted Source Nodes: [trampoline_autograd_apply], Original ATen: [aten.abs, aten.amax, aten.eq, aten._to_copy, aten.mul, aten.add, aten.log2, aten.floor, aten.sub, aten.clamp, aten.isnan, aten.scalar_tensor, aten.where]
+# Source node to ATen node mapping:
+#   trampoline_autograd_apply => abs_1, add, add_1, amax, clamp_max, clamp_min, convert_element_type, convert_element_type_1, convert_element_type_2, convert_element_type_3, eq, floor, isnan, log2, mul, scalar_tensor, sub, where
+# Graph fragment:
+#   %abs_1 : [num_users=1] = call_function[target=torch.ops.aten.abs.default](args = (%view,), kwargs = {})
+#   %amax : [num_users=2] = call_function[target=torch.ops.aten.amax.default](args = (%abs_1, [1]), kwargs = {})
+#   %eq : [num_users=1] = call_function[target=torch.ops.aten.eq.Scalar](args = (%amax, 0), kwargs = {})
+#   %convert_element_type : [num_users=1] = call_function[target=torch.ops.prims.convert_element_type.default](args = (%eq, torch.bfloat16), kwargs = {})
+#   %mul : [num_users=1] = call_function[target=torch.ops.aten.mul.Tensor](args = (%convert_element_type, 1.1754943508222875e-38), kwargs = {})
+#   %add : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%amax, %mul), kwargs = {})
+#   %log2 : [num_users=1] = call_function[target=torch.ops.aten.log2.default](args = (%add,), kwargs = {})
+#   %floor : [num_users=1] = call_function[target=torch.ops.aten.floor.default](args = (%log2,), kwargs = {})
+#   %sub : [num_users=1] = call_function[target=torch.ops.aten.sub.Tensor](args = (%floor, 8), kwargs = {})
+#   %convert_element_type_1 : [num_users=1] = call_function[target=torch.ops.prims.convert_element_type.default](args = (%sub, torch.float32), kwargs = {})
+#   %clamp_min : [num_users=1] = call_function[target=torch.ops.aten.clamp_min.default](args = (%convert_element_type_1, -127), kwargs = {})
+#   %clamp_max : [num_users=1] = call_function[target=torch.ops.aten.clamp_max.default](args = (%clamp_min, 127), kwargs = {})
+#   %convert_element_type_2 : [num_users=3] = call_function[target=torch.ops.prims.convert_element_type.default](args = (%clamp_max, torch.bfloat16), kwargs = {})
+#   %isnan : [num_users=1] = call_function[target=torch.ops.aten.isnan.default](args = (%convert_element_type_2,), kwargs = {})
+#   %scalar_tensor : [num_users=1] = call_function[target=torch.ops.aten.scalar_tensor.default](args = (255,), kwargs = {dtype: torch.uint8, layout: torch.strided, device: cuda:0})
+#   %add_1 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%convert_element_type_2, 127), kwargs = {})
+#   %convert_element_type_3 : [num_users=1] = call_function[target=torch.ops.prims.convert_element_type.default](args = (%add_1, torch.uint8), kwargs = {})
+#   %where : [num_users=1] = call_function[target=torch.ops.aten.where.self](args = (%isnan, %scalar_tensor, %convert_element_type_3), kwargs = {})
+triton_per_fused__to_copy_abs_add_amax_clamp_eq_floor_isnan_log2_mul_scalar_tensor_sub_where_0 = async_compile.triton('triton_per_fused__to_copy_abs_add_amax_clamp_eq_floor_isnan_log2_mul_scalar_tensor_sub_where_0', '''
+import triton
+import triton.language as tl
+from triton.compiler.compiler import AttrsDescriptor
+
+from torch._inductor.runtime import triton_helpers, triton_heuristics
+from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
+from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, DeviceProperties
+triton_helpers.set_driver_to_gpu()
+
+@triton_heuristics.persistent_reduction(
+    size_hints={'x': 262144, 'r0_': 32},
+    reduction_hint=ReductionHint.INNER,
+    filename=__file__,
+    triton_meta={'signature': {'in_ptr0': '*bf16', 'out_ptr0': '*bf16', 'out_ptr1': '*u8', 'xnumel': 'i32', 'r0_numel': 'i32'}, 'device': DeviceProperties(type='cuda', index=0, multi_processor_count=132, cc=90, major=9, regs_per_multiprocessor=65536, max_threads_per_multi_processor=2048, warp_size=32), 'constants': {}, 'configs': [AttrsDescriptor.from_dict({'arg_properties': {'tt.divisibility': (0, 1, 2, 3, 4), 'tt.equal_to': ()}, 'cls': 'AttrsDescriptor'})]},
+    inductor_meta={'autotune_hints': set(), 'kernel_name': 'triton_per_fused__to_copy_abs_add_amax_clamp_eq_floor_isnan_log2_mul_scalar_tensor_sub_where_0', 'mutated_arg_names': [], 'optimize_mem': True, 'no_x_dim': False, 'num_load': 1, 'num_reduction': 1, 'backend_hash': 'E5A2A8A2DA3940D7982306EB4DB6969673A9C6972732D60489D0F131EE13D9BF', 'are_deterministic_algorithms_enabled': False, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': True, 'dynamic_scale_rblock': True, 'max_autotune': False, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False}
+)
+@triton.jit
+def triton_per_fused__to_copy_abs_add_amax_clamp_eq_floor_isnan_log2_mul_scalar_tensor_sub_where_0(in_ptr0, out_ptr0, out_ptr1, xnumel, r0_numel, XBLOCK : tl.constexpr):
+    xnumel = 262144
+    r0_numel = 32
+    R0_BLOCK: tl.constexpr = 32
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
+    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+    r0_offset = 0
+    r0_mask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
+    roffset = r0_offset
+    rindex = r0_index
+    r0_1 = r0_index
+    x0 = xindex
+    tmp0 = tl.load(in_ptr0 + (r0_1 + 32*x0), None).to(tl.float32)
+    tmp1 = tl_math.abs(tmp0)
+    tmp2 = tl.broadcast_to(tmp1, [XBLOCK, R0_BLOCK])
+    tmp4 = triton_helpers.max2(tmp2, 1)[:, None]
+    tmp5 = 0.0
+    tmp6 = tmp4 == tmp5
+    tmp7 = tmp6.to(tl.float32)
+    tmp8 = 1.1754943508222875e-38
+    tmp9 = tmp7 * tmp8
+    tmp10 = tmp4 + tmp9
+    tmp11 = libdevice.log2(tmp10)
+    tmp12 = libdevice.floor(tmp11)
+    tmp13 = 8.0
+    tmp14 = tmp12 - tmp13
+    tmp15 = tmp14.to(tl.float32)
+    tmp16 = -127.0
+    tmp17 = triton_helpers.maximum(tmp15, tmp16)
+    tmp18 = 127.0
+    tmp19 = triton_helpers.minimum(tmp17, tmp18)
+    tmp20 = tmp19.to(tl.float32)
+    tmp21 = libdevice.isnan(tmp20).to(tl.int1)
+    tmp22 = tmp20 + tmp18
+    tmp23 = tmp22.to(tl.int8).to(tl.uint8)
+    tmp24 = tl.full([1, 1], 255, tl.uint8)
+    tmp25 = tl.where(tmp21, tmp24, tmp23)
+    tl.store(out_ptr1 + (x0), tmp25, None)
+    tl.store(out_ptr0 + (x0), tmp4, None)
+''', device_str='cuda')
+
+
+# kernel path: /tmp/torchinductor_vasiliy/tmpsn15k4j9/2x/c2xu4thbsz4gqnyrey7aesvh75n4cp7wibri55csbygz3fuxa2zc.py
+# Topologically Sorted Source Nodes: [trampoline_autograd_apply], Original ATen: [aten._to_copy]
+# Source node to ATen node mapping:
+#   trampoline_autograd_apply => convert_element_type_4
+# Graph fragment:
+#   %convert_element_type_4 : [num_users=1] = call_function[target=torch.ops.prims.convert_element_type.default](args = (%view_1, torch.float8_e4m3fn), kwargs = {})
+triton_poi_fused__to_copy_1 = async_compile.triton('triton_poi_fused__to_copy_1', '''
+import triton
+import triton.language as tl
+from triton.compiler.compiler import AttrsDescriptor
+
+from torch._inductor.runtime import triton_helpers, triton_heuristics
+from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
+from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, DeviceProperties
+triton_helpers.set_driver_to_gpu()
+
+@triton_heuristics.pointwise(
+    size_hints={'x': 8388608}, 
+    filename=__file__,
+    triton_meta={'signature': {'in_ptr0': '*bf16', 'in_ptr1': '*bf16', 'out_ptr0': '*fp8e4nv', 'xnumel': 'i32'}, 'device': DeviceProperties(type='cuda', index=0, multi_processor_count=132, cc=90, major=9, regs_per_multiprocessor=65536, max_threads_per_multi_processor=2048, warp_size=32), 'constants': {}, 'configs': [AttrsDescriptor.from_dict({'arg_properties': {'tt.divisibility': (0, 1, 2, 3), 'tt.equal_to': ()}, 'cls': 'AttrsDescriptor'})]},
+    inductor_meta={'autotune_hints': set(), 'kernel_name': 'triton_poi_fused__to_copy_1', 'mutated_arg_names': [], 'optimize_mem': True, 'no_x_dim': False, 'num_load': 2, 'num_reduction': 0, 'backend_hash': 'E5A2A8A2DA3940D7982306EB4DB6969673A9C6972732D60489D0F131EE13D9BF', 'are_deterministic_algorithms_enabled': False, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': True, 'dynamic_scale_rblock': True, 'max_autotune': False, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False},
+    min_elem_per_thread=2
+)
+@triton.jit
+def triton_poi_fused__to_copy_1(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 8388608
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    xmask = tl.full([XBLOCK], True, tl.int1)
+    x2 = xindex
+    tmp0 = tl.load(in_ptr0 + (x2), None).to(tl.float32)
+    tmp2 = tl.load(in_ptr1 + (x2 // 32), None, eviction_policy='evict_last').to(tl.float32)
+    tmp1 = tmp0.to(tl.float32)
+    tmp3 = 0.0
+    tmp4 = tmp2 == tmp3
+    tmp5 = tmp4.to(tl.float32)
+    tmp6 = 1.1754943508222875e-38
+    tmp7 = tmp5 * tmp6
+    tmp8 = tmp2 + tmp7
+    tmp9 = libdevice.log2(tmp8)
+    tmp10 = libdevice.floor(tmp9)
+    tmp11 = 8.0
+    tmp12 = tmp10 - tmp11
+    tmp13 = tmp12.to(tl.float32)
+    tmp14 = -127.0
+    tmp15 = triton_helpers.maximum(tmp13, tmp14)
+    tmp16 = 127.0
+    tmp17 = triton_helpers.minimum(tmp15, tmp16)
+    tmp18 = tmp17.to(tl.float32)
+    tmp19 = tmp18.to(tl.float32)
+    tmp20 = 2.0
+    tmp21 = libdevice.pow(tmp20, tmp19)
+    tmp22 = triton_helpers.maximum(tmp21, tmp6)
+    tmp23 = tmp1 / tmp22
+    tmp24 = -448.0
+    tmp25 = triton_helpers.maximum(tmp23, tmp24)
+    tmp26 = 448.0
+    tmp27 = triton_helpers.minimum(tmp25, tmp26)
+    tmp28 = tmp27.to(tl.float8e4nv)
+    tl.store(out_ptr0 + (x2), tmp28, None)
+''', device_str='cuda')
+
+
+async_compile.wait(globals())
+del async_compile
+
+def call(args):
+    arg0_1, = args
+    args.clear()
+    assert_size_stride(arg0_1, (2048, 4096), (4096, 1))
+    with torch.cuda._DeviceGuard(0):
+        torch.cuda.set_device(0)
+        buf0 = empty_strided_cuda((262144, ), (1, ), torch.bfloat16)
+        buf1 = empty_strided_cuda((262144, ), (1, ), torch.uint8)
+        # Topologically Sorted Source Nodes: [trampoline_autograd_apply], Original ATen: [aten.abs, aten.amax, aten.eq, aten._to_copy, aten.mul, aten.add, aten.log2, aten.floor, aten.sub, aten.clamp, aten.isnan, aten.scalar_tensor, aten.where]
+        stream0 = get_raw_stream(0)
+        triton_per_fused__to_copy_abs_add_amax_clamp_eq_floor_isnan_log2_mul_scalar_tensor_sub_where_0.run(arg0_1, buf0, buf1, 262144, 32, grid=grid(262144), stream=stream0)
+        buf2 = empty_strided_cuda((2048, 4096), (4096, 1), torch.float8_e4m3fn)
+        # Topologically Sorted Source Nodes: [trampoline_autograd_apply], Original ATen: [aten._to_copy]
+        stream0 = get_raw_stream(0)
+        triton_poi_fused__to_copy_1.run(arg0_1, buf0, buf2, 8388608, grid=grid(8388608), stream=stream0)
+        del arg0_1
+        del buf0
+    return (buf1, buf2, )
+
+
+def benchmark_compiled_module(times=10, repeat=10):
+    from torch._dynamo.testing import rand_strided
+    from torch._inductor.utils import print_performance
+    arg0_1 = rand_strided((2048, 4096), (4096, 1), device='cuda:0', dtype=torch.bfloat16)
+    fn = lambda: call([arg0_1])
+    return print_performance(fn, times=times, repeat=repeat)
+
+
+if __name__ == "__main__":
+    from torch._inductor.wrapper_benchmark import compiled_module_main
+    compiled_module_main('None', benchmark_compiled_module)
+
+DEBUG:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmpsn15k4j9/hz/chz5i3yxxsiu3mqw6tjnldzx4auyujylgzvqclomkv6o4wfukvjo.py
+INFO:torch._inductor.codecache.__output_code:Output code written to: /tmp/torchinductor_vasiliy/tmpsn15k4j9/hz/chz5i3yxxsiu3mqw6tjnldzx4auyujylgzvqclomkv6o4wfukvjo.py
+Compile is set to       | True
+model_type is set to    | linear
+enable_activation_checkpointing is set to False
+mode_filter is set to cast_only
+config: MXLinearConfig(block_size=32, elem_dtype=torch.float8_e4m3fn, elem_dtype_weight_override=None, elem_dtype_grad_output_override=None, gemm_kernel_choice=<MXGemmKernelChoice.EMULATED: 'emulated'>, use_fp4_custom_triton_dequant_kernel=False)
+m_ref Sequential(
+  (0): Linear(in_features=4096, out_features=8192, bias=False)
+)
+m_lowp Sequential(
+  (0): MXLinear(in_features=4096, out_features=8192, bias=False)
+)
+input_tensor.shape torch.Size([2048, 4096])
+grad_output.shape torch.Size([2048, 8192])
+
+profiling lowp
+saved profiling trace to /home/vasiliy/local/tmp/20250223_test_linear_lowp_compile_True.json
+
+Summary of GPU time by CPU kernel
+
+   experiment  ... bw_gpbs
+1     1_lowp  ...    None
+0     1_lowp  ...    None
+
+[2 rows x 6 columns]
+
+Summary of time (ms) by kernel category
+
+ experiment  1_lowp
+category          
+1_other      0.034
+All          0.034
