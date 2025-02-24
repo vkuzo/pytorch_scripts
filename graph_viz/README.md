@@ -17,4 +17,10 @@ python main.py your_logs.txt ~/local/tmp/your_output_dir
 
 Note that below is a screenshot of partial output.  In the actual output you can zoom, scroll and text search.
 
+### AOT joint
+
+<img width="2224" alt="Image" src="https://github.com/user-attachments/assets/701efd44-2ce9-4991-8696-fad7bb531928" />
+
+### AOT forward and backward
+
 <img width="1535" alt="Image" src="https://github.com/user-attachments/assets/44c71edc-0e97-46c1-9d63-1eba852cb111" />
