@@ -24,3 +24,7 @@ Note that below is a screenshot of partial output.  In the actual output you can
 ### AOT forward and backward
 
 <img width="1535" alt="Image" src="https://github.com/user-attachments/assets/44c71edc-0e97-46c1-9d63-1eba852cb111" />
+
+### triton forward and backward
+
+<img width="1631" alt="Image" src="https://github.com/user-attachments/assets/c5e628f6-1ab6-4389-96df-63be21bdd132" />
