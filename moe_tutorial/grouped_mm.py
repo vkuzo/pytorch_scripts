@@ -102,6 +102,14 @@ def run():
         torch.testing.assert_close(grad_input_repro, x_ref.grad, atol=0, rtol=0)
 
         # calculate grad_weight by hand
+        #
+        # note that both grad.t() and x are 2D, and the offsets are used to slice
+        # along the M dimension, as follows:
+        #
+        #   grad_weight[0, N, K] = grad_output.t()[N, M0:M1] @ input[M0:M1, K]
+        #   grad_weight[1, N, K] = grad_output.t()[N, M1:M2] @ input[M1:M2, K]
+        #   ...
+
         grad_weight_repro = torch._grouped_mm(grad.t(), x, x_offsets)
         grad_weight_ref = torch.stack([expert0.weight.grad, expert1.weight.grad])
         torch.testing.assert_close(grad_weight_repro, grad_weight_ref, atol=0, rtol=0)
