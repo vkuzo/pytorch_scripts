@@ -14,10 +14,9 @@ import numpy as np
 import torch
 import time
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Callable, Optional, Literal
 
 from transformers import TorchAoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 import torchao
 from torchao.quantization.quant_api import (
     Float8DynamicActivationFloat8WeightConfig,
@@ -31,10 +30,18 @@ from torchao.quantization.quant_api import (
     Int8DynamicActivationInt4WeightConfig,
     CutlassInt4PackedLayout,
 )
-from torchao.prototype.mx_formats.mx_subclass import MXFPInferenceConfig
+from torchao.prototype.mx_formats.inference_workflow import MXFPInferenceConfig
 from torchao.prototype.mx_formats import MXGemmKernelChoice
 from jsonargparse import CLI, Namespace
 from rich import print
+
+from torch._inductor.utils import do_bench_using_profiling
+
+def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
+    """Thin wrapper around do_bench_using_profiling"""
+    no_args = lambda: func(*args, **kwargs)
+    time = do_bench_using_profiling(no_args)
+    return time * 1e3
 
 
 # Set seeds for reproducibility
