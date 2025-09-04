@@ -33,6 +33,7 @@ class TopkRouter(nn.Module):
         self.linear = nn.Linear(n_embed, num_experts)
     
     def forward(self, mh_output):
+
         # input: (*leading_dims, n_embed)
         # output:
         #   router_output: (*leading_dims, num_experts)
@@ -75,10 +76,25 @@ class SparseMoE(nn.Module):
 
         # gating_output: (*dims, num_experts)
         # indices: (*dims, top_k)
+        #
+        # example for *dims = 2, num_experts = 4, top_k = 2:
+        # 
+        # gating_output[*dims, 4] = [
+        #   [0, 0, 0.45, 0.55,],
+        #   [0.6, 0.4, 0, 0],
+        # ],
+        #
+        # indices[*dims, top_k] = [
+        #   [3, 2],
+        #   [0, 1],
+        # ]
         gating_output, indices = self.router(x)
 
         # final_output: (*dims, n_embed)
         final_output = torch.zeros_like(x)
+
+        # Probably not worth annotating code below, just rewrite
+        # TODO(future): rewrite in a more idiomatic way
 
         # Reshape inputs for batch processing
         flat_x = x.view(-1, x.size(-1))  # (-1, n_embed)
@@ -123,17 +139,16 @@ def run():
 
     # Understanding how gating works    
 
+    leading_dims = (2,)
     num_experts = 4
     top_k = 2
-    n_embed = 32
+    n_embed = 8
     dropout = 0.1
 
     # example MHA output
-    mh_output = torch.randn(2, 4, n_embed)  # (2, 4, n_embed)
+    mh_output = torch.randn(*leading_dims, n_embed)
     print('mh_output.shape', mh_output.shape)
 
-    # router = TopkRouter(n_embed, num_experts, top_k)
-    # output, indices = router(mh_output)
     sparse_moe = SparseMoE(n_embed, num_experts, top_k, dropout)
     final_output = sparse_moe(mh_output)
     print('final_output.shape', final_output.shape)
