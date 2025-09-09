@@ -19,7 +19,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor.parallel import parallelize_module
 
 from torchtitan_moe import MoE, MoEArgs
-from expert_parallel import ExpertParallel, NoParallel
+from expert_parallel import ExpertParallel
 
 torch.backends.fp32_precision = "ieee"
 
@@ -47,11 +47,6 @@ def apply_moe_ep(
         device_mesh=ep_mesh,
         parallelize_plan=ExpertParallel(),
     )
-    parallelize_module(
-        module=model.router.gate,
-        device_mesh=ep_mesh,
-        parallelize_plan=NoParallel(use_local_output=False, output_layout=Shard(0)),
-    )
 
 def run():
 
@@ -73,32 +68,23 @@ def run():
         moe.init_weights(init_std=0.1, buffer_device='cuda')
         x = torch.randn(batch, seq, dim, dtype=torch.bfloat16)
 
-    print0(moe)
-    print0(moe.experts.w1)
-
-    y_ref = moe(x)
-
-    apply_moe_ep(moe, device_mesh)
-    print0(moe)
-    print0(moe.experts.w1)
-    # TODO(next): need to implement dp for x
-
+    # in torchtitan, DP is implicit, so we keep the input tensor as a
+    # regular tensor instead of converting to DTensor
     batch_local_size = batch // world_size
     batch_local_start = batch_local_size * local_rank
     batch_local_end = batch_local_start + batch_local_size
-    # print0('x', x, x.shape)
     x_local = x[batch_local_start:batch_local_end]
-    # print0('x_local', x_local, x_local.shape)
-    x_sharded = torch.distributed.tensor.distribute_tensor(
-        x_local,
-        device_mesh,
-        placements=(Shard(0),),
-    )
-    # print0('x_sharded', x_sharded, x_sharded.shape)
 
-    # does not work (https://www.internalfb.com/phabricator/paste/view/P1939006644)
-    # TODO: fix it
-    y2 = moe(x_sharded)
+    print0(moe)
+    # print0(moe.experts.w1)
+
+    y_ref = moe(x_local)
+
+    apply_moe_ep(moe, device_mesh)
+    # print0(moe)
+    # print0(moe.experts.w1)
+
+    y2 = moe(x_local)
 
     # exact match
     torch.testing.assert_close(y_ref, y2, rtol=0, atol=0)
