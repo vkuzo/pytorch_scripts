@@ -143,11 +143,8 @@ class TokenChoiceTopKRouter(nn.Module):
             num_tokens_per_expert (torch.Tensor):
                 Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
-        print('gate x', type(x), x)
-        print('gate weight', self.gate.weight)
         # scores shape (bs*slen, num_experts)
         scores = self.gate(x)
-        print('gate scores', type(scores), scores)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -156,7 +153,6 @@ class TokenChoiceTopKRouter(nn.Module):
             scores = F.softmax(scores.to(torch.float32), dim=1)
         else:
             raise NotImplementedError(f"Unknown score function {self.score_function}")
-        print('gate scores2', type(scores))
 
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
@@ -170,8 +166,6 @@ class TokenChoiceTopKRouter(nn.Module):
             top_scores, selected_experts_indices = torch.topk(
                 scores, k=self.top_k, dim=1
             )
-        print('gate top_scores', type(top_scores))
-        print('gate selected_experts_indices', type(selected_experts_indices), selected_experts_indices, selected_experts_indices.dtype, selected_experts_indices.device)
 
         if self.score_func == "sigmoid" and self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
@@ -280,8 +274,6 @@ class MoE(nn.Module):
         token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
 
         # shape (bs*slen*top_k, dim)
-        print(0, type(x))
-        print(1, type(token_indices))
         routed_input = torch.gather(
             x.view(-1, dim),
             dim=0,
