@@ -325,15 +325,54 @@ class MoE(nn.Module):
                 self.tokens_per_expert.add_(num_tokens_per_expert)
 
         # shape (bs*slen*top_k, dim)
+
+        # example: turns
+        # 
+        #   [3, 0, 1, 2]
+        # 
+        # into
+        # 
+        #   [[3, 3, 3, 3, 3, 3, 3], 
+        #    [0, 0, 0, 0, 0, 0, 0],
+        #    [1, 1, 1, 1, 1, 1, 1],
+        #    [2, 2, 2, 2, 2, 2, 2]]
+        #
+        # print0('token_indices before', token_indices, token_indices.shape)
         token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
+        # print0('token_indices after', token_indices, token_indices.shape)
 
         # shape (bs*slen*top_k, dim)
+        #
+        # example input before shuffling:
+        #   tensor([[[ 0.9258,  0.2041,  1.1016, -0.0518, -1.1953,  0.2773, -0.9492, -0.3457],
+        #            [-0.3789,  0.8242,  0.0203,  0.3945, -0.1377, -0.3984, -0.3633, -0.1514],
+        #            [ 1.5000, -1.3125, -0.8594, -0.5820, -0.5039,  0.2100, -1.3281, -0.3789],
+        #            [ 0.1045,  1.0703, -0.6953,  0.8125,  0.2461, -0.0194, -1.8516, -0.8750]]])
+        #
+        # after shuffling with torch.gather and token_indices [3, 0, 1, 2] after expansion:
+        #
+        # tensor([[ 0.1045,  1.0703, -0.6953,  0.8125,  0.2461, -0.0194, -1.8516, -0.8750],
+        #         [ 0.9258,  0.2041,  1.1016, -0.0518, -1.1953,  0.2773, -0.9492, -0.3457],
+        #         [-0.3789,  0.8242,  0.0203,  0.3945, -0.1377, -0.3984, -0.3633, -0.1514],
+        #         [ 1.5000, -1.3125, -0.8594, -0.5820, -0.5039,  0.2100, -1.3281, -0.3789]],)
+        #
         routed_input = torch.gather(
             x.view(-1, dim),
             dim=0,
             index=token_indices,
         )
         print0('routed_input', routed_input.shape, routed_input)
+        # after this step, `routed_input` contains tokens grouped by expert assignment,
+        # and `num_tokens_per_expert` contains how many tokens each expert should process
+        # for example, on DP rank 0:
+        # 
+        # routed_input = [
+        #   rank0_expert0_0,                   # tokens on rank0 for expert0
+        #   ,                                  # tokens on rank0 for expert1 (no tokens) 
+        #   rank0_expert2_0, rank0_expert2_1,  # tokens on rank0 for expert2
+        #   rank0_expert3_0,                   # tokens on rank0 for expert3
+        # ]
+        # num_tokens_per_expert = [1, 0, 2, 1]
 
         if self.score_before_experts:
             routed_input = (
