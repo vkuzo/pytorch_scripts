@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from expert_parallel import expert_parallel
+from utils import print0
 
 
 @dataclass
@@ -254,13 +255,21 @@ class MoE(nn.Module):
         """
         bs, slen, dim = x.shape
 
-        # top_scores and selected_indices shape (bs*slen*top_k,)
-        # num_tokens_per_expert shape (num_experts,)
+        print0('x', x.shape, x)
+        print0('start router')
         (
             top_scores,
             token_indices,
             num_tokens_per_expert,
         ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
+
+        # top_scores and selected_indices shape (bs*slen*top_k,)
+        print0('top_scores', top_scores.shape, top_scores)
+        print0('token_indices', token_indices.shape, token_indices)
+
+        # num_tokens_per_expert shape (num_experts,)
+        print0('num_tokens_per_expert', num_tokens_per_expert)
+        print0('end router')
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # TODO: Activation Checkpointing has the side effect of double counting tokens_per_expert --
@@ -279,6 +288,7 @@ class MoE(nn.Module):
             dim=0,
             index=token_indices,
         )
+        print0('routed_input', routed_input.shape, routed_input)
 
         if self.score_before_experts:
             routed_input = (
@@ -286,7 +296,9 @@ class MoE(nn.Module):
             ).to(x.dtype)
 
         # shape (bs*slen*top_k, dim)
+        print0('start routed output')
         routed_output = self.experts(routed_input, num_tokens_per_expert)
+        print0('end routed output')
 
         if not self.score_before_experts:
             routed_output = (
