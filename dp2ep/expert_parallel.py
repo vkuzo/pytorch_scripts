@@ -14,6 +14,7 @@ from typing import Callable, Literal
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed import get_rank
 from torch.distributed.tensor import (
     DeviceMesh,
     distribute_module,
@@ -100,6 +101,9 @@ class ExpertParallel(ParallelStyle):
         print0('start token dispatch')
         # annotate module input placements/sharding with input_layouts
         routed_input, num_tokens_per_expert = inputs
+        print0('routed_input', routed_input)
+
+        # print('rank', get_rank(), 'num_tokens_per_expert', num_tokens_per_expert, '\n')
 
         # generate the input splits and output splits for all-to-all
         with torch.no_grad():
@@ -111,15 +115,47 @@ class ExpertParallel(ParallelStyle):
                 num_tokens_per_expert,
                 group=device_mesh.get_group(),
             )
+            # example with actual values
+            #
+            # before all_to_all_single 
+            #   num_tokens_per_expert rank 0: tensor([1, 0, 2, 1], device='cuda:0')
+            #   num_tokens_per_expert rank 1: tensor([0, 0, 1, 3], device='cuda:1')
+            # after all_to_all_single 
+            #   num_tokens_per_expert_group rank 0: tensor([1, 0, 0, 0], device='cuda:0')
+            #   num_tokens_per_expert_group rank 1: tensor([2, 1, 1, 3], device='cuda:1')
+            # 
+            # example with variables
+            #
+            # before all_to_all_single
+            #   rank 0: [n0, n1, n2, n3]
+            #   rank 1: [n4, n5, n6, n7]
+            # after all_to_all_single
+            #   rank 0: [n0, n1, n4, n5]
+            #   rank 1: [n2, n3, n6, n7]
+
+            # print('rank', get_rank(), 'num_tokens_per_expert_group', num_tokens_per_expert_group)
+
             # NOTE: this would incur a device-to-host sync
             self.input_splits = (
                 num_tokens_per_expert.view(device_mesh.shape[0], -1).sum(dim=1).tolist()
             )
+
+            # example input_splits (how many tokens each rank is sending in a2a)
+            #   rank 0: [1, 3]  # 1 token for experts 0:1, 3 tokens for experts 2:3
+            #   rank 1: [0, 4]  # 0 token for experts 0:1, 4 tokens for experts 2:3
+            # print('rank', get_rank(), 'input_splits', self.input_splits)
+            # print0('input_splits', self.input_splits)
+
+            # example output_splits (how many tokens each rank is receiving in a2a)
+            #   rank 0: [1, 0]  # 1 token for expert 0, 0 tokens for expert 1
+            #   rank 1: [3, 4]  # 3 token for expert 2, 4 tokens for expert 3
             self.output_splits = (
                 num_tokens_per_expert_group.view(device_mesh.shape[0], -1)
                 .sum(dim=1)
                 .tolist()
             )
+            # print('rank', get_rank(), 'output_splits', self.output_splits)
+            # print0('output_splits', self.output_splits)
 
         # perform all-to-all
         routed_input = all_to_all_single_autograd(
