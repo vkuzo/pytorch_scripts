@@ -21,12 +21,9 @@ from torch.distributed.tensor.parallel import parallelize_module
 from torchtitan_moe import MoE, MoEArgs
 from expert_parallel import ExpertParallel
 
-torch.backends.fp32_precision = "ieee"
+from utils import print0
 
-def print0(*args, **kwargs):
-    if not get_rank() == 0:
-        return
-    print(*args, **kwargs)
+torch.backends.fp32_precision = "ieee"
 
 def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", -1))
@@ -53,16 +50,25 @@ def run():
     device_mesh = setup_distributed()
     world_size = torch.distributed.get_world_size()
     local_rank = torch.distributed.get_rank()
+    assert world_size == 2, "unsupported"
 
+    # turn off shared expert for now, for simplicity
+    num_experts, num_shared_experts = 2, 0
+    top_k = 1
     moe_args = MoEArgs(
-        num_experts=2,
-        # turn off shared expert for now, for simplicity
-        num_shared_experts=0,
+        num_experts=num_experts,
+        num_shared_experts=num_shared_experts,
         # turn off expert bias for now, for simplicity
         load_balance_coeff=None,
+        top_k=top_k,
+        # set score_before_experts to False for simplicity
+        score_before_experts=False
     )
-    dim, hidden_dim = 512, 1024
-    batch, seq, dim = 8, 2028, dim
+    dim, hidden_dim = 8, 16
+    batch, seq = 2, 4
+
+    print0(f'{dim=}, {hidden_dim=}, {batch=}, {seq=}, {num_experts=}, {top_k=}')
+
     with torch.device('cuda'):
         moe = MoE(moe_args, dim, hidden_dim).to(torch.bfloat16)
         moe.init_weights(init_std=0.1, buffer_device='cuda')
@@ -74,14 +80,17 @@ def run():
     batch_local_start = batch_local_size * local_rank
     batch_local_end = batch_local_start + batch_local_size
     x_local = x[batch_local_start:batch_local_end]
+    print0('x.shape', x.shape, 'x_local.shape', x_local.shape)
 
     print0(moe)
-    # print0(moe.experts.w1)
+    # print0('before moe.experts.w1', moe.experts.w1)
 
+    print0('\nstarting ep==1\n')
     y_ref = moe(x_local)
 
+    print0('\nstarting ep==2\n')
     apply_moe_ep(moe, device_mesh)
-    # print0(moe)
+    # print('local_rank', local_rank, 'after moe.experts.w1', moe.experts.w1)
     # print0(moe.experts.w1)
 
     y2 = moe(x_local)
@@ -91,7 +100,7 @@ def run():
 
     # torch.distributed.breakpoint(0)
 
-    print0('done')
+    print0('dp2ep done')
 
     torch.distributed.destroy_process_group()
 
