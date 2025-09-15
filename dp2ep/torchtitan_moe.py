@@ -155,6 +155,13 @@ class TokenChoiceTopKRouter(nn.Module):
         else:
             raise NotImplementedError(f"Unknown score function {self.score_function}")
 
+        # example raw scores for local batch_size 1, seq_len 4, num_experts 4
+        # raw scores tensor([[0.5205, 0.4301, 0.5530, 0.4598],
+        #         [0.4884, 0.5011, 0.5045, 0.4773],
+        #         [0.5254, 0.4230, 0.4948, 0.5964],
+        #         [0.5081, 0.4400, 0.4632, 0.4840]], device='cuda:0',
+        #        grad_fn=<SigmoidBackward0>)
+        # print0('raw scores', scores, scores.shape)
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
@@ -167,6 +174,13 @@ class TokenChoiceTopKRouter(nn.Module):
             top_scores, selected_experts_indices = torch.topk(
                 scores, k=self.top_k, dim=1
             )
+
+        # example top_scores before sorting them:
+        #   tensor([[0.5530], [0.5045], [0.5964], [0.5081]], device='cuda:0', grad_fn=<TopkBackward0>)
+        # print0('top_scores', top_scores)
+        # example selected_experts_indices:
+        #   ([[2], [2], [3], [0]], device='cuda:0')
+        # print0('selected_experts_indices', selected_experts_indices)
 
         if self.score_func == "sigmoid" and self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
@@ -181,13 +195,26 @@ class TokenChoiceTopKRouter(nn.Module):
             max=self.num_experts,
         )
 
+        # example num_tokens_per_expert
+        #   tensor([1, 0, 2, 1], device='cuda:0')
+        # print0('num_tokens_per_expert', num_tokens_per_expert)
+
+
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
         token_indices_experts_sorted = torch.argsort(
             selected_experts_indices.view(-1), stable=True
         )
 
+        # example token_indices_experts_sorted
+        #   tensor([3, 0, 1, 2], device='cuda:0') 
+        # print0('token_indices_experts_sorted', token_indices_experts_sorted)
+
+        # example sorting of top_scores:
+        #   before: tensor([0.5530, 0.5045, 0.5964, 0.5081], ...)
+        #   after: tensor([0.5081, 0.5530, 0.5045, 0.5964], ...)
         top_scores = top_scores.view(-1)[token_indices_experts_sorted]
+
         token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
 
         return top_scores, token_indices_experts_sorted, num_tokens_per_expert
@@ -257,6 +284,24 @@ class MoE(nn.Module):
 
         print0('x', x.shape, x)
         print0('start router')
+
+        # (inside router) example raw scores for local batch_size 1, seq_len 4, num_experts 4
+        #   raw scores tensor([[0.5205, 0.4301, 0.5530, 0.4598],
+        #         [0.4884, 0.5011, 0.5045, 0.4773],
+        #         [0.5254, 0.4230, 0.4948, 0.5964],
+        #         [0.5081, 0.4400, 0.4632, 0.4840]], device='cuda:0',
+        #        grad_fn=<SigmoidBackward0>)
+        # (inside router) example top_scores before sorting them:
+        #   tensor([[0.5530], [0.5045], [0.5964], [0.5081]], device='cuda:0', grad_fn=<TopkBackward0>)
+        # (inside router) example selected_experts_indices:
+        #   ([[2], [2], [3], [0]], device='cuda:0')
+
+        # example top_scores (after sorting by token_indices) 
+        #   tensor([0.5081, 0.5530, 0.5045, 0.5964], ...)
+        # example token_indices
+        #   tensor([3, 0, 1, 2], device='cuda:0') 
+        # example num_tokens_per_expert
+        #   tensor([1, 0, 2, 1], device='cuda:0')
         (
             top_scores,
             token_indices,
