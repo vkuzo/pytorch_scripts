@@ -3,7 +3,7 @@ Working through dp2ep with DTensor
 
 run with
 
-  torchrun --nproc_per_node 2 dp2ep.py
+  torchrun --nproc_per_node 2 main.py
 """
 
 import copy
