@@ -29,7 +29,8 @@ def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", -1))
     device_mesh = init_device_mesh("cuda", (world_size,))
     # seed must be the same in all processes
-    torch.manual_seed(1)
+    # seed 6 happens to give nice splits of tokens to 4 experts in toy example
+    torch.manual_seed(6)
     local_rank = torch.distributed.get_rank()
     torch.cuda.set_device(local_rank)
     return device_mesh
@@ -53,7 +54,7 @@ def run():
     assert world_size == 2, "unsupported"
 
     # turn off shared expert for now, for simplicity
-    num_experts, num_shared_experts = 2, 0
+    num_experts, num_shared_experts = 4, 0
     top_k = 1
     moe_args = MoEArgs(
         num_experts=num_experts,
