@@ -289,8 +289,38 @@ def expert_parallel(func: Callable) -> Callable:
 
             experts_per_ep_rank = w1.shape[0]
             num_ep_ranks = num_tokens_per_expert.shape[0] // experts_per_ep_rank
+            # print1('experts_per_ep_rank', experts_per_ep_rank, 'num_ep_ranks', num_ep_ranks)
+
+            # print1('before generate_permute_indices')
+            # print1('num_tokens_per_expert', num_tokens_per_expert, 'x.shape[0]', x.shape[0], 'TOKEN_GROUP_ALIGN_SIZE_M', TOKEN_GROUP_ALIGN_SIZE_M)
+            # print1('x.shape[0] + experts_per_ep_rank * TOKEN_GROUP_ALIGN_SIZE_M', x.shape[0] + experts_per_ep_rank * TOKEN_GROUP_ALIGN_SIZE_M)
+
+            # example
+            #   rank 0
+            #     inputs
+            #       num_tokens_per_expert = tensor([1, 0, 0, 0], device='cuda:0')
+            #       experts_per_ep_rank = 2
+            #       num_ep_ranks = 2
+            #       max_len = 17
+            #       TOKEN_GROUP_ALIGN_SIZE_M = 16
+            #     outputs
+            #       permuted_indices = tensor([ 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], device='cuda:0', dtype=torch.int32) torch.Size([17])
+            #       num_tokens_per_expert = tensor([8, 8], device='cuda:0', dtype=torch.int32)
+            #       _ = tensor([ 8, 16], device='cuda:0', dtype=torch.int32)
+            #   rank 1
+            #     inputs
+            #       num_tokens_per_expert = tensor([2, 1, 1, 3], device='cuda:1')
+            #       experts_per_ep_rank = 2
+            #       num_ep_ranks = 2
+            #       max_len = 23
+            #       TOKEN_GROUP_ALIGN_SIZE_M = 16
+            #     outputs
+            #       permuted_indices = tensor([ 0,  1,  3, -1, -1, -1, -1, -1,  2,  4,  5,  6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], device='cuda:1', dtype=torch.int32) torch.Size([23])
+            #       num_tokens_per_expert = num_tokens_per_expert tensor([8, 8], device='cuda:1', dtype=torch.int32)
+            #       _ = tensor([ 8, 16], device='cuda:1', dtype=torch.int32)
 
             with torch.no_grad():
+                # note that this creates `-1` indices for entries which should be padded with zeroes
                 (
                     permuted_indices,
                     num_tokens_per_expert,
@@ -302,19 +332,32 @@ def expert_parallel(func: Callable) -> Callable:
                     x.shape[0] + experts_per_ep_rank * TOKEN_GROUP_ALIGN_SIZE_M,
                     TOKEN_GROUP_ALIGN_SIZE_M,
                 )
+            # print1('after generate_permute_indices')
+            # print1('permuted_indices', permuted_indices, permuted_indices.shape)
+            # print1('num_tokens_per_expert', num_tokens_per_expert)
+            # print1('_', _)
 
-            print0('old x', x.shape, x)
+            # print1('old x', x.shape, x)
+            # add a row of zeros to the end, we use this to generate padding
             x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
+            # print1('intermediate x', x.shape, x)
             input_shape = x.shape
+            # this pads the tensor with zeros, using the padding we generated above
             x = x[permuted_indices, :]
-            print0('new x', x.shape, x)
+            # print1('new x', x.shape, x)
 
         out = func(w1, w2, w3, x, num_tokens_per_expert)
+        print0('after func in expert_parallel wrapper')
+        print0('out.shape', out.shape)
 
+        # example:
+        #   rank 0 shape: (17, 8) -> (1, 8)
+        #   rank 1 shape: (23, 8) -> (7, 8)
         if num_tokens_per_expert is not None:
             out_unpermuted = out.new_empty(input_shape)
             out_unpermuted[permuted_indices, :] = out
             out = out_unpermuted[:-1]
+            print0('new out.shape', out.shape)
 
         print0('end expert_parallel wrapper')
         return out
