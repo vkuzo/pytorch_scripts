@@ -25,7 +25,7 @@ from torch.distributed.tensor import (
 )
 from torch.distributed.tensor.parallel import ParallelStyle
 from torch.distributed.tensor.placement_types import Placement
-from utils import print0
+from utils import print0, print1
 
 
 # from torch.distributed._functional_collectives import all_to_all_single_autograd
@@ -158,12 +158,53 @@ class ExpertParallel(ParallelStyle):
             # print0('output_splits', self.output_splits)
 
         # perform all-to-all
+
+        # example routed_input, rank0:
+        # 
+        #   before a2a
+        #
+        # tensor([[ 0.1045,  1.0703, -0.6953,  0.8125,  0.2461, -0.0194, -1.8516, -0.8750],
+        #         [ 0.9258,  0.2041,  1.1016, -0.0518, -1.1953,  0.2773, -0.9492, -0.3457],
+        #         [-0.3789,  0.8242,  0.0203,  0.3945, -0.1377, -0.3984, -0.3633, -0.1514],
+        #         [ 1.5000, -1.3125, -0.8594, -0.5820, -0.5039,  0.2100, -1.3281, -0.3789]],)
+        # 
+        #   after a2a (1 token for expert 0, 0 tokens for expert 1)
+        #
+        # tensor([[ 0.1045,  1.0703, -0.6953,  0.8125,  0.2461, -0.0194, -1.8516, -0.8750]])
+        #
+        #   num_tokens_per_expert_group: tensor([1, 0, 0, 0], device='cuda:0')
+        #
+        # rank1:
+        #   
+        #   before a2a
+				#
+				# tensor([[-1.0781e+00,  1.6602e-01,  4.1602e-01,  1.3672e+00, -2.3750e+00, 1.1172e+00, -7.0703e-01, -1.6504e-01],
+				#         [ 3.6523e-01,  2.5940e-03,  5.4688e-01,  3.0078e-01,  1.8984e+00, -2.4531e+00, -2.1562e+00, -2.9102e-01],
+				#         [ 1.1016e+00,  1.0469e+00, -9.7266e-01, -2.0469e+00,  9.8633e-02, -6.4844e-01, -1.1094e+00,  3.9844e-01],
+				#         [ 2.6250e+00, -6.7383e-02, -2.3594e+00,  1.5938e+00,  5.6250e-01, -1.1406e+00,  6.6797e-01,  1.3477e-01]], device='cuda:1',)
+				#
+				#   after a2a (3 token for expert 2, 4 tokens for expert 3)
+				#
+        # tensor([[ 9.2578e-01,  2.0410e-01,  1.1016e+00, -5.1758e-02, -1.1953e+00, 2.7734e-01, -9.4922e-01, -3.4570e-01],
+        #         [-3.7891e-01,  8.2422e-01,  2.0264e-02,  3.9453e-01, -1.3770e-01, -3.9844e-01, -3.6328e-01, -1.5137e-01],
+        #         [ 1.5000e+00, -1.3125e+00, -8.5938e-01, -5.8203e-01, -5.0391e-01, 2.0996e-01, -1.3281e+00, -3.7891e-01],
+        #         [-1.0781e+00,  1.6602e-01,  4.1602e-01,  1.3672e+00, -2.3750e+00, 1.1172e+00, -7.0703e-01, -1.6504e-01],
+        #         [ 3.6523e-01,  2.5940e-03,  5.4688e-01,  3.0078e-01,  1.8984e+00, -2.4531e+00, -2.1562e+00, -2.9102e-01],
+        #         [ 1.1016e+00,  1.0469e+00, -9.7266e-01, -2.0469e+00,  9.8633e-02, -6.4844e-01, -1.1094e+00,  3.9844e-01],
+        #         [ 2.6250e+00, -6.7383e-02, -2.3594e+00,  1.5938e+00,  5.6250e-01, -1.1406e+00,  6.6797e-01,  1.3477e-01]], device='cuda:1', dtype=torch.bfloat16)
+        #
+        #   num_tokens_per_expert_group: tensor([2, 1, 1, 3], device='cuda:1')
+        #
+
+        # print1('r1 routed_input before a2a', routed_input, routed_input.shape)
         routed_input = all_to_all_single_autograd(
             routed_input,
             self.output_splits,
             self.input_splits,
             device_mesh.get_group(),
         )
+        # print1('r1 routed_input after a2a', routed_input, routed_input.shape)
+        # print1('r1 num_tokens_per_expert_group', num_tokens_per_expert_group)
 
         # NOTE: After this all-to-all, the routed input is put on proper EP rank.
         # However, the num_tokens_per_expert_group is not of the final target format
