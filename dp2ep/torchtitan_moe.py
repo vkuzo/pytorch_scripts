@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from expert_parallel import expert_parallel
-from utils import print0
+from utils import print0, print1
 
 
 @dataclass
@@ -282,8 +282,8 @@ class MoE(nn.Module):
         """
         bs, slen, dim = x.shape
 
-        print0('x', x.shape, x)
-        print0('start router')
+        print1('x', x.shape, x)
+        print1('start router')
 
         # (inside router) example raw scores for local batch_size 1, seq_len 4, num_experts 4
         #   raw scores tensor([[0.5205, 0.4301, 0.5530, 0.4598],
@@ -297,11 +297,14 @@ class MoE(nn.Module):
         #   ([[2], [2], [3], [0]], device='cuda:0')
 
         # example top_scores (after sorting by token_indices) 
-        #   tensor([0.5081, 0.5530, 0.5045, 0.5964], ...)
+        #   rank 0: tensor([0.5081, 0.5530, 0.5045, 0.5964], ...)
+        #   rank 1: tensor([0.6397, 0.6243, 0.7090, 0.7186], device='cuda:1',)
         # example token_indices
-        #   tensor([3, 0, 1, 2], device='cuda:0') 
+        #   rank 0: tensor([3, 0, 1, 2], device='cuda:0') 
+        #   rank 1: tensor([2, 0, 1, 3], device='cuda:1')
         # example num_tokens_per_expert
-        #   tensor([1, 0, 2, 1], device='cuda:0')
+        #   rank 0: tensor([1, 0, 2, 1], device='cuda:0')
+        #   rank 1: tensor([0, 0, 1, 3], device='cuda:1')
         (
             top_scores,
             token_indices,
@@ -309,12 +312,12 @@ class MoE(nn.Module):
         ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
 
         # top_scores and selected_indices shape (bs*slen*top_k,)
-        print0('top_scores', top_scores.shape, top_scores)
-        print0('token_indices', token_indices.shape, token_indices)
+        print1('top_scores', top_scores.shape, top_scores)
+        print1('token_indices', token_indices.shape, token_indices)
 
         # num_tokens_per_expert shape (num_experts,)
-        print0('num_tokens_per_expert', num_tokens_per_expert)
-        print0('end router')
+        print1('num_tokens_per_expert', num_tokens_per_expert)
+        print1('end router')
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # TODO: Activation Checkpointing has the side effect of double counting tokens_per_expert --
