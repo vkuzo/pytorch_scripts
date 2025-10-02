@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# copied from Driss's https://www.internalfb.com/phabricator/paste/view/P1858050926
-
 import os
 
 import random

@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Script for quantizing LLM models with TorchAO.
+Script for quantizing HuggingFace models with TorchAO.
 Supports various quantization configurations and model types.
-
-Copy of Driss's https://www.internalfb.com/phabricator/paste/view/P1838316614
 """
 
 
