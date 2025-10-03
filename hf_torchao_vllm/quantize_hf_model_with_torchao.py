@@ -252,7 +252,7 @@ def main(
     # Set default output directory based on model base name if not provided
     if output_dir is None:
         model_base_name = model_name.split("/")[-1]
-        output_dir = f"data/{quant_type}-{model_base_name}"
+        output_dir = f"data/torchao/{quant_type}-{model_base_name}"
 
     # Convert to args-like object for compatibility with the rest of the code
     args = Namespace(
