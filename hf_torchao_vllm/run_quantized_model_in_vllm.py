@@ -54,7 +54,7 @@ def print_vllm_torchao_quant_info(model: torch.nn.Module):
 
 def main(
     # model_name: str = "Qwen/Qwen2-7B-Instruct",
-    model_name: str = "data/fp8-opt-125m",
+    model_name: str = "data/torchao/fp8-opt-125m",
     max_tokens=64,
     tp_size: int = 1,
     compile: bool = True,

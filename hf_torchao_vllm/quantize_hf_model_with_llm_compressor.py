@@ -1,5 +1,7 @@
 # https://github.com/vllm-project/llm-compressor/blob/main/examples/quantization_w8a8_fp8/llama3_example.py
 
+import torch
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
@@ -14,7 +16,7 @@ def run():
     MODEL_ID = "facebook/opt-125m"
 
     # Load model.
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
     # Configure the quantization algorithm and scheme.
@@ -39,7 +41,7 @@ def run():
     print("==========================================")
 
     # Save to disk in compressed-tensors format.
-    SAVE_DIR = "data/llmcompressor/" + MODEL_ID.rstrip("/").split("/")[-1] + "-FP8-Dynamic"
+    SAVE_DIR = "data/llmcompressor/" + "fp8-" + MODEL_ID.rstrip("/").split("/")[-1]
     model.save_pretrained(SAVE_DIR)
     tokenizer.save_pretrained(SAVE_DIR)
 

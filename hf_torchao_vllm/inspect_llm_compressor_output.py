@@ -6,7 +6,7 @@ import json
 import fire
 
 def run(
-    dir_name: str = 'data/llmcompressor/opt-125m-FP8-Dynamic',
+    dir_name: str = 'data/llmcompressor/fp8-opt-125m',
 ):
     json_config_name = f'{dir_name}/config.json'
     with open(json_config_name, 'r') as f:
