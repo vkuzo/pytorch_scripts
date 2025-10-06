@@ -73,14 +73,21 @@ def get_quantization_config(args):
                 expert_fqn_to_config = {}
                 # TODO(future PR): this is annoying, I should be able to use a regex here
                 for layer_idx in range(24):
-                    for expert_idx in range(60):
-                        expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj"] = single_config
-                        expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj"] = single_config
-                        expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj"] = single_config
+                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.q_proj"] = None
+                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.k_proj"] = None
+                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.v_proj"] = None
+                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.o_proj"] = None
+                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.gate"] = None
+                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.gate_proj"] = None
+                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.up_proj"] = None
+                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.down_proj"] = None
+                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert_gate"] = None
+                    expert_fqn_to_config[f"lm_head"] = None
                 module_fqn_to_config = ModuleFqnToConfig({
-                    "_default": None,
+                    "_default": single_config,
                     **expert_fqn_to_config,
                 })
+
                 return TorchAoConfig(
                     quant_type=module_fqn_to_config,
                 )
