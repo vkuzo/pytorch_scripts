@@ -19,14 +19,5 @@ def run(
     model_name, model_extension = 'model', 'safetensors'
     inspect_model_state_dict(dir_name, model_name, model_extension)
 
-    if False:
-        # inpect the model, saved in safetensors format
-        model_name = f'{dir_name}/model.safetensors'
-        with safetensors.safe_open(model_name, framework='pt', device='cpu') as f:
-            print(f.metadata())
-            for k in f.keys():
-                t = f.get_tensor(k)
-                print(k, t.shape, t.dtype)
-
 if __name__ == '__main__':
     fire.Fire(run)
