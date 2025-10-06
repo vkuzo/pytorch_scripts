@@ -1,10 +1,15 @@
+import copy
 import json
 import os
+from typing import List
 import pathlib
 
 import safetensors
+from safetensors.torch import save_file
 
 import torch
+from torchao.quantization.quantize_.workflows.float8.float8_tensor import Float8Tensor
+
 
 torch.serialization.add_safe_globals([getattr])
 
@@ -57,3 +62,86 @@ def inspect_model_state_dict(dir_name, model_name, model_extension) -> None:
                 continue
             print(file_path)
             _inspect_state_dict_file(file_path)
+
+def convert_pt_statedict_to_safetensors(
+    pt_statedict_filename,
+    safetensors_statedict_filename,
+) -> None:
+    old_state_dict = torch.load(pt_statedict_filename, weights_only=True)
+    new_state_dict = {}
+
+    for k, v in old_state_dict.items():
+        print(k, v.shape, type(v))
+        if type(v) == torch.Tensor:
+            
+            if "lm_head" in k:
+                # work around issues detailed in 
+                # https://huggingface.co/docs/safetensors/torch_shared_tensors
+                v = copy.deepcopy(v)
+
+            new_state_dict[k] = v
+        elif type(v) == Float8Tensor:
+            new_state_dict[k] = v.qdata
+            # for now, manually cast scale to bfloat16 to match current 
+            # llm-compressor script
+            # TODO(future): prob needs to be user controllable 
+            new_state_dict[k + '_scale'] = v.scale.bfloat16()
+        else:
+            raise AssertionError(f'unsupported type {type(v)}')
+    save_file(new_state_dict, safetensors_statedict_filename)
+
+def convert_pt_multifile_index_to_safetensors(
+    source_filename: str,
+    target_filename: str,
+    model_part_filenames: List[str],
+) -> None:
+    """
+    Source format
+
+    {
+        "metadata": {...},
+        "weight_map": {
+            "foo": "pytorch_model-00001-of-00004.bin",
+            "bar": "pytorch_model-00002-of-00004.bin",
+            ...
+        }
+    }
+
+    Target format
+
+    {
+        "metadata": {...},
+        "weight_map": {
+            # weight already in high precision
+            "foo": "pytorch_model-00001-of-00004.bin",
+            # weight original stored as tensor subclass, but now decomposed
+            # into qdata and scale
+            "bar": "model-00002-of-00004.safetensors",
+            "bar_scale": "model-00002-of-00004.safetensors",
+            ...
+        }
+    }
+
+    For now, metadata is not updated.
+    """
+
+    # generate the new fqn to weight location map from the new safetensors files
+    new_weight_map = {}
+    for model_part_filename in model_part_filenames:
+        # print(model_part_filename)
+
+        # get the file_name from dir_name/file_name
+        basename = os.path.basename(model_part_filename)
+        # print(basename)
+
+        with safetensors.safe_open(model_part_filename, framework='pt', device='cpu') as f:
+            for k in f.keys():
+                new_weight_map[k] = basename
+
+    # save the updated mapping
+    with open(source_filename, 'r') as f:
+        source_mapping = json.load(f)
+    source_mapping['weight_map'] = new_weight_map
+    # print(json.dumps(source_mapping, indent=2))
+    with open(target_filename, 'w') as f:
+        json.dump(source_mapping, f, indent=2) 
