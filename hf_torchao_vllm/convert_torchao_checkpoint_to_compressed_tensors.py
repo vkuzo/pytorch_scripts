@@ -17,37 +17,12 @@ from torchao.quantization.quantize_.workflows.float8.float8_tensor import Float8
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from utils import convert_pt_statedict_to_safetensors, convert_pt_multifile_index_to_safetensors
+from utils import (
+    convert_pt_statedict_to_safetensors, 
+    convert_pt_multifile_index_to_safetensors,
+    ao_config_to_compressed_tensors_config,
+)
 
-def ao_config_to_compressed_tensors_config(aobaseconfig: AOBaseConfig) -> Dict[str, Any]:
-    # for now, allowlist of recipes we know how to convert and hand convert
-    # them here
-    # for a production version, we'll need a more scalable way to do this
-
-    assert isinstance(aobaseconfig, Float8DynamicActivationFloat8WeightConfig), "unsupported"
-    assert aobaseconfig.granularity == [PerRow(), PerRow()], "unsupported"
-
-    ct_config = {
-        "format": "float-quantized",
-        "input_activations": {
-            "dynamic": True,
-            "num_bits": 8,
-            "strategy": "token",
-            "symmetric": True,
-            "type": "float",
-        },
-        "output_activations": None,
-        "targets": ["Linear"],
-        "weights": {
-            "dynamic": False,
-            "num_bits": 8,
-            "observer": "minmax",
-            "strategy": "channel",
-            "symmetric": True,
-            "type": "float",
-        },
-    }
-    return ct_config 
 
 def run(
     # original torchao checkpoint

@@ -10,6 +10,13 @@ import fire
 
 from utils import inspect_model_state_dict
 
+# ensure NVFP4Tensor can be loaded
+import torchao.prototype.mx_formats.inference_workflow
+
+# TODO: ensure the line below happens in torchao
+import torchao
+torch.serialization.add_safe_globals([torchao.prototype.mx_formats.nvfp4_tensor.QuantizeTensorToNVFP4Kwargs])
+
 # not sure why I still need this
 torch.serialization.add_safe_globals([getattr])
 

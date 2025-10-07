@@ -45,6 +45,8 @@ def print_vllm_torchao_quant_info(model: torch.nn.Module):
     for name, mod in model.named_modules():
         if "Linear" not in str(type(mod)):
             continue
+        if not hasattr(mod, "weight"):
+            continue
         mod_and_weight_type = type(mod), type(mod.weight)
         if mod_and_weight_type in seen_types:
             continue

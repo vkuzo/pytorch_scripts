@@ -147,6 +147,15 @@ def get_quantization_config(args):
             single_config = NVFP4InferenceConfig(
                 mm_config=NVFP4MMConfig.WEIGHT_ONLY,
                 use_triton_kernel=False,
+                #
+                # weight_only and use_dynamic_per_tensor_scale=True works here
+                # but garbage output in vLLM, probably because we currently don't have a way
+                # in torchao to enforce the scales for attention and ffn weights that
+                # are going to be fused for inference to be the same
+                # TODO: file a torchao issue about this, and fix in torchao
+                #
+                # dynamic and use_dynamic_per_tensor_scale=False not supported in torch._scaled_mm
+                #
                 use_dynamic_per_tensor_scale=False,
             )
             if args.experts_only_qwen_1_5_moe_a_2_7b:
