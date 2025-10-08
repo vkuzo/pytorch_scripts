@@ -84,7 +84,20 @@ def run(
         #   * quantize the weights to fp4 with per group 16 via ptq
         #   * calibrate a global_scale for activations, which will be used to
         #       quantize activations to fp4 on the fly
-        recipe = QuantizationModifier(targets="Linear", scheme="NVFP4", ignore=["lm_head"])
+        recipe = QuantizationModifier(
+            targets="Linear", 
+            scheme="NVFP4", 
+            ignore=[
+                "lm_head",
+                # for Qwen MoE, but ok to just hardcode here for now
+                # https://github.com/vllm-project/llm-compressor/blob/33ef5f497a9801893764c6a2c880cb1f560067fa/examples/quantizing_moe/qwen_example.py#L10
+                "re:.*mlp.gate$", 
+                "re:.*mlp.shared_expert_gate$",
+                # also skip attention and shared expert, to focus on MoE for now
+                "re:.*self_attn.*",
+                "re:.*shared_expert.*",
+            ],
+        )
 
         # Apply quantization.
         oneshot(
