@@ -23,6 +23,18 @@ def run(
     print(model)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+    ignore_list = ["lm_head"]
+    if model_name == "Qwen1.5-MoE-A2.7B":
+        ignore_list.extend(
+            [
+                "re:.*mlp.gate$",
+                "re:.*mlp.shared_expert_gate$",
+                # also skip attention and shared expert, to focus on MoE for now
+                "re:.*self_attn.*",
+                "re:.*shared_expert.*",
+            ]
+        )
+
     if quant_type == "fp8":
         # Configure the quantization algorithm and scheme.
         # In this case, we:
@@ -31,16 +43,7 @@ def run(
         recipe = QuantizationModifier(
             targets="Linear",
             scheme="FP8_DYNAMIC",
-            ignore=[
-                "lm_head",
-                # for Qwen MoE, but ok to just hardcode here for now
-                # https://github.com/vllm-project/llm-compressor/blob/33ef5f497a9801893764c6a2c880cb1f560067fa/examples/quantizing_moe/qwen_example.py#L10
-                "re:.*mlp.gate$",
-                "re:.*mlp.shared_expert_gate$",
-                # also skip attention and shared expert, to focus on MoE for now
-                "re:.*self_attn.*",
-                "re:.*shared_expert.*",
-            ],
+            ignore=ignore_list,
         )
 
         # Apply quantization.
@@ -89,16 +92,7 @@ def run(
         recipe = QuantizationModifier(
             targets="Linear",
             scheme="NVFP4",
-            ignore=[
-                "lm_head",
-                # for Qwen MoE, but ok to just hardcode here for now
-                # https://github.com/vllm-project/llm-compressor/blob/33ef5f497a9801893764c6a2c880cb1f560067fa/examples/quantizing_moe/qwen_example.py#L10
-                "re:.*mlp.gate$",
-                "re:.*mlp.shared_expert_gate$",
-                # also skip attention and shared expert, to focus on MoE for now
-                "re:.*self_attn.*",
-                "re:.*shared_expert.*",
-            ],
+            ignore=ignore_list,
         )
 
         # Apply quantization.
