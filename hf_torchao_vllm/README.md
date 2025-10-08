@@ -1,6 +1,6 @@
 # HF -> torchao -> vLLM convenience scripts
 
-Example
+## Usage Example
 
 ```bash
 # save a quantized model ot data/nvfp4-Qwen1.5-MoE-A2.7B
@@ -8,4 +8,11 @@ python quantize_hf_model_with_torchao.py --model_name "Qwen/Qwen1.5-MoE-A2.7B" -
 
 # run the model from above in vLLM
 python run_quantized_model_in_vllm.py --model_name "data/torchao/nvfp4-Qwen1.5-MoE-A2.7B" --compile False
+```
+
+## Code Quality & Linting
+
+```bash
+ruff format .
+ruff check . --fix
 ```

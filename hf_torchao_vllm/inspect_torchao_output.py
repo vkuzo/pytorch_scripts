@@ -2,34 +2,36 @@
 # via the `torchao_hf_script.py` script
 
 import json
-import os
-import pathlib
-import torch
-import torchao  # this is needed to run torch.serialization.add_safe_globals([torchao.quantization.Float8Tensor])
+
 import fire
 
-from utils import inspect_model_state_dict
+import torch
+
+# TODO: ensure the line below happens in torchao
+import torchao  # this is needed to run torch.serialization.add_safe_globals([torchao.quantization.Float8Tensor])
 
 # ensure NVFP4Tensor can be loaded
 import torchao.prototype.mx_formats.inference_workflow
+from utils import inspect_model_state_dict
 
-# TODO: ensure the line below happens in torchao
-import torchao
-torch.serialization.add_safe_globals([torchao.prototype.mx_formats.nvfp4_tensor.QuantizeTensorToNVFP4Kwargs])
+torch.serialization.add_safe_globals(
+    [torchao.prototype.mx_formats.nvfp4_tensor.QuantizeTensorToNVFP4Kwargs]
+)
 
 # not sure why I still need this
 torch.serialization.add_safe_globals([getattr])
 
-def run(dir_name: str = 'data/torchao/fp8-opt-125m'):
-    json_config_name = f'{dir_name}/config.json'
+
+def run(dir_name: str = "data/torchao/fp8-opt-125m"):
+    json_config_name = f"{dir_name}/config.json"
 
     # inspect the config
-    with open(json_config_name, 'r') as f:
+    with open(json_config_name) as f:
         data = json.load(f)
         print(json.dumps(data, indent=2))
 
     # inspect the data
-    # 
+    #
     # if there is a single chunk, the state dict is named `pytorch_model.bin`
     #
     # if there are multiple chunks, the state dict is spread across multiple files:
@@ -39,8 +41,9 @@ def run(dir_name: str = 'data/torchao/fp8-opt-125m'):
     #   pytorch_model-00004-of-00004.bin
     #   pytorch_model.bin.index.json
     #
-    model_name, model_extension = 'pytorch_model', 'bin'
+    model_name, model_extension = "pytorch_model", "bin"
     inspect_model_state_dict(dir_name, model_name, model_extension)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     fire.Fire(run)

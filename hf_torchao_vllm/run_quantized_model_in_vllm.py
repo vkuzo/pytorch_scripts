@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-
 import random
 
 import numpy as np
+from rich import print
+from vllm import LLM, SamplingParams
+
 import torch
 from torchao.quantization.quant_api import _quantization_type
-
-from vllm import LLM, SamplingParams
-from rich import print
 
 
 # Set seeds for reproducibility
@@ -34,8 +33,9 @@ os.environ["VLLM_TEST_STANDALONE_COMPILE"] = "1"
 # TODO: remove this after https://github.com/pytorch/ao/issues/2478 is fixed
 torch.serialization.add_safe_globals([getattr])
 
+
 def print_vllm_torchao_quant_info(model: torch.nn.Module):
-    # vLLM model layers do not print any information about torchao 
+    # vLLM model layers do not print any information about torchao
     # quantization, because the tensor subclasses wrap the weights and
     # the custom vLLM linear modules do not print information about the
     # weights. For now, hack it. In the future, we should fix this
@@ -51,7 +51,9 @@ def print_vllm_torchao_quant_info(model: torch.nn.Module):
         if mod_and_weight_type in seen_types:
             continue
         seen_types.add(mod_and_weight_type)
-        print(f"first seen torchao quantization for {mod}:\n  path {name}, quant_type {_quantization_type(mod.weight)}")
+        print(
+            f"first seen torchao quantization for {mod}:\n  path {name}, quant_type {_quantization_type(mod.weight)}"
+        )
 
 
 def main(
@@ -69,7 +71,11 @@ def main(
     )
     # Create an LLM.
     print(f"Using Model name: {model_name}")
-    llm = LLM(model=model_name, tensor_parallel_size=tp_size, enforce_eager=not compile)
+    llm = LLM(
+        model=model_name,
+        tensor_parallel_size=tp_size,
+        enforce_eager=not compile,
+    )
 
     # Print diagnostic information
     # model config
