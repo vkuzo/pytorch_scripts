@@ -6,41 +6,43 @@ Script for quantizing HuggingFace models with TorchAO.
 Supports various quantization configurations and model types.
 """
 
-
 import random
-import numpy as np
-import torch
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional, Literal
+from typing import Literal
 
-from transformers import TorchAoConfig, AutoModelForCausalLM, AutoTokenizer
-import torchao
-from torchao.quantization.quant_api import (
-    Float8DynamicActivationFloat8WeightConfig,
-    Int4WeightOnlyConfig,
-    Int8WeightOnlyConfig,
-    Int8DynamicActivationInt8WeightConfig,
-    PerRow,
-    PerTensor,
-    GemliteUIntXWeightOnlyConfig,
-    Int4DynamicActivationInt4WeightConfig,
-    Int8DynamicActivationInt4WeightConfig,
-    CutlassInt4PackedLayout,
-)
-from torchao.quantization import ModuleFqnToConfig
-from torchao.prototype.mx_formats.inference_workflow import (
-    MXFPInferenceConfig, 
-    NVFP4InferenceConfig, 
-    NVFP4MMConfig,
-)
-from torchao.prototype.mx_formats import MXGemmKernelChoice
+import numpy as np
 from jsonargparse import CLI, Namespace
 from rich import print
 
+import torch
 from torch._inductor.utils import do_bench_using_profiling
+from torchao.prototype.mx_formats import MXGemmKernelChoice
+from torchao.prototype.mx_formats.inference_workflow import (
+    MXFPInferenceConfig,
+    NVFP4InferenceConfig,
+    NVFP4MMConfig,
+)
+from torchao.quantization import ModuleFqnToConfig
+from torchao.quantization.quant_api import (
+    CutlassInt4PackedLayout,
+    Float8DynamicActivationFloat8WeightConfig,
+    GemliteUIntXWeightOnlyConfig,
+    Int4DynamicActivationInt4WeightConfig,
+    Int4WeightOnlyConfig,
+    Int8DynamicActivationInt4WeightConfig,
+    Int8DynamicActivationInt8WeightConfig,
+    Int8WeightOnlyConfig,
+    PerRow,
+    PerTensor,
+)
+from transformers import AutoModelForCausalLM, AutoTokenizer, TorchAoConfig
 
-def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
+
+def benchmark_cuda_function_in_microseconds(
+    func: Callable, *args, **kwargs
+) -> float:
     """Thin wrapper around do_bench_using_profiling"""
     no_args = lambda: func(*args, **kwargs)
     time = do_bench_using_profiling(no_args)
@@ -68,25 +70,47 @@ def get_quantization_config(args):
         case "autoquant":
             return TorchAoConfig("autoquant", min_sqnr=args.min_sqnr)
         case "fp8":
-            single_config = Float8DynamicActivationFloat8WeightConfig(granularity=gran)
+            single_config = Float8DynamicActivationFloat8WeightConfig(
+                granularity=gran
+            )
             if args.experts_only_qwen_1_5_moe_a_2_7b:
                 expert_fqn_to_config = {}
                 # TODO(future PR): this is annoying, I should be able to use a regex here
                 for layer_idx in range(24):
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.q_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.k_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.v_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.o_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.gate"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.gate_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.up_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.down_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert_gate"] = None
-                    expert_fqn_to_config[f"lm_head"] = None
-                module_fqn_to_config = ModuleFqnToConfig({
-                    "_default": single_config,
-                    **expert_fqn_to_config,
-                })
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.q_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.k_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.v_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.o_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.gate"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert.gate_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert.up_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert.down_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert_gate"
+                    ] = None
+                    expert_fqn_to_config["lm_head"] = None
+                module_fqn_to_config = ModuleFqnToConfig(
+                    {
+                        "_default": single_config,
+                        **expert_fqn_to_config,
+                    }
+                )
 
                 return TorchAoConfig(
                     quant_type=module_fqn_to_config,
@@ -105,7 +129,9 @@ def get_quantization_config(args):
             return TorchAoConfig(Int4DynamicActivationInt4WeightConfig())
         case "A8W4":
             return TorchAoConfig(
-                Int8DynamicActivationInt4WeightConfig(layout=CutlassInt4PackedLayout())
+                Int8DynamicActivationInt4WeightConfig(
+                    layout=CutlassInt4PackedLayout()
+                )
             )
         case "mxfp8":
             return TorchAoConfig(MXFPInferenceConfig())
@@ -121,20 +147,40 @@ def get_quantization_config(args):
                 expert_fqn_to_config = {}
                 # TODO(future PR): this is annoying, I should be able to use a regex here
                 for layer_idx in range(24):
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.q_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.k_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.v_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.o_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.gate"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.gate_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.up_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.down_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert_gate"] = None
-                    expert_fqn_to_config[f"lm_head"] = None
-                module_fqn_to_config = ModuleFqnToConfig({
-                    "_default": single_config,
-                    **expert_fqn_to_config,
-                })
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.q_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.k_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.v_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.o_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.gate"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert.gate_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert.up_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert.down_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert_gate"
+                    ] = None
+                    expert_fqn_to_config["lm_head"] = None
+                module_fqn_to_config = ModuleFqnToConfig(
+                    {
+                        "_default": single_config,
+                        **expert_fqn_to_config,
+                    }
+                )
 
                 return TorchAoConfig(
                     quant_type=module_fqn_to_config,
@@ -143,9 +189,13 @@ def get_quantization_config(args):
                 modules_to_not_convert = []
                 if args.skip_gate_qwen_1_5_moe_a_2_7b:
                     for layer_idx in range(24):
-                        modules_to_not_convert.append(f"model.layers.{layer_idx}.mlp.gate")
-                        modules_to_not_convert.append(f"model.layers.{layer_idx}.mlp.shared_expert_gate")
-                modules_to_not_convert.append(f"lm_head")
+                        modules_to_not_convert.append(
+                            f"model.layers.{layer_idx}.mlp.gate"
+                        )
+                        modules_to_not_convert.append(
+                            f"model.layers.{layer_idx}.mlp.shared_expert_gate"
+                        )
+                modules_to_not_convert.append("lm_head")
                 return TorchAoConfig(
                     single_config,
                     modules_to_not_convert=modules_to_not_convert,
@@ -169,20 +219,40 @@ def get_quantization_config(args):
                 expert_fqn_to_config = {}
                 # TODO(future PR): this is annoying, I should be able to use a regex here
                 for layer_idx in range(24):
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.q_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.k_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.v_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.self_attn.o_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.gate"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.gate_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.up_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert.down_proj"] = None
-                    expert_fqn_to_config[f"model.layers.{layer_idx}.mlp.shared_expert_gate"] = None
-                    expert_fqn_to_config[f"lm_head"] = None
-                module_fqn_to_config = ModuleFqnToConfig({
-                    "_default": single_config,
-                    **expert_fqn_to_config,
-                })
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.q_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.k_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.v_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.self_attn.o_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.gate"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert.gate_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert.up_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert.down_proj"
+                    ] = None
+                    expert_fqn_to_config[
+                        f"model.layers.{layer_idx}.mlp.shared_expert_gate"
+                    ] = None
+                    expert_fqn_to_config["lm_head"] = None
+                module_fqn_to_config = ModuleFqnToConfig(
+                    {
+                        "_default": single_config,
+                        **expert_fqn_to_config,
+                    }
+                )
                 return TorchAoConfig(
                     quant_type=module_fqn_to_config,
                 )
@@ -190,15 +260,21 @@ def get_quantization_config(args):
                 modules_to_not_convert = []
                 if args.skip_gate_qwen_1_5_moe_a_2_7b:
                     for layer_idx in range(24):
-                        modules_to_not_convert.append(f"model.layers.{layer_idx}.mlp.gate")
-                        modules_to_not_convert.append(f"model.layers.{layer_idx}.mlp.shared_expert_gate")
-                modules_to_not_convert.append(f"lm_head")
+                        modules_to_not_convert.append(
+                            f"model.layers.{layer_idx}.mlp.gate"
+                        )
+                        modules_to_not_convert.append(
+                            f"model.layers.{layer_idx}.mlp.shared_expert_gate"
+                        )
+                modules_to_not_convert.append("lm_head")
                 return TorchAoConfig(
                     single_config,
                     modules_to_not_convert=modules_to_not_convert,
                 )
         case _:
-            raise ValueError(f"Unsupported quantization type: {args.quant_type}")
+            raise ValueError(
+                f"Unsupported quantization type: {args.quant_type}"
+            )
 
 
 def benchmark_model(model, input_ids, max_new_tokens, name=""):
@@ -220,7 +296,9 @@ def benchmark_model(model, input_ids, max_new_tokens, name=""):
         print("torch._inductor.utils not available, using simple timing")
         start = time.time()
         model.generate(
-            **input_ids, max_new_tokens=max_new_tokens, cache_implementation="static"
+            **input_ids,
+            max_new_tokens=max_new_tokens,
+            cache_implementation="static",
         )
         elapsed = (time.time() - start) * 1000  # ms
         tokens_per_second = max_new_tokens / (elapsed / 1000)
@@ -232,7 +310,7 @@ def benchmark_model(model, input_ids, max_new_tokens, name=""):
 
 def main(
     model_name: str = "facebook/opt-125m",
-    output_dir: Optional[str] = None,
+    output_dir: str | None = None,
     push_to_hub: bool = False,
     quant_type: Literal[
         "fp8",
@@ -248,7 +326,7 @@ def main(
         "nvfp4",
     ] = "fp8",
     granularity: Literal["per_row", "per_tensor"] = "per_row",
-    min_sqnr: Optional[float] = None,
+    min_sqnr: float | None = None,
     max_new_tokens: int = 64,
     benchmark: bool = False,
     bench_tokens: int = 100,
@@ -304,7 +382,10 @@ def main(
     if args.experts_only_qwen_1_5_moe_a_2_7b:
         assert args.quant_type in ("fp8", "mxfp4", "nvfp4"), "unsupported"
 
-    assert not (args.skip_gate_qwen_1_5_moe_a_2_7b and args.experts_only_qwen_1_5_moe_a_2_7b), "unsupported"
+    assert not (
+        args.skip_gate_qwen_1_5_moe_a_2_7b
+        and args.experts_only_qwen_1_5_moe_a_2_7b
+    ), "unsupported"
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -340,9 +421,11 @@ def main(
     input_ids = tokenizer(prompts, return_tensors="pt", padding=True).to(
         quantized_model.device
     )
-    outputs = quantized_model.generate(**input_ids, max_new_tokens=args.max_new_tokens)
+    outputs = quantized_model.generate(
+        **input_ids, max_new_tokens=args.max_new_tokens
+    )
 
-    for i, (prompt, output) in enumerate(zip(prompts, outputs)):
+    for i, (prompt, output) in enumerate(zip(prompts, outputs, strict=False)):
         generated_text = tokenizer.decode(output, skip_special_tokens=True)
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
@@ -366,15 +449,24 @@ def main(
         print("\nLoading saved quantized model to verify...")
         # TODO: do we really need `weights_only=False` here?
         loaded_model = AutoModelForCausalLM.from_pretrained(
-            output_dir, device_map=args.device_map, torch_dtype="auto", weights_only=False,
+            output_dir,
+            device_map=args.device_map,
+            torch_dtype="auto",
+            weights_only=False,
         )
 
         # Test loaded model with first prompt
         test_prompt = prompts[0]
-        input_ids = tokenizer(test_prompt, return_tensors="pt").to(loaded_model.device)
-        output = loaded_model.generate(**input_ids, max_new_tokens=args.max_new_tokens)
+        input_ids = tokenizer(test_prompt, return_tensors="pt").to(
+            loaded_model.device
+        )
+        output = loaded_model.generate(
+            **input_ids, max_new_tokens=args.max_new_tokens
+        )
         generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-        print(f"Verification - Prompt: {test_prompt!r}, Generated text: {generated_text!r}")
+        print(
+            f"Verification - Prompt: {test_prompt!r}, Generated text: {generated_text!r}"
+        )
 
     # Benchmark if requested
     if args.benchmark:
@@ -383,18 +475,25 @@ def main(
         # Benchmark quantized model
         print("Benchmarking quantized model:")
         quant_time = benchmark_model(
-            loaded_model, input_ids, args.bench_tokens, f"Quantized ({args.quant_type})"
+            loaded_model,
+            input_ids,
+            args.bench_tokens,
+            f"Quantized ({args.quant_type})",
         )
 
         # Load and benchmark original model in BF16
         print("\nLoading original model in BF16 for comparison...")
         bf16_model = AutoModelForCausalLM.from_pretrained(
-            args.model_name, device_map=args.device_map, torch_dtype=torch.bfloat16
+            args.model_name,
+            device_map=args.device_map,
+            torch_dtype=torch.bfloat16,
         )
 
         # Benchmark original model
         print("Benchmarking original BF16 model:")
-        bf16_time = benchmark_model(bf16_model, input_ids, args.bench_tokens, "BF16")
+        bf16_time = benchmark_model(
+            bf16_model, input_ids, args.bench_tokens, "BF16"
+        )
 
         # Calculate speedup
         speedup = bf16_time / quant_time if quant_time > 0 else 0

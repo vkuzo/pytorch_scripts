@@ -1,0 +1,63 @@
+# Ruff configuration for hf_torchao_vllm directory
+# See: https://docs.astral.sh/ruff/configuration/
+
+# Target Python version
+target-version = "py312"
+
+# Line length for formatting
+line-length = 80
+
+# Enable specific rule categories
+lint.select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort (import sorting)
+    "B",   # flake8-bugbear (common bugs and design problems)
+    "C4",  # flake8-comprehensions (list/dict/set comprehensions)
+    "UP",  # pyupgrade (modernize Python code)
+    "N",   # pep8-naming (naming conventions)
+    "SIM", # flake8-simplify (code simplification)
+]
+
+# Ignore specific rules
+lint.ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E731",   # do not assign a lambda expression, use a def
+    "B008",   # do not perform function calls in argument defaults
+    "SIM108", # use ternary operator instead of if-else
+    "N806",   # variable name should be lowercase (for ML variables like N, K, etc.)
+    "F841",  # unused vars, TODO fix this
+    "SIM117",  # nested context, TODO fix this
+    "SIM118",  # key in dict, TODO fix this
+    "E721",  # type comparison, TODO fix this
+    "B007",  # loop control var unused, TODO fix this
+]
+
+# Exclude files and directories
+exclude = [
+    "__pycache__",
+    "*.pyc",
+    ".git",
+    "build",
+    "dist",
+    "*.egg-info",
+    "data",
+    "sparse_logs",
+]
+
+[lint.per-file-ignores]
+# Allow unused imports in __init__.py files
+"__init__.py" = ["F401"]
+
+[lint.isort]
+# Sort imports
+known-first-party = ["torchao", "transformers", "torch"]
+force-single-line = false
+split-on-trailing-comma = true
+
+[format]
+# Formatting options
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
