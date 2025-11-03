@@ -24,7 +24,12 @@ from torchao.prototype.mx_formats.inference_workflow import (
     NVFP4InferenceConfig,
     NVFP4MMConfig,
 )
-from torchao.quantization import ModuleFqnToConfig
+from torchao.quantization import (
+    ModuleFqnToConfig,
+    PerBlock,
+    PerRow,
+    PerTensor,
+)
 from torchao.quantization.quant_api import (
     CutlassInt4PackedLayout,
     Float8DynamicActivationFloat8WeightConfig,
@@ -34,8 +39,6 @@ from torchao.quantization.quant_api import (
     Int8DynamicActivationInt4WeightConfig,
     Int8DynamicActivationInt8WeightConfig,
     Int8WeightOnlyConfig,
-    PerRow,
-    PerTensor,
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, TorchAoConfig
 
@@ -62,6 +65,7 @@ def get_quantization_config(args):
     granularity_mapping = {
         "per_row": PerRow(),
         "per_tensor": PerTensor(),
+        "a1x128_w128x128": [PerBlock([1, 128]), PerBlock([128, 128])],
     }
 
     gran = granularity_mapping[args.granularity]
@@ -71,7 +75,13 @@ def get_quantization_config(args):
             return TorchAoConfig("autoquant", min_sqnr=args.min_sqnr)
         case "fp8":
             single_config = Float8DynamicActivationFloat8WeightConfig(
-                granularity=gran
+                granularity=gran,
+                # the 125m model has a lot of activation zeroes for some
+                # prompts, need to set a lower bound to prevent scales from
+                # being 0.
+                # TODO seems like torchao should do this for me.
+                # TODO tool to find this (I used bisect on this tiny model).
+                activation_value_lb=1.0e-12,
             )
             if args.experts_only_qwen_1_5_moe_a_2_7b:
                 expert_fqn_to_config = {}
@@ -325,7 +335,9 @@ def main(
         "mxfp4",
         "nvfp4",
     ] = "fp8",
-    granularity: Literal["per_row", "per_tensor"] = "per_row",
+    granularity: Literal[
+        "per_row", "per_tensor", "a1x128_w128x128"
+    ] = "per_row",
     min_sqnr: float | None = None,
     max_new_tokens: int = 64,
     benchmark: bool = False,
