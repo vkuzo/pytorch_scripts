@@ -365,6 +365,15 @@ def main(
         skip_gate_qwen_1_5_moe_a_2_7b: if True, skips gate quantization for Qwen1.5-MoE-A2.7B model
         save_model_to_disk: if True, saves quantized model to local disk
     """
+    # Test prompts
+    prompts = [
+        "Why is Pytorch 2.0 the best machine learning compiler?",
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+
     # Set seed before creating the model
     set_seed(42)
 
@@ -406,40 +415,82 @@ def main(
     # Get quantization config
     quantization_config = get_quantization_config(args)
 
-    # Load and quantize model
-    print("Loading and quantizing model...")
-    quantized_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype="bfloat16",
-        device_map=args.device_map,
-        quantization_config=quantization_config,
-    )
-    print(quantized_model)
+    if args.model_name == "meta-llama/Llama-4-Scout-17B-16E-Instruct":
+        # TODO(future): maybe unify with the else branch, need to figure
+        # out the right syntax for preparing inputs and running generation
+        # TODO(future): make this work for multiple prompts
+        from transformers import AutoProcessor, Llama4ForConditionalGeneration
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        processor = AutoProcessor.from_pretrained(args.model_name)
+        quantized_model = Llama4ForConditionalGeneration.from_pretrained(
+            args.model_name,
+            # Note: flex does not work with naive device_map="auto"
+            # attn_implementation="flex_attention",
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            quantization_config=quantization_config,
+        )
 
-    # Test prompts
-    prompts = [
-        "Why is Pytorch 2.0 the best machine learning compiler?",
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
+        messages = []
+        for prompt in prompts[:1]:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                    ],
+                },
+            )
 
-    # Test generation
-    print("\nTesting quantized model generation...")
-    input_ids = tokenizer(prompts, return_tensors="pt", padding=True).to(
-        quantized_model.device
-    )
-    outputs = quantized_model.generate(
-        **input_ids, max_new_tokens=args.max_new_tokens
-    )
+        inputs = processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding="longest",
+        ).to(quantized_model.device)
 
-    for i, (prompt, output) in enumerate(zip(prompts, outputs, strict=False)):
-        generated_text = tokenizer.decode(output, skip_special_tokens=True)
-        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        outputs = quantized_model.generate(
+            **inputs,
+            max_new_tokens=args.max_new_tokens,
+        )
+
+        responses = processor.batch_decode(
+            outputs[:, inputs["input_ids"].shape[-1] :]
+        )
+        for response in responses:
+            print(response)
+
+    else:
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        # breakpoint()
+
+        # Load and quantize model
+        print("Loading and quantizing model...")
+        quantized_model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype="bfloat16",
+            device_map=args.device_map,
+            quantization_config=quantization_config,
+        )
+        print(quantized_model)
+
+        # Test generation
+        print("\nTesting quantized model generation...")
+        input_ids = tokenizer(prompts, return_tensors="pt", padding=True).to(
+            quantized_model.device
+        )
+        outputs = quantized_model.generate(
+            **input_ids, max_new_tokens=args.max_new_tokens
+        )
+
+        for i, (prompt, output) in enumerate(
+            zip(prompts, outputs, strict=False)
+        ):
+            generated_text = tokenizer.decode(output, skip_special_tokens=True)
+            print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
     if args.save_model_to_disk:
         # Save quantized model
@@ -457,6 +508,7 @@ def main(
         tokenizer.push_to_hub(model_name)
 
     if args.save_model_to_disk:
+        # TODO(future): support this for LLaMa 4 Scout
         # Load saved model to verify
         print("\nLoading saved quantized model to verify...")
         # TODO: do we really need `weights_only=False` here?
