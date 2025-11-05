@@ -3,6 +3,7 @@
 import fire
 from datasets import load_dataset
 from llmcompressor import oneshot
+from llmcompressor.modeling import replace_modules_for_calibration
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.utils import dispatch_for_generation
 
@@ -17,6 +18,7 @@ def run(
 
     # Load model.
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
+    model = replace_modules_for_calibration(model)
     print(model)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
