@@ -6,7 +6,6 @@ from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.utils import dispatch_for_generation
 
-import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -17,9 +16,7 @@ def run(
     assert quant_type in ("fp8", "nvfp4"), "unsupported"
 
     # Load model.
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
     print(model)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -32,6 +29,16 @@ def run(
                 # also skip attention and shared expert, to focus on MoE for now
                 "re:.*self_attn.*",
                 "re:.*shared_expert.*",
+            ]
+        )
+    elif model_name == "meta-llama/Llama-4-Scout-17B-16E-Instruct":
+        ignore_list.extend(
+            [
+                "re:.*self_attn",
+                "re:.*router",
+                "re:.*vision_model.*",
+                "re:.*multi_modal_projector.*",
+                "Llama4TextAttention",
             ]
         )
 
