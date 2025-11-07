@@ -14,6 +14,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
 from torchao.prototype.mx_formats.utils import from_blocked
 from torchao.quantization import (
     Float8DynamicActivationFloat8WeightConfig,
+    FqnToConfig,
     PerRow,
 )
 from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
@@ -100,11 +101,75 @@ def convert_pt_statedict_to_safetensors(
             new_state_dict[k] = v
 
         elif type(v) == Float8Tensor:
-            new_state_dict[k] = v.qdata
-            # for now, manually cast scale to bfloat16 to match current
-            # llm-compressor script
-            # TODO(future): prob needs to be user controllable
-            new_state_dict[k + "_scale"] = v.scale.bfloat16()
+            if len(v.shape) == 2:
+                # 2D weight, assume this is from a `torch.nn.Linear`
+
+                new_state_dict[k] = v.qdata
+                # for now, manually cast scale to bfloat16 to match current
+                # llm-compressor script
+                # TODO(future): prob needs to be user controllable
+                new_state_dict[k + "_scale"] = v.scale.bfloat16()
+
+            elif len(v.shape) == 3:
+                # 3D weight. We need to:
+                # 1. map this to `num_experts` 2D weights, to match checkpoint
+                #    format of llm-compressor
+                # 2. do the same fusion which llm-compressor does
+                # print(k, v.shape)
+
+                # the code below is specific to LLaMa 4 Scout MoE
+                B, K, N = v.shape
+
+                for expert_idx in range(B):
+                    local_v = v[expert_idx]
+
+                    if k.endswith("gate_up_proj"):
+                        # need to unfuse this into "gate_proj" and "up_proj"
+                        # need to transpose-contiguous from KN to NK
+                        # v_gate_proj = local_v[:, :(N // 2)]
+                        # v_up_proj = local_v[:, (N // 2):]
+                        v_gate_proj = local_v[:, (N // 2) :]
+                        v_up_proj = local_v[:, : (N // 2)]
+
+                        k_gate_proj = k.replace(
+                            "gate_up_proj", f"{expert_idx}.gate_proj.weight"
+                        )
+                        k_up_proj = k.replace(
+                            "gate_up_proj", f"{expert_idx}.up_proj.weight"
+                        )
+
+                        new_state_dict[k_gate_proj] = (
+                            v_gate_proj.qdata.t().contiguous()
+                        )
+                        new_state_dict[k_gate_proj + "_scale"] = (
+                            v_gate_proj.scale.t().contiguous().bfloat16()
+                        )
+
+                        new_state_dict[k_up_proj] = (
+                            v_up_proj.qdata.t().contiguous()
+                        )
+                        new_state_dict[k_up_proj + "_scale"] = (
+                            v_up_proj.scale.t().contiguous().bfloat16()
+                        )
+                        # print(f"wrote {k_gate_proj} and {k_up_proj}")
+
+                    elif k.endswith("down_proj"):
+                        # need to transpose-contiguous from KN to NK
+                        k_down_proj = k.replace(
+                            "down_proj", f"{expert_idx}.down_proj.weight"
+                        )
+                        new_state_dict[k_down_proj] = (
+                            local_v.qdata.t().contiguous()
+                        )
+                        new_state_dict[k_down_proj + "_scale"] = (
+                            local_v.scale.t().contiguous().bfloat16()
+                        )
+                        # print(f"wrote {k_down_proj}")
+
+                # breakpoint()
+
+            else:
+                raise AssertionError("unsupported")
 
         elif type(v) == NVFP4Tensor:
             # example checkpoint format: https://www.internalfb.com/phabricator/paste/view/P1981272933
@@ -208,6 +273,22 @@ def ao_config_to_compressed_tensors_config(
     # for now, allowlist of recipes we know how to convert and hand convert
     # them here
     # for a production version, we'll need a more scalable way to do this
+
+    # print('aobaseconfig', aobaseconfig)
+    if isinstance(aobaseconfig, FqnToConfig):
+        for k, v in aobaseconfig.fqn_to_config.items():
+            # print('\n', k, v, '\n')
+            if isinstance(
+                v, Float8DynamicActivationFloat8WeightConfig
+            ) and v.granularity == [PerRow(), PerRow()]:
+                # HACK: short circuit here
+                # This only works if:
+                # 1. we are using float8 rowwise quantization only
+                # 2. we are making assumptions about what llm-compressor is doing
+                #    as the blessed path of the compressed-tensors checkpoint for
+                #    this model.
+                aobaseconfig = v
+                break
 
     if isinstance(aobaseconfig, Float8DynamicActivationFloat8WeightConfig):
         assert aobaseconfig.granularity == [PerRow(), PerRow()], "unsupported"
