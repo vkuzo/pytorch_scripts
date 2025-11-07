@@ -75,6 +75,7 @@ def main(
         model=model_name,
         tensor_parallel_size=tp_size,
         enforce_eager=not compile,
+        max_model_len=max_tokens,
     )
 
     # Print diagnostic information
@@ -86,6 +87,8 @@ def main(
         print(f"model_config: {model_config}")
         print(f"hf_config: {model_config.hf_config}")
     if print_model:
+        # TODO: fix this for latest vllm, lines below crash when building from
+        # source with https://www.internalfb.com/phabricator/paste/view/P2028278010
         model = llm.llm_engine.model_executor.driver_worker.model_runner.model
         print(f"model: {model}")
 
