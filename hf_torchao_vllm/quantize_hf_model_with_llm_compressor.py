@@ -23,7 +23,7 @@ def run(
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     ignore_list = ["lm_head"]
-    if model_name == "Qwen1.5-MoE-A2.7B":
+    if model_name == "Qwen/Qwen1.5-MoE-A2.7B":
         ignore_list.extend(
             [
                 "re:.*mlp.gate$",
