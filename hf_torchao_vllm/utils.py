@@ -126,10 +126,8 @@ def convert_pt_statedict_to_safetensors(
                     if k.endswith("gate_up_proj"):
                         # need to unfuse this into "gate_proj" and "up_proj"
                         # need to transpose-contiguous from KN to NK
-                        # v_gate_proj = local_v[:, :(N // 2)]
-                        # v_up_proj = local_v[:, (N // 2):]
-                        v_gate_proj = local_v[:, (N // 2) :]
-                        v_up_proj = local_v[:, : (N // 2)]
+                        v_gate_proj = local_v[:, : (N // 2)]
+                        v_up_proj = local_v[:, (N // 2) :]
 
                         k_gate_proj = k.replace(
                             "gate_up_proj", f"{expert_idx}.gate_proj.weight"
