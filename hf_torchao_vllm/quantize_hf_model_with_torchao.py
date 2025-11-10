@@ -345,44 +345,6 @@ def benchmark_model(model, input_ids, max_new_tokens, name=""):
         return elapsed
 
 
-def _inference_with_processor(
-    model,
-    processor,
-    prompts,
-    args,
-) -> None:
-    messages = []
-    for prompt in prompts[:1]:
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                ],
-            },
-        )
-
-    inputs = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-        padding="longest",
-    ).to(model.device)
-
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=args.max_new_tokens,
-    )
-
-    responses = processor.batch_decode(
-        outputs[:, inputs["input_ids"].shape[-1] :]
-    )
-    for response in responses:
-        print(response)
-
-
 def main(
     model_name: str = "facebook/opt-125m",
     output_dir: str | None = None,
@@ -482,86 +444,56 @@ def main(
 
     # Get quantization config
     quantization_config = get_quantization_config(args)
+    # breakpoint()
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    # breakpoint()
+
+    # Load and quantize model
+    print("Loading and quantizing model...")
+    quantized_model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype="bfloat16",
+        device_map=args.device_map,
+        quantization_config=quantization_config,
+    )
+    print(quantized_model)
 
     if args.model_name == "meta-llama/Llama-4-Scout-17B-16E-Instruct":
-        # TODO(future): maybe unify with the else branch, need to figure
-        # out the right syntax for preparing inputs and running generation
-        # TODO(future): make this work for multiple prompts
-        from transformers import AutoProcessor, Llama4ForConditionalGeneration
-
-        processor = AutoProcessor.from_pretrained(args.model_name)
-        quantized_model = Llama4ForConditionalGeneration.from_pretrained(
-            args.model_name,
-            # Note: flex does not work with naive device_map="auto"
-            # attn_implementation="flex_attention",
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            quantization_config=quantization_config,
-        )
-        print(quantized_model)
-
         print(
-            "quantized_model.language_model.model.layers[47].feed_forward.experts.down_proj",
+            "quantized_model.model.layers[47].feed_forward.experts.down_proj",
             type(
-                quantized_model.language_model.model.layers[
-                    47
-                ].feed_forward.experts.down_proj
+                quantized_model.model.layers[47].feed_forward.experts.down_proj
             ),
         )
         print(
-            "quantized_model.language_model.model.layers[47].feed_forward.experts.gate_up_proj",
+            "quantized_model.model.layers[47].feed_forward.experts.gate_up_proj",
             type(
-                quantized_model.language_model.model.layers[
+                quantized_model.model.layers[
                     47
                 ].feed_forward.experts.gate_up_proj
             ),
         )
 
-        _inference_with_processor(quantized_model, processor, prompts, args)
+    # Test generation
+    print("\nTesting quantized model generation...")
+    input_ids = tokenizer(prompts, return_tensors="pt", padding=True).to(
+        quantized_model.device
+    )
+    outputs = quantized_model.generate(
+        **input_ids, max_new_tokens=args.max_new_tokens
+    )
 
-    else:
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        # breakpoint()
-
-        # Load and quantize model
-        print("Loading and quantizing model...")
-        quantized_model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            torch_dtype="bfloat16",
-            device_map=args.device_map,
-            quantization_config=quantization_config,
-        )
-        print(quantized_model)
-
-        # Test generation
-        print("\nTesting quantized model generation...")
-        input_ids = tokenizer(prompts, return_tensors="pt", padding=True).to(
-            quantized_model.device
-        )
-        outputs = quantized_model.generate(
-            **input_ids, max_new_tokens=args.max_new_tokens
-        )
-
-        for i, (prompt, output) in enumerate(
-            zip(prompts, outputs, strict=False)
-        ):
-            generated_text = tokenizer.decode(output, skip_special_tokens=True)
-            print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    for i, (prompt, output) in enumerate(zip(prompts, outputs, strict=False)):
+        generated_text = tokenizer.decode(output, skip_special_tokens=True)
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
     if args.save_model_to_disk:
         # Save quantized model
         print(f"\nSaving quantized model to: {output_dir}")
-        if args.model_name == "meta-llama/Llama-4-Scout-17B-16E-Instruct":
-            quantized_model.save_pretrained(
-                output_dir, safe_serialization=False
-            )
-            processor.save_pretrained(output_dir)
-        else:
-            quantized_model.save_pretrained(
-                output_dir, safe_serialization=False
-            )
-            tokenizer.save_pretrained(output_dir)
+        quantized_model.save_pretrained(output_dir, safe_serialization=False)
+        tokenizer.save_pretrained(output_dir)
 
     # Push to HuggingFace hub if requested
     if args.push_to_hub:
@@ -573,36 +505,27 @@ def main(
         tokenizer.push_to_hub(model_name)
 
     if args.save_model_to_disk:
-        # TODO(future): support this for LLaMa 4 Scout
-        print("\nLoading saved quantized model to verify...")
-        if args.model_name == "meta-llama/Llama-4-Scout-17B-16E-Instruct":
-            _inference_with_processor(quantized_model, processor, prompts, args)
-            print("Verified inference with reloaded model")
+        # Load saved model to verify
+        # TODO: do we really need `weights_only=False` here?
+        loaded_model = AutoModelForCausalLM.from_pretrained(
+            output_dir,
+            device_map=args.device_map,
+            torch_dtype="auto",
+            weights_only=False,
+        )
 
-        else:
-            # Load saved model to verify
-            # TODO: do we really need `weights_only=False` here?
-            loaded_model = AutoModelForCausalLM.from_pretrained(
-                output_dir,
-                device_map=args.device_map,
-                torch_dtype="auto",
-                weights_only=False,
-            )
-
-            # Test loaded model with first prompt
-            test_prompt = prompts[0]
-            input_ids = tokenizer(test_prompt, return_tensors="pt").to(
-                loaded_model.device
-            )
-            output = loaded_model.generate(
-                **input_ids, max_new_tokens=args.max_new_tokens
-            )
-            generated_text = tokenizer.decode(
-                output[0], skip_special_tokens=True
-            )
-            print(
-                f"Verification - Prompt: {test_prompt!r}, Generated text: {generated_text!r}"
-            )
+        # Test loaded model with first prompt
+        test_prompt = prompts[0]
+        input_ids = tokenizer(test_prompt, return_tensors="pt").to(
+            loaded_model.device
+        )
+        output = loaded_model.generate(
+            **input_ids, max_new_tokens=args.max_new_tokens
+        )
+        generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+        print(
+            f"Verification - Prompt: {test_prompt!r}, Generated text: {generated_text!r}"
+        )
 
     # Benchmark if requested
     if args.benchmark:

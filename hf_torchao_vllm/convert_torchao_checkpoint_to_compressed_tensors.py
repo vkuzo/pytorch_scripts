@@ -90,12 +90,27 @@ def run(
 
             aobaseconfig = config_from_dict(serialized_aobaseconfig)
             ct_config = ao_config_to_compressed_tensors_config(aobaseconfig)
+            # print(aobaseconfig)
+            # print(ct_config)
+            # return
 
-            assert fqn in ("default", "_default"), "unsupported"
+            # assert fqn in ("default", "_default"), "unsupported"
             new_hf_quantization_config["config_groups"]["group_0"] = ct_config
 
         # for now, modify config_source inplace
         config_source["quantization_config"] = new_hf_quantization_config
+
+        # HACK: manually assign `ignore` based on the specific recipe
+        # used to quantize `Llama-4-Scout-17B-16E-Instruct`:
+        # 1. only quantize FFN
+        for layer_idx in range(48):
+            new_ignore_list = [
+                f"model.layers.{layer_idx}.self_attn.q_proj",
+                f"model.layers.{layer_idx}.self_attn.k_proj",
+                f"model.layers.{layer_idx}.self_attn.v_proj",
+                f"model.layers.{layer_idx}.self_attn.o_proj",
+            ]
+            new_hf_quantization_config["ignore"].extend(new_ignore_list)
 
         # save to new location
         with open(config_name_target, "w") as f:
