@@ -308,6 +308,8 @@ def get_quantization_config(args):
                     single_config,
                     modules_to_not_convert=modules_to_not_convert,
                 )
+        case "none":
+            return None
         case _:
             raise ValueError(
                 f"Unsupported quantization type: {args.quant_type}"
@@ -361,6 +363,7 @@ def main(
         "fp8",
         "mxfp4",
         "nvfp4",
+        "none",
     ] = "fp8",
     granularity: Literal[
         "per_row", "per_tensor", "a1x128_w128x128"
@@ -444,7 +447,6 @@ def main(
 
     # Get quantization config
     quantization_config = get_quantization_config(args)
-    # breakpoint()
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
