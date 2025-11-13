@@ -40,6 +40,7 @@ def run(
                 "re:.*router",
                 "re:.*vision_model.*",
                 "re:.*multi_modal_projector.*",
+                "re:.*shared_expert.*",
                 "Llama4TextAttention",
             ]
         )

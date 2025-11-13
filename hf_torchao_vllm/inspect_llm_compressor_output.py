@@ -10,6 +10,7 @@ from utils import inspect_model_state_dict
 
 def run(
     dir_name: str = "data/llmcompressor/fp8-opt-125m",
+    num_files_limit: int | None = None,
 ):
     json_config_name = f"{dir_name}/config.json"
     with open(json_config_name) as f:
@@ -18,7 +19,9 @@ def run(
         print(json.dumps(data, indent=2))
 
     model_name, model_extension = "model", "safetensors"
-    inspect_model_state_dict(dir_name, model_name, model_extension)
+    inspect_model_state_dict(
+        dir_name, model_name, model_extension, num_files_limit
+    )
 
 
 if __name__ == "__main__":
