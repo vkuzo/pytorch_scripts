@@ -465,22 +465,6 @@ def main(
             ),
         )
 
-    if args.convert_llama_4_expert_weights_to_mnk:
-        if args.model_name != "meta-llama/Llama-4-Scout-17B-16E-Instruct":
-            raise AssertionError("unimplemented")
-        print("\nConverting LLaMa 4 expert weights from MKN to MNK layout")
-        for name, param in quantized_model.named_parameters():
-            if (
-                ("feed_forward.experts.down_proj" in name)
-                or ("feed_forward.experts.gate_up_proj" in name)
-            ) and isinstance(param, Float8Tensor):
-                # convert memory layout mkn -> mnk
-                param.qdata = (
-                    param.qdata.transpose(-2, -1).contiguous().transpose(-2, -1)
-                )
-        # TODO(future): investigate why this memory layout transformation does
-        # not survive saving the checkpoint to disk
-
     # Test generation
     print("\nTesting quantized model generation...")
     input_ids = tokenizer(prompts, return_tensors="pt", padding=True).to(
@@ -497,7 +481,37 @@ def main(
     if args.save_model_to_disk:
         # Save quantized model
         print(f"\nSaving quantized model to: {output_dir}")
-        quantized_model.save_pretrained(output_dir, safe_serialization=False)
+
+        if args.convert_llama_4_expert_weights_to_mnk:
+            if args.model_name != "meta-llama/Llama-4-Scout-17B-16E-Instruct":
+                raise AssertionError("unimplemented")
+            print("\nConverting LLaMa 4 expert weights from MKN to MNK layout")
+
+            # source: https://github.com/huggingface/transformers/blob/6f6095e0cf509f7384d3ce0c1804013ef6cafd5f/src/transformers/modeling_utils.py#L3466
+            def save_function(shard, filename):
+                # `save_pretrained` default logic calls tensor.contiguous() before
+                # saving, so if we do mkn -> mnk before saving it will be
+                # converted back to mkn.
+                # We undo this in the custom save_function, which runs after
+                # the contiguous call in `save_pretrained`.:)
+                for k, v in shard.items():
+                    # hacky check for LLaMa 4 experts
+                    if isinstance(v, Float8Tensor) and len(v.shape) == 3:
+                        v.qdata = (
+                            v.qdata.transpose(-2, -1)
+                            .contiguous()
+                            .transpose(-2, -1)
+                        )
+                torch.save(shard, filename)
+
+        else:
+            save_function = torch.save
+
+        quantized_model.save_pretrained(
+            output_dir,
+            safe_serialization=False,
+            save_function=save_function,
+        )
         tokenizer.save_pretrained(output_dir)
 
     # Push to HuggingFace hub if requested
