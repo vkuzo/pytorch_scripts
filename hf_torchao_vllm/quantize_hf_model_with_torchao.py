@@ -359,6 +359,7 @@ def main(
     ffn_only_llama_4_scout: bool = False,
     convert_llama_4_expert_weights_to_mnk: bool = False,
     save_model_to_disk: bool = True,
+    load_model_from_disk: bool = True,
 ):
     """
     Quantize a model with TorchAO and test its performance.
@@ -379,14 +380,15 @@ def main(
         ffn_only_llama_4_scout: if True, FFN only for meta-llama/Llama-4-Scout-17B-16E-Instruct
         convert_llama_4_expert_weights_to_mnk: if True, converts LLaMa 4 Scout expert weights from MKN to MNK memory layout
         save_model_to_disk: if True, saves quantized model to local disk
+        load_model_from_disk: if True, reloads model from disk to test it again
     """
     # Test prompts
     prompts = [
         "Why is Pytorch 2.0 the best machine learning compiler?",
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
+        # "Hello, my name is",
+        # "The president of the United States is",
+        # "The capital of France is",
+        # "The future of AI is",
     ]
 
     # Set seed before creating the model
@@ -411,6 +413,7 @@ def main(
         device_map=device_map,
         experts_only_qwen_1_5_moe_a_2_7b=experts_only_qwen_1_5_moe_a_2_7b,
         save_model_to_disk=save_model_to_disk,
+        load_model_from_disk=load_model_from_disk,
         skip_gate_qwen_1_5_moe_a_2_7b=skip_gate_qwen_1_5_moe_a_2_7b,
         ffn_only_llama_4_scout=ffn_only_llama_4_scout,
         convert_llama_4_expert_weights_to_mnk=convert_llama_4_expert_weights_to_mnk,
@@ -506,7 +509,8 @@ def main(
         quantized_model.push_to_hub(model_name, safe_serialization=False)
         tokenizer.push_to_hub(model_name)
 
-    if args.save_model_to_disk:
+    if args.load_model_from_disk:
+        assert args.save_model_to_disk, "unimplemented"
         # Load saved model to verify
         # TODO: do we really need `weights_only=False` here?
         loaded_model = AutoModelForCausalLM.from_pretrained(
