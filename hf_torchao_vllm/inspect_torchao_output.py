@@ -22,7 +22,10 @@ torch.serialization.add_safe_globals(
 torch.serialization.add_safe_globals([getattr])
 
 
-def run(dir_name: str = "data/torchao/fp8-opt-125m"):
+def run(
+    dir_name: str = "data/torchao/fp8-opt-125m",
+    num_files_limit: int | None = None,
+):
     json_config_name = f"{dir_name}/config.json"
 
     # inspect the config
@@ -42,7 +45,9 @@ def run(dir_name: str = "data/torchao/fp8-opt-125m"):
     #   pytorch_model.bin.index.json
     #
     model_name, model_extension = "pytorch_model", "bin"
-    inspect_model_state_dict(dir_name, model_name, model_extension)
+    inspect_model_state_dict(
+        dir_name, model_name, model_extension, num_files_limit
+    )
 
 
 if __name__ == "__main__":

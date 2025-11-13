@@ -41,6 +41,9 @@ from torchao.quantization.quant_api import (
     Int8DynamicActivationInt8WeightConfig,
     Int8WeightOnlyConfig,
 )
+from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
+    Float8Tensor,
+)
 from transformers import AutoModelForCausalLM, AutoTokenizer, TorchAoConfig
 
 
@@ -354,6 +357,7 @@ def main(
     experts_only_qwen_1_5_moe_a_2_7b: bool = False,
     skip_gate_qwen_1_5_moe_a_2_7b: bool = False,
     ffn_only_llama_4_scout: bool = False,
+    convert_llama_4_expert_weights_to_mnk: bool = False,
     save_model_to_disk: bool = True,
 ):
     """
@@ -373,6 +377,7 @@ def main(
         experts_only_qwen_1_5_moe_a_2_7b: if True, quantizes experts only for Qwen1.5-MoE-A2.7B model
         skip_gate_qwen_1_5_moe_a_2_7b: if True, skips gate quantization for Qwen1.5-MoE-A2.7B model
         ffn_only_llama_4_scout: if True, FFN only for meta-llama/Llama-4-Scout-17B-16E-Instruct
+        convert_llama_4_expert_weights_to_mnk: if True, converts LLaMa 4 Scout expert weights from MKN to MNK memory layout
         save_model_to_disk: if True, saves quantized model to local disk
     """
     # Test prompts
@@ -408,6 +413,7 @@ def main(
         save_model_to_disk=save_model_to_disk,
         skip_gate_qwen_1_5_moe_a_2_7b=skip_gate_qwen_1_5_moe_a_2_7b,
         ffn_only_llama_4_scout=ffn_only_llama_4_scout,
+        convert_llama_4_expert_weights_to_mnk=convert_llama_4_expert_weights_to_mnk,
     )
     print(f"{args=}")
 
@@ -455,6 +461,22 @@ def main(
                 ].feed_forward.experts.gate_up_proj
             ),
         )
+
+    if args.convert_llama_4_expert_weights_to_mnk:
+        if args.model_name != "meta-llama/Llama-4-Scout-17B-16E-Instruct":
+            raise AssertionError("unimplemented")
+        print("\nConverting LLaMa 4 expert weights from MKN to MNK layout")
+        for name, param in quantized_model.named_parameters():
+            if (
+                ("feed_forward.experts.down_proj" in name)
+                or ("feed_forward.experts.gate_up_proj" in name)
+            ) and isinstance(param, Float8Tensor):
+                # convert memory layout mkn -> mnk
+                param.qdata = (
+                    param.qdata.transpose(-2, -1).contiguous().transpose(-2, -1)
+                )
+        # TODO(future): investigate why this memory layout transformation does
+        # not survive saving the checkpoint to disk
 
     # Test generation
     print("\nTesting quantized model generation...")
