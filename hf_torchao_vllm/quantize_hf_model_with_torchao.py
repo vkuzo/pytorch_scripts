@@ -17,6 +17,7 @@ from jsonargparse import CLI, Namespace
 from rich import print
 
 import torch
+import transformers
 from torch._inductor.utils import do_bench_using_profiling
 from torchao.prototype.mx_formats import MXGemmKernelChoice
 from torchao.prototype.mx_formats.inference_workflow import (
@@ -41,6 +42,11 @@ from torchao.quantization.quant_api import (
     Int8WeightOnlyConfig,
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, TorchAoConfig
+
+
+def _assert_transformers_version_supports_regex():
+    v = transformers.__version__
+    assert str(v) >= "5", f"transformers version {v} not greater than 5"
 
 
 def benchmark_cuda_function_in_microseconds(
@@ -85,47 +91,18 @@ def get_quantization_config(args):
             )
 
             if args.experts_only_qwen_1_5_moe_a_2_7b:
-                expert_fqn_to_config = {}
-                # TODO(future PR): this is annoying, I should be able to use a regex here
-                for layer_idx in range(24):
-                    expert_fqn_to_config[
-                        f"model.layers.{layer_idx}.self_attn.q_proj"
-                    ] = None
-                    expert_fqn_to_config[
-                        f"model.layers.{layer_idx}.self_attn.k_proj"
-                    ] = None
-                    expert_fqn_to_config[
-                        f"model.layers.{layer_idx}.self_attn.v_proj"
-                    ] = None
-                    expert_fqn_to_config[
-                        f"model.layers.{layer_idx}.self_attn.o_proj"
-                    ] = None
-                    expert_fqn_to_config[
-                        f"model.layers.{layer_idx}.mlp.gate"
-                    ] = None
-                    expert_fqn_to_config[
-                        f"model.layers.{layer_idx}.mlp.shared_expert.gate_proj"
-                    ] = None
-                    expert_fqn_to_config[
-                        f"model.layers.{layer_idx}.mlp.shared_expert.up_proj"
-                    ] = None
-                    expert_fqn_to_config[
-                        f"model.layers.{layer_idx}.mlp.shared_expert.down_proj"
-                    ] = None
-                    expert_fqn_to_config[
-                        f"model.layers.{layer_idx}.mlp.shared_expert_gate"
-                    ] = None
-                    expert_fqn_to_config["lm_head"] = None
+                _assert_transformers_version_supports_regex()
                 module_fqn_to_config = ModuleFqnToConfig(
                     {
-                        "_default": single_config,
-                        **expert_fqn_to_config,
+                        r"re:.*experts.*gate_proj.*": single_config,
+                        r"re:.*experts.*up_proj.*": single_config,
+                        r"re:.*experts.*down_proj.*": single_config,
                     }
                 )
-
                 return TorchAoConfig(
                     quant_type=module_fqn_to_config,
                 )
+
             elif args.ffn_only_llama_4_scout:
                 # TODO gate this properly
                 expert_3d_weight_single_config = Float8DynamicActivationFloat8WeightConfig(
@@ -139,13 +116,14 @@ def get_quantization_config(args):
                     # TODO tool to find this (I used bisect on this tiny model).
                     activation_value_lb=1.0e-12,
                 )
+                _assert_transformers_version_supports_regex()
                 module_fqn_to_config = ModuleFqnToConfig(
                     {
                         r"re:.*\.feed_forward\.experts\.gate_up_proj": expert_3d_weight_single_config,
                         r"re:.*\.feed_forward\.experts\.down_proj": expert_3d_weight_single_config,
-                        r"re:.*\.shared_expert\.down_proj": single_config,
-                        r"re:.*\.shared_expert\.up_proj": single_config,
-                        r"re:.*\.shared_expert\.gate_proj": single_config,
+                        # r"re:.*\.shared_expert\.down_proj": single_config,
+                        # r"re:.*\.shared_expert\.up_proj": single_config,
+                        # r"re:.*\.shared_expert\.gate_proj": single_config,
                     }
                 )
                 return TorchAoConfig(
