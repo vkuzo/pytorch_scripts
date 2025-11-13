@@ -38,10 +38,20 @@ def _inspect_state_dict_file(model_name):
         # pytorch format
         state_dict = torch.load(model_name, weights_only=True)
         for k, v in state_dict.items():
+            if "Float8" in str(type(v)) and len(v.shape) == 3:
+                print(1, v.shape, v.qdata.shape, v.qdata.stride())
+                v.qdata = (
+                    v.qdata.transpose(-2, -1).contiguous().transpose(-2, -1)
+                )
+                print(2, v.shape, v.qdata.shape, v.qdata.stride())
             print(k, type(v), v.shape, v.dtype)
 
+        torch.save(state_dict, model_name)
 
-def inspect_model_state_dict(dir_name, model_name, model_extension) -> None:
+
+def inspect_model_state_dict(
+    dir_name, model_name, model_extension, num_files_limit
+) -> None:
     """
     Inspect the model state_dict from HuggingFace and print data to stdout.
     For example, if model_name == `pytorch_model` and extension == `bin`,
@@ -71,6 +81,7 @@ def inspect_model_state_dict(dir_name, model_name, model_extension) -> None:
             print(json.dumps(data, indent=2))
 
         # iterate through each file
+        inspected_files_cnt = 0
         for file_path in pathlib.Path(dir_name).iterdir():
             if not file_path.is_file():
                 continue
@@ -79,8 +90,14 @@ def inspect_model_state_dict(dir_name, model_name, model_extension) -> None:
                 and str(file_path).endswith(model_extension)
             ):
                 continue
+            if (
+                num_files_limit is not None
+                and inspected_files_cnt >= num_files_limit
+            ):
+                break
             print(file_path)
             _inspect_state_dict_file(file_path)
+            inspected_files_cnt += 1
 
 
 def convert_pt_statedict_to_safetensors(
