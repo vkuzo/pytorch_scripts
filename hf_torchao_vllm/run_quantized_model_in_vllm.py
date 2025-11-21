@@ -64,6 +64,7 @@ def main(
     compile: bool = True,
     print_configs: bool = False,
     print_model: bool = True,
+    gpu_memory_utilization: float = 0.9,
 ):
     # Create a sampling params object.
     sampling_params = SamplingParams(
@@ -76,6 +77,7 @@ def main(
         tensor_parallel_size=tp_size,
         enforce_eager=not compile,
         max_model_len=max_tokens,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
 
     # Print diagnostic information
