@@ -19,11 +19,9 @@ from rich import print
 import torch
 import transformers
 from torch._inductor.utils import do_bench_using_profiling
-from torchao.prototype.mx_formats import MXGemmKernelChoice
 from torchao.prototype.mx_formats.inference_workflow import (
-    MXFPInferenceConfig,
-    NVFP4InferenceConfig,
-    NVFP4MMConfig,
+    MXDynamicActivationMXWeightConfig,
+    NVFP4DynamicActivationNVFP4WeightConfig,
 )
 from torchao.quantization import (
     ModuleFqnToConfig,
@@ -152,14 +150,12 @@ def get_quantization_config(args):
                 )
             )
         case "mxfp8":
-            return TorchAoConfig(MXFPInferenceConfig())
+            return TorchAoConfig(MXDynamicActivationMXWeightConfig())
         case "mxfp4":
-            single_config = MXFPInferenceConfig(
+            single_config = MXDynamicActivationMXWeightConfig(
                 activation_dtype=torch.float4_e2m1fn_x2,
                 weight_dtype=torch.float4_e2m1fn_x2,
                 block_size=32,
-                # gemm_kernel_choice=MXGemmKernelChoice.CUTLASS,
-                gemm_kernel_choice=MXGemmKernelChoice.EMULATED,
             )
             if args.experts_only_qwen_1_5_moe_a_2_7b:
                 expert_fqn_to_config = {}
@@ -219,8 +215,7 @@ def get_quantization_config(args):
                     modules_to_not_convert=modules_to_not_convert,
                 )
         case "nvfp4":
-            single_config = NVFP4InferenceConfig(
-                mm_config=NVFP4MMConfig.WEIGHT_ONLY,
+            single_config = NVFP4DynamicActivationNVFP4WeightConfig(
                 use_triton_kernel=False,
                 #
                 # weight_only and use_dynamic_per_tensor_scale=True works here
