@@ -54,7 +54,7 @@ def run(
         # try using autoquant_
 
         m = torchao.autoquant(torch.compile(m, mode="max-autotune"))
-        y = m(x)
+        m(x)
         print(m)
 
     else:

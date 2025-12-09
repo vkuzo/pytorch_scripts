@@ -38,6 +38,9 @@ def max_with_atomics(x: torch.Tensor):
     # Note: need to initialize to zero for numerical correctness of max
     output = torch.zeros(1, dtype=x.dtype, device=x.device)
     n_elements = x.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+
+    def grid(meta):
+        return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+
     max_with_atomics_kernel[grid](x, output, n_elements)
     return output.squeeze()

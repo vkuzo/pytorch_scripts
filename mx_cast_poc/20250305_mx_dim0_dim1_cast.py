@@ -16,7 +16,10 @@ torch.manual_seed(0)
 
 def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
     """Thin wrapper around do_bench_using_profiling"""
-    no_args = lambda: func(*args, **kwargs)
+
+    def no_args():
+        return func(*args, **kwargs)
+
     time = do_bench_using_profiling(no_args)
     return time * 1e3
 

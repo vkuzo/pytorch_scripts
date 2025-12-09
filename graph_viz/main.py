@@ -4,7 +4,7 @@ import fire
 import re
 import os
 
-from typing import *
+from typing import Dict, List
 
 from jinja2 import Template
 
@@ -312,9 +312,6 @@ def parse_triton_region_graph(
         return (buf8, buf4, reinterpret_tensor(buf9, (4096, 4096), (1, 4096), 0), reinterpret_tensor(buf12, (4096, 4096), (1, 4096), 0), buf13, )
     """
     g = ParsedGraph()
-
-    cur_empty_buffers_set = set()
-    cur_populated_buffers_set = set()
 
     kernel_name_to_arg_idx_to_input_output_none = {}
 

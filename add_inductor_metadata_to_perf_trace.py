@@ -25,9 +25,6 @@ def run(
     directly visible in tools like chrome://tracing and perfetto.
     """
 
-    external_id_to_cpu_ops = dict()
-    external_id_to_kernels = dict()
-
     # open the torch logs file
     torch_logs_str = None
     with open(torch_logs_file, "r") as f:
