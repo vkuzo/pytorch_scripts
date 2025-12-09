@@ -3,7 +3,8 @@
     "allow": [
       "Bash(ruff check:*)",
       "Bash(git push:*)",
-      "Bash(gh pr create:*)"
+      "Bash(gh pr create:*)",
+      "Bash(with-proxy python:*)"
     ],
     "deny": [],
     "ask": []
