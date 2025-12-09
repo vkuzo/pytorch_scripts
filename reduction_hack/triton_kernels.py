@@ -6,17 +6,17 @@ need to do a two-stage reduction.
 import torch
 import triton
 from triton import language as tl
-from triton.runtime import driver
+
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE': 512}),
-        triton.Config({'BLOCK_SIZE': 1024}),
-        triton.Config({'BLOCK_SIZE': 2048}),
-        triton.Config({'BLOCK_SIZE': 8192}),
-        triton.Config({'BLOCK_SIZE': 16384}),
+        triton.Config({"BLOCK_SIZE": 512}),
+        triton.Config({"BLOCK_SIZE": 1024}),
+        triton.Config({"BLOCK_SIZE": 2048}),
+        triton.Config({"BLOCK_SIZE": 8192}),
+        triton.Config({"BLOCK_SIZE": 16384}),
     ],
-    key=['n_elements'],
+    key=["n_elements"],
 )
 @triton.jit
 def max_with_atomics_kernel(
@@ -32,7 +32,7 @@ def max_with_atomics_kernel(
     x = tl.load(in_ptr0 + offsets, mask=mask)
     x_max = tl.max(x)
     tl.atomic_max(out_ptr, x_max)
-        
+
 
 def max_with_atomics(x: torch.Tensor):
     # Note: need to initialize to zero for numerical correctness of max

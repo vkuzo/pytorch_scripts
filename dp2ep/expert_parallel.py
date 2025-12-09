@@ -8,24 +8,20 @@
 # LICENSE file in the root directory of this source tree.
 
 
-from functools import partial
 from typing import Callable, Literal
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed import get_rank
 from torch.distributed.tensor import (
     DeviceMesh,
     distribute_module,
     distribute_tensor,
     DTensor,
-    Replicate,
     Shard,
 )
 from torch.distributed.tensor.parallel import ParallelStyle
-from torch.distributed.tensor.placement_types import Placement
-from utils import print0, print1
+from utils import print0
 
 
 # from torch.distributed._functional_collectives import all_to_all_single_autograd
@@ -98,10 +94,10 @@ class ExpertParallel(ParallelStyle):
 
     # performing all-to-all dispatch on the input
     def _token_dispatch(self, mod, inputs, device_mesh):
-        print0('start token dispatch')
+        print0("start token dispatch")
         # annotate module input placements/sharding with input_layouts
         routed_input, num_tokens_per_expert = inputs
-        print0('routed_input', routed_input)
+        print0("routed_input", routed_input)
 
         # print('rank', get_rank(), 'num_tokens_per_expert', num_tokens_per_expert, '\n')
 
@@ -117,13 +113,13 @@ class ExpertParallel(ParallelStyle):
             )
             # example with actual values
             #
-            # before all_to_all_single 
+            # before all_to_all_single
             #   num_tokens_per_expert rank 0: tensor([1, 0, 2, 1], device='cuda:0')
             #   num_tokens_per_expert rank 1: tensor([0, 0, 1, 3], device='cuda:1')
-            # after all_to_all_single 
+            # after all_to_all_single
             #   num_tokens_per_expert_group rank 0: tensor([1, 0, 0, 0], device='cuda:0')
             #   num_tokens_per_expert_group rank 1: tensor([2, 1, 1, 3], device='cuda:1')
-            # 
+            #
             # example with variables
             #
             # before all_to_all_single
@@ -160,14 +156,14 @@ class ExpertParallel(ParallelStyle):
         # perform all-to-all
 
         # example routed_input, rank0:
-        # 
+        #
         #   before a2a
         #
         # tensor([[ 0.1045,  1.0703, -0.6953,  0.8125,  0.2461, -0.0194, -1.8516, -0.8750],
         #         [ 0.9258,  0.2041,  1.1016, -0.0518, -1.1953,  0.2773, -0.9492, -0.3457],
         #         [-0.3789,  0.8242,  0.0203,  0.3945, -0.1377, -0.3984, -0.3633, -0.1514],
         #         [ 1.5000, -1.3125, -0.8594, -0.5820, -0.5039,  0.2100, -1.3281, -0.3789]],)
-        # 
+        #
         #   after a2a (1 token for expert 0, 0 tokens for expert 1)
         #
         # tensor([[ 0.1045,  1.0703, -0.6953,  0.8125,  0.2461, -0.0194, -1.8516, -0.8750]])
@@ -175,16 +171,16 @@ class ExpertParallel(ParallelStyle):
         #   num_tokens_per_expert_group: tensor([1, 0, 0, 0], device='cuda:0')
         #
         # rank1:
-        #   
+        #
         #   before a2a
-				#
-				# tensor([[-1.0781e+00,  1.6602e-01,  4.1602e-01,  1.3672e+00, -2.3750e+00, 1.1172e+00, -7.0703e-01, -1.6504e-01],
-				#         [ 3.6523e-01,  2.5940e-03,  5.4688e-01,  3.0078e-01,  1.8984e+00, -2.4531e+00, -2.1562e+00, -2.9102e-01],
-				#         [ 1.1016e+00,  1.0469e+00, -9.7266e-01, -2.0469e+00,  9.8633e-02, -6.4844e-01, -1.1094e+00,  3.9844e-01],
-				#         [ 2.6250e+00, -6.7383e-02, -2.3594e+00,  1.5938e+00,  5.6250e-01, -1.1406e+00,  6.6797e-01,  1.3477e-01]], device='cuda:1',)
-				#
-				#   after a2a (3 token for expert 2, 4 tokens for expert 3)
-				#
+        #
+        # tensor([[-1.0781e+00,  1.6602e-01,  4.1602e-01,  1.3672e+00, -2.3750e+00, 1.1172e+00, -7.0703e-01, -1.6504e-01],
+        #         [ 3.6523e-01,  2.5940e-03,  5.4688e-01,  3.0078e-01,  1.8984e+00, -2.4531e+00, -2.1562e+00, -2.9102e-01],
+        #         [ 1.1016e+00,  1.0469e+00, -9.7266e-01, -2.0469e+00,  9.8633e-02, -6.4844e-01, -1.1094e+00,  3.9844e-01],
+        #         [ 2.6250e+00, -6.7383e-02, -2.3594e+00,  1.5938e+00,  5.6250e-01, -1.1406e+00,  6.6797e-01,  1.3477e-01]], device='cuda:1',)
+        #
+        #   after a2a (3 token for expert 2, 4 tokens for expert 3)
+        #
         # tensor([[ 9.2578e-01,  2.0410e-01,  1.1016e+00, -5.1758e-02, -1.1953e+00, 2.7734e-01, -9.4922e-01, -3.4570e-01],
         #         [-3.7891e-01,  8.2422e-01,  2.0264e-02,  3.9453e-01, -1.3770e-01, -3.9844e-01, -3.6328e-01, -1.5137e-01],
         #         [ 1.5000e+00, -1.3125e+00, -8.5938e-01, -5.8203e-01, -5.0391e-01, 2.0996e-01, -1.3281e+00, -3.7891e-01],
@@ -227,7 +223,7 @@ class ExpertParallel(ParallelStyle):
 
     # performing all-to-all combine on the output
     def _token_combine(self, mod, routed_output, device_mesh):
-        print0('start token combine')
+        print0("start token combine")
         routed_output = all_to_all_single_autograd(
             routed_output,
             self.input_splits,
@@ -274,7 +270,7 @@ def expert_parallel(func: Callable) -> Callable:
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        print0('start expert_parallel wrapper')
+        print0("start expert_parallel wrapper")
         global TOKEN_GROUP_ALIGN_SIZE_M
         if isinstance(w1, DTensor):
             w1 = w1.to_local()
@@ -347,8 +343,8 @@ def expert_parallel(func: Callable) -> Callable:
             # print1('new x', x.shape, x)
 
         out = func(w1, w2, w3, x, num_tokens_per_expert)
-        print0('after func in expert_parallel wrapper')
-        print0('out.shape', out.shape)
+        print0("after func in expert_parallel wrapper")
+        print0("out.shape", out.shape)
 
         # example:
         #   rank 0 shape: (17, 8) -> (1, 8)
@@ -357,9 +353,9 @@ def expert_parallel(func: Callable) -> Callable:
             out_unpermuted = out.new_empty(input_shape)
             out_unpermuted[permuted_indices, :] = out
             out = out_unpermuted[:-1]
-            print0('new out.shape', out.shape)
+            print0("new out.shape", out.shape)
 
-        print0('end expert_parallel wrapper')
+        print0("end expert_parallel wrapper")
         return out
 
     return wrapper
