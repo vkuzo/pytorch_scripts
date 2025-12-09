@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 
 from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-from torchao.float8.float8_utils import compute_error
 
 torch.manual_seed(0)
 
@@ -94,10 +93,6 @@ def run():
             y = m(x)
             y.backward(go)
             # print('y', y[0])
-
-            o_sqnr = compute_error(y_ref, y).item()
-            gi_sqnr = compute_error(x_ref_copy.grad, x.grad).item()
-            gw_sqnr = compute_error(m_ref_copy.weight.grad, m.weight.grad).item()
 
             o_mae = mean_absolute_error(y_ref, y).item()
             gi_mae = mean_absolute_error(x_ref_copy.grad, x.grad).item()

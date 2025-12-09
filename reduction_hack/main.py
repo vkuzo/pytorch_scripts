@@ -12,12 +12,11 @@ import torch
 import triton
 
 from torch.profiler import profile, ProfilerActivity
-
-torch.manual_seed(0)
-
 from triton_kernels import (
     max_with_atomics,
 )
+
+torch.manual_seed(0)
 
 
 def test_numerics():
@@ -76,7 +75,9 @@ def benchmark(size, provider):
         )
 
     # read numel elements, write 1 (ignore the write)
-    gbps = lambda ms: x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+    def gbps(ms):
+        return x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 

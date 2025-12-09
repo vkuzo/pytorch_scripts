@@ -51,7 +51,7 @@ def run():
     test_with_token = False
     if test_with_token:
         # Usage
-        hook_handles = register_hooks_to_linear_modules(model)
+        register_hooks_to_linear_modules(model)
         # Prepare input[[transformers.XLMRobertaConfig]]
         inputs = tokenizer(
             "Bonjour, je suis un modèle <mask>.", return_tensors="pt"
@@ -111,10 +111,10 @@ def run():
             kernel_preference=KernelPreference.TORCH,
         )
         print(config)
-        filter_fn = (
-            lambda mod, name: isinstance(mod, torch.nn.Linear)
-            and "attention" not in name
-        )
+
+        def filter_fn(mod, name):
+            return isinstance(mod, torch.nn.Linear) and "attention" not in name
+
         quantize_(m_q, config, filter_fn)
         print(m_q)
         m_q_c = torch.compile(m_q, mode="default")

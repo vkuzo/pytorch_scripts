@@ -63,8 +63,6 @@ def run(mode: str):
 
         # local tensor on rank 0 equals to a slice of the original tensor
         if get_rank() == 0:
-            shape_us = N, K
-            shape_s = N // world_size, K
             torch.testing.assert_close(
                 w_us[: N // world_size], w_s.to_local(), atol=0, rtol=0
             )
@@ -135,9 +133,6 @@ def run(mode: str):
 
         x_ref = torch.randn(M, K, device="cuda")
         m_ref = FFN(K, N).cuda()
-
-        x_tp = copy.deepcopy(x_ref)
-        m_tp = copy.deepcopy(m_ref)
 
         # print0('unsharded forward')
         y = m_ref(x_ref)

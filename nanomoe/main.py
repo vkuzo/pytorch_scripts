@@ -72,8 +72,8 @@ class Router(nn.Module):
             # router z loss, computed on logits (before softmax)
             # this loss prevents router logits from becoming too large
             if self.use_router_z_loss:
-                z_loss = self.compute_router_z_loss(logits)
-                MANAGER.add_router_z_loss(z_loss)
+                self.compute_router_z_loss(logits)
+                # MANAGER.add_router_z_loss(z_loss)  # noqa: F821
 
             # find top k experts for each token
             top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1)  # [B, T, k]
@@ -97,8 +97,8 @@ class Router(nn.Module):
             # this loss encourages equal probability assigned to each expert
             # and equal load balancing of tokens assigned to each expert
             if self.use_aux_loss:
-                aux_loss = self.compute_aux_loss(router_probs, top_k_indices)
-                MANAGER.add_aux_loss(aux_loss)
+                self.compute_aux_loss(router_probs, top_k_indices)
+                # MANAGER.add_aux_loss(aux_loss)  # noqa: F821
 
             # compute expert capacity
             exp_capacity = self.get_capacity(num_tokens)
@@ -376,7 +376,7 @@ def run():
     x = torch.randn(B, T, n_embd)
     print("x.shape", x.shape)
 
-    y = moe(x)
+    moe(x)
 
     print("done")
 

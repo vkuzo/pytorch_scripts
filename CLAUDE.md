@@ -3,6 +3,7 @@
 ## General guidelines (do not ignore)
 
 * When you write code, do not commit code to github unless I ask for that - I usually want to check it first
+* When you need to connect to the internet, precede the bash command with `with-proxy` to activate the proxy
 
 ## Repository Overview
 
