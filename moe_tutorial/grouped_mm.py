@@ -13,6 +13,7 @@ import torch.nn as nn
 
 torch.manual_seed(0)
 
+
 def run():
     M, K, N = 4, 16, 32
     # Simple routing - x[:1] to expert0, x[1:] to expert1. In the real use
@@ -38,7 +39,7 @@ def run():
     #
     y0_ref = x0_ref @ expert0_ref.weight.t()
     y1_ref = x1_ref @ expert1_ref.weight.t()
-    y_ref = torch.cat([y0_ref, y1_ref], dim=0) 
+    y_ref = torch.cat([y0_ref, y1_ref], dim=0)
     y_ref.backward(grad_ref)
     # print(y_ref)
 
@@ -64,7 +65,7 @@ def run():
     # print(y)
     y.backward(grad)
 
-    # 
+    #
     # verify outputs match
     #
 
@@ -75,16 +76,20 @@ def run():
     torch.testing.assert_close(x_ref.grad, x.grad, atol=0, rtol=0)
 
     # grad_weight
-    torch.testing.assert_close(expert0_ref.weight.grad, expert0.weight.grad, atol=0, rtol=0)
-    torch.testing.assert_close(expert1_ref.weight.grad, expert1.weight.grad, atol=0, rtol=0)
+    torch.testing.assert_close(
+        expert0_ref.weight.grad, expert0.weight.grad, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        expert1_ref.weight.grad, expert1.weight.grad, atol=0, rtol=0
+    )
 
     #
-    # now, reproduce grad_input and grad_weight using calls to 
+    # now, reproduce grad_input and grad_weight using calls to
     # `torch._grouped_mm`, demonstrating proper use of offsets
     #
     # individual weight stored with shape [N, K], so weight.t() is [K, N]
     #
-    # forward, with shapes: 
+    # forward, with shapes:
     #
     #   output[M, N] = input[M, K] @ weight.t()[num_experts, K, N]
     #
@@ -93,7 +98,7 @@ def run():
     #   grad_input[M, K] = grad_output[M, N] @ weight[num_experts, N, K]
     #
     #   grad_weight[num_experts, N, K] = grad_output.t()[N, M] @ input[M, K]
-    # 
+    #
 
     with torch.no_grad():
         # calculate grad_input by hand
@@ -113,8 +118,9 @@ def run():
         grad_weight_repro = torch._grouped_mm(grad.t(), x, x_offsets)
         grad_weight_ref = torch.stack([expert0.weight.grad, expert1.weight.grad])
         torch.testing.assert_close(grad_weight_repro, grad_weight_ref, atol=0, rtol=0)
-    
-    print('done')
 
-if __name__ == '__main__':
-    run() 
+    print("done")
+
+
+if __name__ == "__main__":
+    run()

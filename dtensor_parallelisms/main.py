@@ -14,15 +14,16 @@ import torch.nn.functional as F
 import os
 
 from torch.distributed import get_rank
-from torch.distributed._tensor import DTensor, Replicate, Shard, distribute_tensor
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.device_mesh import init_device_mesh
 
 torch.backends.fp32_precision = "ieee"
+
 
 def print0(*args, **kwargs):
     if not get_rank() == 0:
         return
     print(*args, **kwargs)
+
 
 def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", -1))
@@ -33,14 +34,13 @@ def setup_distributed():
     torch.cuda.set_device(local_rank)
     return device_mesh
 
-def run(mode: str):
 
+def run(mode: str):
     device_mesh = setup_distributed()
     world_size = torch.distributed.get_world_size()
-    print0('mode', mode)
+    print0("mode", mode)
 
-    if mode == 'fsdp':
-
+    if mode == "fsdp":
         #
         # Data Parallel - use FSDP2 for a ready-made example
         #
@@ -52,7 +52,7 @@ def run(mode: str):
         assert world_size == 2, "unsupported"
 
         # create a toy linear
-        m_unsharded = nn.Sequential(nn.Linear(K, N, bias=False, device='cuda'))
+        m_unsharded = nn.Sequential(nn.Linear(K, N, bias=False, device="cuda"))
 
         m_sharded = copy.deepcopy(m_unsharded)
         m_sharded = torch.distributed.fsdp.fully_shard(m_sharded, mesh=device_mesh)
@@ -65,7 +65,9 @@ def run(mode: str):
         if get_rank() == 0:
             shape_us = N, K
             shape_s = N // world_size, K
-            torch.testing.assert_close(w_us[:N//world_size], w_s.to_local(), atol=0, rtol=0)
+            torch.testing.assert_close(
+                w_us[: N // world_size], w_s.to_local(), atol=0, rtol=0
+            )
 
         # original tensor equals the reassembled tensor
         torch.testing.assert_close(w_us, w_s_f, atol=0, rtol=0)
@@ -90,7 +92,7 @@ def run(mode: str):
         torch.testing.assert_close(w_us.grad, w_s.grad.full_tensor(), atol=0, rtol=0)
 
     else:
-        assert mode == 'tp', f'unsupported mode {mode}'
+        assert mode == "tp", f"unsupported mode {mode}"
 
         #
         # Tensor parallel
@@ -98,13 +100,13 @@ def run(mode: str):
         # * https://arxiv.org/pdf/2205.05198 section 4.2.2 figure 5 (paper about TP + SP)
         # * https://docs.pytorch.org/tutorials/intermediate/TP_tutorial.html
         #
-        # unsharded fwd: 
+        # unsharded fwd:
         #   input: (M, dim1)
         #   w1 and w3 are (dim1, dim2): (M, dim1) -> (M, dim2)
         #   w2 is (dim2, dim1): (M, dim2) -> (M, dim1)
         #
         # sharded fwd:
-        #   input: (M, dim1) 
+        #   input: (M, dim1)
         #   w1 and w3 are (dim1, dim2 // world_size): (M, dim1) -> (M, dim2 // world_size)
         #   w2 is (dim2 // world_size, dim1): (M, dim2 // world_size) -> (M, dim1)
         #   all-reduce(sum) the output
@@ -129,9 +131,9 @@ def run(mode: str):
                 return w2
 
         M, K, N = 4, 8, 16
-        print0('MKN', M, K, N)
+        print0("MKN", M, K, N)
 
-        x_ref = torch.randn(M, K, device='cuda')
+        x_ref = torch.randn(M, K, device="cuda")
         m_ref = FFN(K, N).cuda()
 
         x_tp = copy.deepcopy(x_ref)
@@ -142,7 +144,11 @@ def run(mode: str):
         # print0('y', y)
 
         # apply TP APIs from https://docs.pytorch.org/tutorials/intermediate/TP_tutorial.html
-        from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
+        from torch.distributed.tensor.parallel import (
+            ColwiseParallel,
+            RowwiseParallel,
+            parallelize_module,
+        )
 
         layer_tp_plan = {
             "w1": ColwiseParallel(),
@@ -161,7 +167,7 @@ def run(mode: str):
         torch.testing.assert_close(y, y2)
 
         # now, reimplement the above by hand for world_size == 2
-        assert world_size == 2, 'unsupported'
+        assert world_size == 2, "unsupported"
         w1_col_size = m_ref.w1.weight.shape[0] // world_size
         w2_row_size = m_ref.w2.weight.shape[1] // world_size
         rank = get_rank()
@@ -172,9 +178,9 @@ def run(mode: str):
         w2_row_start = w2_row_size * rank
         w2_row_end = w2_row_start + w2_row_size
 
-        w1_sharded = m_ref.w1.weight[w1_col_start:w1_col_end] 
-        w3_sharded = m_ref.w3.weight[w1_col_start:w1_col_end] 
-        w2_sharded = m_ref.w2.weight[:, w2_row_start:w2_row_end] 
+        w1_sharded = m_ref.w1.weight[w1_col_start:w1_col_end]
+        w3_sharded = m_ref.w3.weight[w1_col_start:w1_col_end]
+        w2_sharded = m_ref.w2.weight[:, w2_row_start:w2_row_end]
 
         w1_out = torch.mm(x_ref, w1_sharded.t())
         w3_out = torch.mm(x_ref, w3_sharded.t())
@@ -185,9 +191,10 @@ def run(mode: str):
 
     # torch.distributed.breakpoint(0)
 
-    print0('done')
+    print0("done")
 
     torch.distributed.destroy_process_group()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     fire.Fire(run)

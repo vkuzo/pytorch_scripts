@@ -38,7 +38,7 @@ def generate_image(prompt: str, seed: int, out_path: str) -> Image.Image:
     generator = torch.manual_seed(seed)
     image = pipe(
         prompt,
-        num_inference_steps=25,   # can tweak for speed vs quality
+        num_inference_steps=25,  # can tweak for speed vs quality
         guidance_scale=7.5,
         generator=generator,
     ).images[0]
@@ -64,23 +64,29 @@ baseline_img = generate_image(PROMPT, BASELINE_SEED, baseline_path)
 modified_path = os.path.join(OUTPUT_DIR, "modified.png")
 modified_img = generate_image(PROMPT, MODIFIED_SEED, modified_path)
 
+
 # -----------------------------
 # 4. Compute LPIPS between the two
 # -----------------------------
 # LPIPS expects normalized tensors in [-1, 1]
 def pil_to_lpips_tensor(img: Image.Image, device: str):
-    t = torch.from_numpy(
-        (torch.ByteTensor(torch.ByteStorage.from_buffer(img.tobytes()))
-         .view(img.size[1], img.size[0], 3)
-         .numpy())
-    ).float() / 255.0  # [0, 1]
+    t = (
+        torch.from_numpy(
+            (
+                torch.ByteTensor(torch.ByteStorage.from_buffer(img.tobytes()))
+                .view(img.size[1], img.size[0], 3)
+                .numpy()
+            )
+        ).float()
+        / 255.0
+    )  # [0, 1]
     # reshape to (1, 3, H, W) and scale to [-1, 1]
     t = t.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
     t = t * 2.0 - 1.0
     return t.to(device)
 
 
-loss_fn = lpips.LPIPS(net='vgg').to(device)
+loss_fn = lpips.LPIPS(net="vgg").to(device)
 
 baseline_t = pil_to_lpips_tensor(baseline_img, device)
 modified_t = pil_to_lpips_tensor(modified_img, device)
