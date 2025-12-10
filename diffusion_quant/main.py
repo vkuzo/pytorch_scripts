@@ -20,7 +20,18 @@ from torchao.quantization import (
 # Config
 # -----------------------------
 MODEL_ID = "OFA-Sys/small-stable-diffusion-v0"
-PROMPT = "a small cozy cabin in the snowy mountains at sunset, high detail"
+PROMPTS = [
+    "a small cozy cabin in the snowy mountains at sunset, high detail",
+    "a wizard doing magic",
+    "a enthusiast fisherman in the middle of a lake",
+    "an unhappy wolf",
+    "striker lining up for a penalty kick",
+    "a person enjoying their morning coffee",
+    "a robot playing basketball",
+    "beautiful flowers in a mountain meadow",
+    "a supermarket shelf full of sale items",
+    "a yellow taxi",
+]
 IMAGE_SIZE = (512, 512)  # (width, height)
 OUTPUT_DIR = "diffusion_quant/outputs"
 RANDOM_SEED = 42
@@ -171,6 +182,35 @@ def create_comparison_image(
     return composite
 
 
+def create_combined_comparison_image(
+    comparison_images: list[Image.Image],
+) -> Image.Image:
+    """
+    Stack multiple comparison images vertically into a single combined image.
+
+    Args:
+        comparison_images: List of comparison images to stack vertically
+
+    Returns:
+        Combined image with all comparisons stacked vertically
+    """
+    if not comparison_images:
+        raise ValueError("comparison_images list cannot be empty")
+
+    # Calculate dimensions
+    total_height = sum(img.size[1] for img in comparison_images)
+    max_width = max(img.size[0] for img in comparison_images)
+
+    # Create combined image
+    combined_img = Image.new("RGB", (max_width, total_height))
+    y_offset = 0
+    for comp_img in comparison_images:
+        combined_img.paste(comp_img, (0, y_offset))
+        y_offset += comp_img.size[1]
+
+    return combined_img
+
+
 def pil_to_lpips_tensor(img: Image.Image, device: str):
     """
     Convert a PIL Image to a tensor suitable for LPIPS computation.
@@ -198,10 +238,14 @@ def pil_to_lpips_tensor(img: Image.Image, device: str):
     return t.to(device)
 
 
-def run(mode: str):
+def run(mode: str, num_prompts: int = None):
     """
     Main execution function: generates baseline and modified images,
     computes LPIPS, and creates a comparison visualization.
+
+    Args:
+        mode: One of 'sweep', 'use_sweep_results', or 'test'
+        num_prompts: Optional limit on number of prompts to use (for debugging)
     """
     assert mode in ("sweep", "use_sweep_results", "test"), f"unsupported {mode=}"
 
@@ -245,11 +289,19 @@ def run(mode: str):
     loss_fn = lpips.LPIPS(net="vgg").to(device)
 
     # -----------------------------
-    # 2. Baseline image
+    # 2. Baseline images (for all prompts)
     # -----------------------------
-    log("Generating baseline image")
-    baseline_img = generate_image(pipe, PROMPT, RANDOM_SEED, device)
-    baseline_t = pil_to_lpips_tensor(baseline_img, device)
+    # Limit prompts for debugging if requested
+    prompts_to_use = PROMPTS if num_prompts is None else PROMPTS[:num_prompts]
+    log(f"Generating baseline images for {len(prompts_to_use)} prompts")
+    baseline_data = []  # List of (prompt_idx, prompt, baseline_img, baseline_t)
+    for idx, prompt in enumerate(prompts_to_use):
+        prompt_idx = f"prompt_{idx}"
+        log(f"Generating baseline for {prompt_idx}: {prompt}")
+        baseline_img = generate_image(pipe, prompt, RANDOM_SEED, device)
+        baseline_t = pil_to_lpips_tensor(baseline_img, device)
+        baseline_data.append((prompt_idx, prompt, baseline_img, baseline_t))
+        log(f"  Baseline generated for {prompt_idx}")
 
     # -----------------------------
     # Inspect Linear layers in U-Net
@@ -285,7 +337,8 @@ def run(mode: str):
         print("sweep")
 
         # test every single linear and measure impact on LPIPS
-        fqn_to_lpips = []
+        # Store results: dict mapping fqn to list of lpips values (one per prompt)
+        fqn_to_lpips = {}  # {fqn: [lpips_0, lpips_1, ...]}
         for fqn, weight_shape in tqdm(
             unet_linear_fqns_and_weight_shapes, desc="Quantizing layers"
         ):
@@ -296,67 +349,123 @@ def run(mode: str):
             quantize_(unet_copy, fqn_to_config, filter_fn=None)
             pipe.unet = unet_copy
 
-            # print_pipeline_architecture(pipe)
-            modified_img = generate_image(pipe, PROMPT, RANDOM_SEED, device)
+            # Store LPIPS values for this FQN across all prompts
+            lpips_values = []
 
-            # -----------------------------
-            # 4. Compute LPIPS between the two
-            # -----------------------------
-            with torch.no_grad():
-                modified_t = pil_to_lpips_tensor(modified_img, device)
-                lpips_value = loss_fn(baseline_t, modified_t).item()
+            # Test on all prompts
+            for prompt_idx, prompt, baseline_img, baseline_t in baseline_data:
+                # print_pipeline_architecture(pipe)
+                modified_img = generate_image(pipe, prompt, RANDOM_SEED, device)
 
-            log(f"LPIPS distance: {lpips_value:.4f}")
+                # -----------------------------
+                # 4. Compute LPIPS between the two
+                # -----------------------------
+                with torch.no_grad():
+                    modified_t = pil_to_lpips_tensor(modified_img, device)
+                    lpips_value = loss_fn(baseline_t, modified_t).item()
 
-            # -----------------------------
-            # 5. Create and save comparison image
-            # -----------------------------
-            comparison_img = create_comparison_image(
-                baseline_img, modified_img, lpips_value
-            )
-            comparison_path = os.path.join(OUTPUT_DIR, f"comparison_{fqn}.png")
-            comparison_img.save(comparison_path)
-            log(f"Saved comparison image to: {comparison_path}")
+                log(f"LPIPS distance ({prompt_idx}): {lpips_value:.4f}")
 
-            fqn_to_lpips.append((fqn, lpips_value))
+                # -----------------------------
+                # 5. Create and save comparison image
+                # -----------------------------
+                comparison_img = create_comparison_image(
+                    baseline_img, modified_img, lpips_value
+                )
+                comparison_path = os.path.join(
+                    OUTPUT_DIR, f"comparison_{fqn}_{prompt_idx}.png"
+                )
+                comparison_img.save(comparison_path)
+                log(f"Saved comparison image to: {comparison_path}")
+
+                lpips_values.append(lpips_value)
+
+            # Store normalized: one entry per FQN with list of LPIPS values
+            fqn_to_lpips[fqn] = lpips_values
 
             # clean up
             pipe.unet = orig_unet
             del unet_copy
 
-        for fqn, lpips_value in fqn_to_lpips:
-            print(fqn, lpips_value)
+        # Print summary
+        for fqn, lpips_values in fqn_to_lpips.items():
+            avg_lpips = sum(lpips_values) / len(lpips_values)
+            print(f"{fqn}: {lpips_values} (avg={avg_lpips:.4f})")
 
-        # Save results to CSV
+        # Save results to CSV (normalized format: each prompt_idx as column)
         csv_path = os.path.join(OUTPUT_DIR, "fqn_to_lpips.csv")
         log(f"Saving results to {csv_path}")
+
+        # Create header with prompt_idx columns based on prompts actually used
+        num_prompts_used = len(prompts_to_use)
+        header = ["fqn"] + [f"prompt_{idx}" for idx in range(num_prompts_used)]
+
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["fqn", "lpips"])
-            for fqn, lpips_value in fqn_to_lpips:
-                writer.writerow([fqn, lpips_value])
+            writer.writerow(header)
+            for fqn, lpips_values in fqn_to_lpips.items():
+                row = [fqn] + lpips_values
+                writer.writerow(row)
         log(f"Results saved to {csv_path}")
 
     elif mode == "use_sweep_results":
-        lpips_upper_bound = 0.30
+        lpips_avg_upper_bound = 0.14
+        lpips_max_upper_bound = 0.30
 
         log("Using sweep results to selectively quantize layers")
+        log(
+            f"Thresholds: avg LPIPS < {lpips_avg_upper_bound}, max LPIPS < {lpips_max_upper_bound}"
+        )
 
-        # Load CSV file
+        # Load CSV file and group by FQN (aggregate across prompts)
         csv_path = os.path.join(OUTPUT_DIR, "fqn_to_lpips.csv")
         log(f"Loading results from {csv_path}")
 
-        fqns_to_quantize = []
+        # Compute average and max LPIPS per FQN across all prompts - read normalized format
+        fqn_to_lpips = {}  # {fqn: [lpips_0, lpips_1, ...]}
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 fqn = row["fqn"]
-                lpips_value = float(row["lpips"])
-                if lpips_value < lpips_upper_bound:
-                    fqns_to_quantize.append(fqn)
-                    log(f"  {fqn}: {lpips_value:.4f} (below threshold, will quantize)")
+                # Extract LPIPS values from prompt columns
+                lpips_values = []
+                idx = 0
+                while f"prompt_{idx}" in row:
+                    lpips_values.append(float(row[f"prompt_{idx}"]))
+                    idx += 1
+                fqn_to_lpips[fqn] = lpips_values
 
-        log(f"Found {len(fqns_to_quantize)} layers with LPIPS < {lpips_upper_bound}")
+        # Find FQNs where both average and max LPIPS are below their respective thresholds
+        fqns_to_quantize = []
+        fqns_rejected_by_avg = []
+        fqns_rejected_by_max = []
+
+        for fqn, lpips_values in fqn_to_lpips.items():
+            avg_lpips = sum(lpips_values) / len(lpips_values)
+            max_lpips = max(lpips_values)
+
+            if avg_lpips < lpips_avg_upper_bound and max_lpips < lpips_max_upper_bound:
+                fqns_to_quantize.append(fqn)
+                log(
+                    f"  ✓ {fqn}: avg={avg_lpips:.4f}, max={max_lpips:.4f} (will quantize)"
+                )
+            else:
+                if avg_lpips >= lpips_avg_upper_bound:
+                    fqns_rejected_by_avg.append(fqn)
+                    log(
+                        f"  ✗ {fqn}: avg={avg_lpips:.4f}, max={max_lpips:.4f} (rejected: avg too high)"
+                    )
+                else:
+                    fqns_rejected_by_max.append(fqn)
+                    log(
+                        f"  ✗ {fqn}: avg={avg_lpips:.4f}, max={max_lpips:.4f} (rejected: max too high)"
+                    )
+
+        log(f"Found {len(fqns_to_quantize)} layers passing both thresholds")
+        log(
+            f"Rejected {len(fqns_rejected_by_avg)} layers due to high avg, "
+            f"{len(fqns_rejected_by_max)} layers due to high max"
+        )
 
         # Create FqnToConfig mapping only for layers passing the threshold
         fqn_to_config_dict = {}
@@ -369,28 +478,47 @@ def run(mode: str):
         unet_copy = copy.deepcopy(orig_unet)
         quantize_(unet_copy, fqn_to_config, filter_fn=None)
         pipe.unet = unet_copy
-        # print_pipeline_architecture(pipe)
+        print_pipeline_architecture(pipe)
 
-        # Generate image with selectively quantized model
-        modified_img = generate_image(pipe, PROMPT, RANDOM_SEED, device)
+        # Generate images with selectively quantized model for all prompts
+        selective_lpips_values = []
+        selective_comparison_images = []
+        for prompt_idx, prompt, baseline_img, baseline_t in baseline_data:
+            log(f"Generating image for {prompt_idx}")
+            modified_img = generate_image(pipe, prompt, RANDOM_SEED, device)
 
-        # Compute LPIPS for selectively quantized model
-        modified_t = pil_to_lpips_tensor(modified_img, device)
+            # Compute LPIPS for selectively quantized model
+            modified_t = pil_to_lpips_tensor(modified_img, device)
 
-        with torch.no_grad():
-            lpips_value = loss_fn(baseline_t, modified_t).item()
+            with torch.no_grad():
+                lpips_value = loss_fn(baseline_t, modified_t).item()
 
-        log(f"LPIPS distance (selective quantization): {lpips_value:.4f}")
+            selective_lpips_values.append(lpips_value)
+            log(
+                f"LPIPS distance (selective quantization, {prompt_idx}): {lpips_value:.4f}"
+            )
 
-        # Create and save comparison image
-        comparison_img = create_comparison_image(
-            baseline_img, modified_img, lpips_value
-        )
-        comparison_path = os.path.join(
-            OUTPUT_DIR, f"comparison_selective_{lpips_upper_bound}.png"
-        )
-        comparison_img.save(comparison_path)
-        log(f"Saved comparison image to: {comparison_path}")
+            # Create and save comparison image
+            comparison_img = create_comparison_image(
+                baseline_img, modified_img, lpips_value
+            )
+            selective_comparison_images.append(comparison_img)
+            comparison_path = os.path.join(
+                OUTPUT_DIR,
+                f"comparison_selective_avg{lpips_avg_upper_bound}_max{lpips_max_upper_bound}_{prompt_idx}.png",
+            )
+            comparison_img.save(comparison_path)
+            log(f"Saved comparison image to: {comparison_path}")
+
+        # Create combined image with all comparisons stacked vertically
+        if selective_comparison_images:
+            combined_img = create_combined_comparison_image(selective_comparison_images)
+            combined_path = os.path.join(
+                OUTPUT_DIR,
+                f"comparison_selective_avg{lpips_avg_upper_bound}_max{lpips_max_upper_bound}_combined.png",
+            )
+            combined_img.save(combined_path)
+            log(f"Saved combined comparison image to: {combined_path}")
 
         # Print quantization statistics
         total_linear_layers = len(unet_linear_fqns_and_weight_shapes)
@@ -402,6 +530,15 @@ def run(mode: str):
         log(f"  Total Linear layers: {total_linear_layers}")
         log(f"  Quantized layers: {quantized_layers}")
         log(f"  Non-quantized layers: {non_quantized_layers}")
+        log("")
+        log("LPIPS Results:")
+        log(
+            f"  Average LPIPS: {sum(selective_lpips_values) / len(selective_lpips_values):.4f}"
+        )
+        log(f"  Max LPIPS: {max(selective_lpips_values):.4f}")
+        log(f"  Min LPIPS: {min(selective_lpips_values):.4f}")
+        log(f"  All values: {[f'{v:.4f}' for v in selective_lpips_values]}")
+        log("=" * 80)
 
     elif mode == "test":
         log("Test mode: Quantizing all Linear layers in U-Net")
@@ -422,33 +559,56 @@ def run(mode: str):
         log("Quantization complete")
         print_pipeline_architecture(pipe)
 
-        # Generate image with fully quantized model
-        log("Generating image with fully quantized model")
-        modified_img = generate_image(pipe, PROMPT, RANDOM_SEED, device)
+        # Generate images with fully quantized model for all prompts
+        log("Generating images with fully quantized model for all prompts")
+        test_lpips_values = []
+        test_comparison_images = []
+        for prompt_idx, prompt, baseline_img, baseline_t in baseline_data:
+            log(f"Generating image for {prompt_idx}")
+            modified_img = generate_image(pipe, prompt, RANDOM_SEED, device)
 
-        # Compute LPIPS for fully quantized model
-        log("Computing LPIPS for fully quantized model")
-        modified_t = pil_to_lpips_tensor(modified_img, device)
+            # Compute LPIPS for fully quantized model
+            log(f"Computing LPIPS for {prompt_idx}")
+            modified_t = pil_to_lpips_tensor(modified_img, device)
 
-        with torch.no_grad():
-            lpips_value = loss_fn(baseline_t, modified_t).item()
+            with torch.no_grad():
+                lpips_value = loss_fn(baseline_t, modified_t).item()
 
-        log(f"LPIPS distance (full quantization): {lpips_value:.4f}")
+            test_lpips_values.append(lpips_value)
+            log(f"LPIPS distance (full quantization, {prompt_idx}): {lpips_value:.4f}")
 
-        # Create and save comparison image
-        log("Creating comparison image")
-        comparison_img = create_comparison_image(
-            baseline_img, modified_img, lpips_value
-        )
-        comparison_path = os.path.join(OUTPUT_DIR, "comparison_test_full_quant.png")
-        comparison_img.save(comparison_path)
-        log(f"Saved comparison image to: {comparison_path}")
+            # Create and save comparison image
+            log("Creating comparison image")
+            comparison_img = create_comparison_image(
+                baseline_img, modified_img, lpips_value
+            )
+            test_comparison_images.append(comparison_img)
+            comparison_path = os.path.join(
+                OUTPUT_DIR, f"comparison_test_full_quant_{prompt_idx}.png"
+            )
+            comparison_img.save(comparison_path)
+            log(f"Saved comparison image to: {comparison_path}")
+
+        # Create combined image with all comparisons stacked vertically
+        if test_comparison_images:
+            combined_img = create_combined_comparison_image(test_comparison_images)
+            combined_path = os.path.join(
+                OUTPUT_DIR, "comparison_test_full_quant_combined.png"
+            )
+            combined_img.save(combined_path)
+            log(f"Saved combined comparison image to: {combined_path}")
 
         # Print summary
         log("=" * 80)
         log("Test Mode Summary:")
         log(f"  Total Linear layers quantized: {len(fqn_to_config_dict)}")
-        log(f"  LPIPS distance: {lpips_value:.4f}")
+        log(f"  Prompts tested: {len(baseline_data)}")
+        log("")
+        log("LPIPS Results:")
+        log(f"  Average LPIPS: {sum(test_lpips_values) / len(test_lpips_values):.4f}")
+        log(f"  Max LPIPS: {max(test_lpips_values):.4f}")
+        log(f"  Min LPIPS: {min(test_lpips_values):.4f}")
+        log(f"  All values: {[f'{v:.4f}' for v in test_lpips_values]}")
         log("=" * 80)
 
     else:
