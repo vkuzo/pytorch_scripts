@@ -1,7 +1,7 @@
 import fire
 import copy
 import torch
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionPipeline, FluxPipeline
 from PIL import Image, ImageDraw, ImageFont
 import lpips
 import os
@@ -12,14 +12,36 @@ import shutil
 
 from torchao.quantization import (
     quantize_,
+    Float8DynamicActivationFloat8WeightConfig,
     Float8WeightOnlyConfig,
     FqnToConfig,
+    PerRow,
+)
+
+# import torchao.prototype.mx_formats
+from torchao.prototype.mx_formats.inference_workflow import (
+    NVFP4DynamicActivationNVFP4WeightConfig,
 )
 
 # -----------------------------
 # Config
 # -----------------------------
-MODEL_ID = "OFA-Sys/small-stable-diffusion-v0"
+MODEL_CONFIGS = {
+    "stable-diffusion": {
+        "id": "OFA-Sys/small-stable-diffusion-v0",
+        "pipeline_class": StableDiffusionPipeline,
+        "main_component": "unet",
+        "components": ["vae", "unet", "text_encoder"],
+    },
+    "flux": {
+        "id": "black-forest-labs/FLUX.1-dev",
+        "pipeline_class": FluxPipeline,
+        "main_component": "transformer",
+        "components": ["vae", "transformer", "text_encoder", "text_encoder_2"],
+    },
+}
+
+MODEL_ID = "OFA-Sys/small-stable-diffusion-v0"  # Legacy - deprecated
 PROMPTS = [
     "a small cozy cabin in the snowy mountains at sunset, high detail",
     "a wizard doing magic",
@@ -45,69 +67,47 @@ def log(message: str):
     print(f"[{timestamp}] {message}")
 
 
-def print_pipeline_architecture(pipe: StableDiffusionPipeline):
+def print_pipeline_architecture(pipe, model_config: dict):
     """
-    Print the PyTorch model architecture for each component of a StableDiffusionPipeline.
+    Print the PyTorch model architecture for each component of a diffusion pipeline.
 
     Args:
-        pipe: The StableDiffusionPipeline to inspect
+        pipe: The diffusion pipeline to inspect
+        model_config: Model configuration dict specifying components
     """
     print("\n" + "=" * 80)
-    print("STABLE DIFFUSION PIPELINE COMPONENTS")
+    print("DIFFUSION PIPELINE COMPONENTS")
     print("=" * 80)
 
-    # The main neural network components in a StableDiffusionPipeline are:
-    # 1. vae (Variational Autoencoder) - encodes/decodes images
-    # 2. unet (U-Net) - the main denoising model
-    # 3. text_encoder - encodes text prompts
-    # 4. Other components: tokenizer, scheduler (not nn.Module)
+    # Iterate through components specified in the model config
+    total_params = 0
+    for idx, component_name in enumerate(model_config["components"], 1):
+        component = getattr(pipe, component_name)
+        print("\n" + "-" * 80)
+        print(f"{idx}. {component_name.upper().replace('_', ' ')}")
+        print("-" * 80)
+        print(component)
+        param_count = sum(p.numel() for p in component.parameters())
+        print(f"\n{component_name} Parameter Count: {param_count:,}")
+        total_params += param_count
 
     print("\n" + "-" * 80)
-    print("1. VAE (Variational Autoencoder)")
-    print("-" * 80)
-    print(pipe.vae)
-    print(f"\nVAE Parameter Count: {sum(p.numel() for p in pipe.vae.parameters()):,}")
-
-    print("\n" + "-" * 80)
-    print("2. U-Net (Main Denoising Model)")
-    print("-" * 80)
-    print(pipe.unet)
-    print(
-        f"\nU-Net Parameter Count: {sum(p.numel() for p in pipe.unet.parameters()):,}"
-    )
-
-    print("\n" + "-" * 80)
-    print("3. Text Encoder (CLIP)")
-    print("-" * 80)
-    print(pipe.text_encoder)
-    print(
-        f"\nText Encoder Parameter Count: {sum(p.numel() for p in pipe.text_encoder.parameters()):,}"
-    )
-
-    print("\n" + "-" * 80)
-    print("4. Other Components (Non-Neural)")
+    print("Other Components (Non-Neural)")
     print("-" * 80)
     print(f"Tokenizer: {type(pipe.tokenizer).__name__}")
     print(f"Scheduler: {type(pipe.scheduler).__name__}")
 
     print("\n" + "=" * 80)
-    total_params = (
-        sum(p.numel() for p in pipe.vae.parameters())
-        + sum(p.numel() for p in pipe.unet.parameters())
-        + sum(p.numel() for p in pipe.text_encoder.parameters())
-    )
     print(f"TOTAL PARAMETERS: {total_params:,}")
     print("=" * 80 + "\n")
 
 
-def generate_image(
-    pipe: StableDiffusionPipeline, prompt: str, seed: int, device: str
-) -> Image.Image:
+def generate_image(pipe, prompt: str, seed: int, device: str) -> Image.Image:
     """
     Generate a single image from a prompt and seed, and return it.
 
     Args:
-        pipe: The StableDiffusionPipeline to use for generation
+        pipe: The diffusion pipeline to use for generation
         prompt: Text prompt for image generation
         seed: Random seed for reproducibility
         device: Device string ('cuda' or 'cpu') for the generator
@@ -238,18 +238,30 @@ def pil_to_lpips_tensor(img: Image.Image, device: str):
     return t.to(device)
 
 
-def run(mode: str, num_prompts: int = None):
+def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
     """
     Main execution function: generates baseline and modified images,
     computes LPIPS, and creates a comparison visualization.
 
     Args:
         mode: One of 'sweep', 'use_sweep_results', or 'test'
+        model: Model to use ('stable-diffusion' or 'flux')
         num_prompts: Optional limit on number of prompts to use (for debugging)
     """
     assert mode in ("sweep", "use_sweep_results", "test"), f"unsupported {mode=}"
+    assert model in MODEL_CONFIGS, (
+        f"unsupported {model=}, choose from {list(MODEL_CONFIGS.keys())}"
+    )
+
+    # Get model configuration
+    model_config = MODEL_CONFIGS[model]
 
     log("Starting diffusion quantization experiment")
+    log(f"Model: {model} ({model_config['id']})")
+
+    # Create model-specific output directory
+    output_dir = os.path.join(OUTPUT_DIR, model)
+    os.makedirs(output_dir, exist_ok=True)
 
     # Set seeds for reproducibility
     import random
@@ -267,9 +279,10 @@ def run(mode: str, num_prompts: int = None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log(f"Using device: {device}")
 
-    log(f"Loading model from HuggingFace: {MODEL_ID}")
-    pipe = StableDiffusionPipeline.from_pretrained(
-        MODEL_ID,
+    log(f"Loading model from HuggingFace: {model_config['id']}")
+    pipeline_class = model_config["pipeline_class"]
+    pipe = pipeline_class.from_pretrained(
+        model_config["id"],
         # torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         # torch_dtype=torch.bfloat16,
         torch_dtype=torch.bfloat16,
@@ -280,7 +293,7 @@ def run(mode: str, num_prompts: int = None):
 
     # Print model architecture for inspection
     log("Printing pipeline architecture")
-    # print_pipeline_architecture(pipe)
+    # print_pipeline_architecture(pipe, model_config)
 
     # Optional: enable memory optimizations
     log("Enabling attention slicing for memory optimization")
@@ -304,34 +317,41 @@ def run(mode: str, num_prompts: int = None):
         log(f"  Baseline generated for {prompt_idx}")
 
     # -----------------------------
-    # Inspect Linear layers in U-Net
+    # Inspect Linear layers in main component (U-Net or Transformer)
     # -----------------------------
-    log("Inspecting Linear layers in U-Net")
-    unet_linear_fqns_and_weight_shapes = []
-    for fqn, module in pipe.unet.named_modules():
+    main_component_name = model_config["main_component"]
+    main_component = getattr(pipe, main_component_name)
+
+    log(f"Inspecting Linear layers in {main_component_name}")
+    component_linear_fqns_and_weight_shapes = []
+    for fqn, module in main_component.named_modules():
         if isinstance(module, torch.nn.Linear):
             weight_shape = module.weight.shape
             print(f"  {fqn}: {weight_shape}")
-            unet_linear_fqns_and_weight_shapes.append([fqn, weight_shape])
+            component_linear_fqns_and_weight_shapes.append([fqn, weight_shape])
 
     # -----------------------------
     # 3. "Quantized" image
     # -----------------------------
-    log("Applying Float8 quantization to U-Net")
+    log(f"Applying Float8 quantization to {main_component_name}")
 
     # Create a copy so that we can test multiple experiments vs baseline
-    orig_unet = pipe.unet
+    orig_main_component = main_component
 
-    # quant_config = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
-    # quant_config = Float8DynamicActivationFloat8WeightConfig()
-    quant_config = Float8WeightOnlyConfig()
+    if False:
+        quant_config = Float8WeightOnlyConfig()
+    if False:
+        quant_config = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
+    quant_config = NVFP4DynamicActivationNVFP4WeightConfig(
+        use_triton_kernel=True, use_dynamic_per_tensor_scale=True
+    )
 
     if mode == "sweep":
         # Clear output directory in sweep mode
-        log(f"Clearing output directory: {OUTPUT_DIR}")
-        if os.path.exists(OUTPUT_DIR):
-            shutil.rmtree(OUTPUT_DIR)
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        log(f"Clearing output directory: {output_dir}")
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         log("Output directory cleared")
 
         print("sweep")
@@ -340,14 +360,16 @@ def run(mode: str, num_prompts: int = None):
         # Store results: dict mapping fqn to list of lpips values (one per prompt)
         fqn_to_lpips = {}  # {fqn: [lpips_0, lpips_1, ...]}
         for fqn, weight_shape in tqdm(
-            unet_linear_fqns_and_weight_shapes, desc="Quantizing layers"
+            component_linear_fqns_and_weight_shapes, desc="Quantizing layers"
         ):
             log(f"{fqn=}")
             fqn_to_config = FqnToConfig(fqn_to_config={fqn: quant_config})
 
-            unet_copy = copy.deepcopy(orig_unet)
-            quantize_(unet_copy, fqn_to_config, filter_fn=None)
-            pipe.unet = unet_copy
+            component_copy = copy.deepcopy(orig_main_component)
+            quantize_(component_copy, fqn_to_config, filter_fn=None)
+            setattr(pipe, main_component_name, component_copy)
+            # print_pipeline_architecture(pipe, model_config)
+            # breakpoint()
 
             # Store LPIPS values for this FQN across all prompts
             lpips_values = []
@@ -373,7 +395,7 @@ def run(mode: str, num_prompts: int = None):
                     baseline_img, modified_img, lpips_value
                 )
                 comparison_path = os.path.join(
-                    OUTPUT_DIR, f"comparison_{fqn}_{prompt_idx}.png"
+                    output_dir, f"comparison_{fqn}_{prompt_idx}.png"
                 )
                 comparison_img.save(comparison_path)
                 log(f"Saved comparison image to: {comparison_path}")
@@ -384,8 +406,8 @@ def run(mode: str, num_prompts: int = None):
             fqn_to_lpips[fqn] = lpips_values
 
             # clean up
-            pipe.unet = orig_unet
-            del unet_copy
+            setattr(pipe, main_component_name, orig_main_component)
+            del component_copy
 
         # Print summary
         for fqn, lpips_values in fqn_to_lpips.items():
@@ -393,7 +415,7 @@ def run(mode: str, num_prompts: int = None):
             print(f"{fqn}: {lpips_values} (avg={avg_lpips:.4f})")
 
         # Save results to CSV (normalized format: each prompt_idx as column)
-        csv_path = os.path.join(OUTPUT_DIR, "fqn_to_lpips.csv")
+        csv_path = os.path.join(output_dir, "fqn_to_lpips.csv")
         log(f"Saving results to {csv_path}")
 
         # Create header with prompt_idx columns based on prompts actually used
@@ -418,7 +440,7 @@ def run(mode: str, num_prompts: int = None):
         )
 
         # Load CSV file and group by FQN (aggregate across prompts)
-        csv_path = os.path.join(OUTPUT_DIR, "fqn_to_lpips.csv")
+        csv_path = os.path.join(output_dir, "fqn_to_lpips.csv")
         log(f"Loading results from {csv_path}")
 
         # Compute average and max LPIPS per FQN across all prompts - read normalized format
@@ -474,11 +496,11 @@ def run(mode: str, num_prompts: int = None):
 
         fqn_to_config = FqnToConfig(fqn_to_config=fqn_to_config_dict)
 
-        # Quantize the U-Net using this selective config
-        unet_copy = copy.deepcopy(orig_unet)
-        quantize_(unet_copy, fqn_to_config, filter_fn=None)
-        pipe.unet = unet_copy
-        print_pipeline_architecture(pipe)
+        # Quantize the main component using this selective config
+        component_copy = copy.deepcopy(orig_main_component)
+        quantize_(component_copy, fqn_to_config, filter_fn=None)
+        setattr(pipe, main_component_name, component_copy)
+        print_pipeline_architecture(pipe, model_config)
 
         # Generate images with selectively quantized model for all prompts
         selective_lpips_values = []
@@ -504,7 +526,7 @@ def run(mode: str, num_prompts: int = None):
             )
             selective_comparison_images.append(comparison_img)
             comparison_path = os.path.join(
-                OUTPUT_DIR,
+                output_dir,
                 f"comparison_selective_avg{lpips_avg_upper_bound}_max{lpips_max_upper_bound}_{prompt_idx}.png",
             )
             comparison_img.save(comparison_path)
@@ -514,14 +536,14 @@ def run(mode: str, num_prompts: int = None):
         if selective_comparison_images:
             combined_img = create_combined_comparison_image(selective_comparison_images)
             combined_path = os.path.join(
-                OUTPUT_DIR,
+                output_dir,
                 f"comparison_selective_avg{lpips_avg_upper_bound}_max{lpips_max_upper_bound}_combined.png",
             )
             combined_img.save(combined_path)
             log(f"Saved combined comparison image to: {combined_path}")
 
         # Print quantization statistics
-        total_linear_layers = len(unet_linear_fqns_and_weight_shapes)
+        total_linear_layers = len(component_linear_fqns_and_weight_shapes)
         quantized_layers = len(fqns_to_quantize)
         non_quantized_layers = total_linear_layers - quantized_layers
 
@@ -541,23 +563,23 @@ def run(mode: str, num_prompts: int = None):
         log("=" * 80)
 
     elif mode == "test":
-        log("Test mode: Quantizing all Linear layers in U-Net")
+        log(f"Test mode: Quantizing all Linear layers in {main_component_name}")
 
         # Create FqnToConfig mapping for ALL Linear layers
         fqn_to_config_dict = {}
-        for fqn, weight_shape in unet_linear_fqns_and_weight_shapes:
+        for fqn, weight_shape in component_linear_fqns_and_weight_shapes:
             fqn_to_config_dict[fqn] = quant_config
 
         fqn_to_config = FqnToConfig(fqn_to_config=fqn_to_config_dict)
         log(f"Created FqnToConfig with all {len(fqn_to_config_dict)} Linear layers")
 
-        # Quantize the U-Net using this config
-        log("Applying quantization to all Linear layers in U-Net")
-        unet_copy = copy.deepcopy(orig_unet)
-        quantize_(unet_copy, fqn_to_config, filter_fn=None)
-        pipe.unet = unet_copy
+        # Quantize the main component using this config
+        log(f"Applying quantization to all Linear layers in {main_component_name}")
+        component_copy = copy.deepcopy(orig_main_component)
+        quantize_(component_copy, fqn_to_config, filter_fn=None)
+        setattr(pipe, main_component_name, component_copy)
         log("Quantization complete")
-        print_pipeline_architecture(pipe)
+        print_pipeline_architecture(pipe, model_config)
 
         # Generate images with fully quantized model for all prompts
         log("Generating images with fully quantized model for all prompts")
@@ -584,7 +606,7 @@ def run(mode: str, num_prompts: int = None):
             )
             test_comparison_images.append(comparison_img)
             comparison_path = os.path.join(
-                OUTPUT_DIR, f"comparison_test_full_quant_{prompt_idx}.png"
+                output_dir, f"comparison_test_full_quant_{prompt_idx}.png"
             )
             comparison_img.save(comparison_path)
             log(f"Saved comparison image to: {comparison_path}")
@@ -593,7 +615,7 @@ def run(mode: str, num_prompts: int = None):
         if test_comparison_images:
             combined_img = create_combined_comparison_image(test_comparison_images)
             combined_path = os.path.join(
-                OUTPUT_DIR, "comparison_test_full_quant_combined.png"
+                output_dir, "comparison_test_full_quant_combined.png"
             )
             combined_img.save(combined_path)
             log(f"Saved combined comparison image to: {combined_path}")
