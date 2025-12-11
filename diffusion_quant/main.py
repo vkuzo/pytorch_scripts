@@ -41,24 +41,22 @@ MODEL_CONFIGS = {
     },
 }
 
-MODEL_ID = "OFA-Sys/small-stable-diffusion-v0"  # Legacy - deprecated
-PROMPTS = [
-    "a small cozy cabin in the snowy mountains at sunset, high detail",
-    "a wizard doing magic",
-    "a enthusiast fisherman in the middle of a lake",
-    "an unhappy wolf",
-    "striker lining up for a penalty kick",
-    "a person enjoying their morning coffee",
-    "a robot playing basketball",
-    "beautiful flowers in a mountain meadow",
-    "a supermarket shelf full of sale items",
-    "a yellow taxi",
-]
 IMAGE_SIZE = (512, 512)  # (width, height)
 OUTPUT_DIR = "diffusion_quant/outputs"
 RANDOM_SEED = 42
+PROMPTS_FILES = {
+    "calibration": "diffusion_quant/prompts_calibrate.txt",
+    "test": "diffusion_quant/prompts_test.txt",
+}
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def load_prompts(prompts_file: str) -> list[str]:
+    """Load prompts from a text file, one prompt per line."""
+    with open(prompts_file, "r") as f:
+        prompts = [line.strip() for line in f if line.strip()]
+    return prompts
 
 
 def log(message: str):
@@ -131,11 +129,19 @@ def create_comparison_image(
     baseline_img: Image.Image,
     modified_img: Image.Image,
     lpips_score: float,
-    margin_top: int = 50,
+    prompt: str = None,
+    margin_top: int = 80,
 ) -> Image.Image:
     """
     Create a comparison image by stacking two images horizontally with a top margin
-    and overlaying the LPIPS score.
+    and overlaying the prompt text and LPIPS score.
+
+    Args:
+        baseline_img: The baseline image
+        modified_img: The modified/quantized image
+        lpips_score: The LPIPS score between the two images
+        prompt: Optional prompt text to display at the top
+        margin_top: Height of the top margin for text (default 80 to fit prompt + LPIPS)
     """
     # Get dimensions
     width1, height1 = baseline_img.size
@@ -152,32 +158,67 @@ def create_comparison_image(
     composite.paste(baseline_img, (0, margin_top))
     composite.paste(modified_img, (width1, margin_top))
 
-    # Add text overlay with LPIPS score
+    # Add text overlay with prompt and LPIPS score
     draw = ImageDraw.Draw(composite)
 
-    # Try to use a reasonable font size, fallback to default if truetype fails
+    # Try to use reasonable font sizes, fallback to default if truetype fails
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
+        prompt_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+        lpips_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
     except Exception:
         try:
-            font = ImageFont.truetype("arial.ttf", 32)
+            prompt_font = ImageFont.truetype("arial.ttf", 20)
+            lpips_font = ImageFont.truetype("arialbd.ttf", 24)
         except Exception:
-            font = ImageFont.load_default()
+            prompt_font = ImageFont.load_default()
+            lpips_font = ImageFont.load_default()
 
-    # Format the text
-    text = f"LPIPS: {lpips_score:.4f}"
+    # Draw prompt text at the top if provided
+    y_offset = 5
+    if prompt:
+        # Wrap prompt text if it's too long
+        max_width = total_width - 20  # 10px padding on each side
+        prompt_lines = []
+        words = prompt.split()
+        current_line = []
+
+        for word in words:
+            test_line = ' '.join(current_line + [word])
+            bbox = draw.textbbox((0, 0), test_line, font=prompt_font)
+            line_width = bbox[2] - bbox[0]
+
+            if line_width <= max_width:
+                current_line.append(word)
+            else:
+                if current_line:
+                    prompt_lines.append(' '.join(current_line))
+                current_line = [word]
+
+        if current_line:
+            prompt_lines.append(' '.join(current_line))
+
+        # Draw each line of the prompt
+        for line in prompt_lines:
+            bbox = draw.textbbox((0, 0), line, font=prompt_font)
+            text_width = bbox[2] - bbox[0]
+            text_x = (total_width - text_width) // 2
+            draw.text((text_x, y_offset), line, fill=(200, 200, 200), font=prompt_font)
+            y_offset += (bbox[3] - bbox[1]) + 2  # line height + small gap
+
+    # Format the LPIPS text
+    lpips_text = f"LPIPS: {lpips_score:.4f}"
 
     # Get text bounding box for centering
-    bbox = draw.textbbox((0, 0), text, font=font)
+    bbox = draw.textbbox((0, 0), lpips_text, font=lpips_font)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
 
-    # Center the text horizontally in the margin area
+    # Center the LPIPS text horizontally, place it below the prompt
     text_x = (total_width - text_width) // 2
-    text_y = (margin_top - text_height) // 2
+    text_y = y_offset + 5  # small gap after prompt
 
-    # Draw text in white
-    draw.text((text_x, text_y), text, fill=(255, 255, 255), font=font)
+    # Draw LPIPS text in white
+    draw.text((text_x, text_y), lpips_text, fill=(255, 255, 255), font=lpips_font)
 
     return composite
 
@@ -238,26 +279,42 @@ def pil_to_lpips_tensor(img: Image.Image, device: str):
     return t.to(device)
 
 
-def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
+def run(
+    mode: str,
+    model: str = "stable-diffusion",
+    num_prompts: int = None,
+    prompt_set: str = "calibration",
+):
     """
     Main execution function: generates baseline and modified images,
     computes LPIPS, and creates a comparison visualization.
 
     Args:
-        mode: One of 'sweep', 'use_sweep_results', or 'test'
+        mode: One of 'sweep', 'use_sweep_results', or 'full_quant'
         model: Model to use ('stable-diffusion' or 'flux')
         num_prompts: Optional limit on number of prompts to use (for debugging)
+        prompt_set: Which prompt set to use ('calibration' or 'test')
     """
-    assert mode in ("sweep", "use_sweep_results", "test"), f"unsupported {mode=}"
+    assert mode in ("sweep", "use_sweep_results", "full_quant"), f"unsupported {mode=}"
     assert model in MODEL_CONFIGS, (
         f"unsupported {model=}, choose from {list(MODEL_CONFIGS.keys())}"
     )
+    assert prompt_set in PROMPTS_FILES, (
+        f"unsupported {prompt_set=}, choose from {list(PROMPTS_FILES.keys())}"
+    )
+
+    # Enforce calibration prompts for sweep mode
+    if mode == "sweep" and prompt_set != "calibration":
+        raise ValueError(
+            f"sweep mode only supports calibration prompts, got {prompt_set=}"
+        )
 
     # Get model configuration
     model_config = MODEL_CONFIGS[model]
 
     log("Starting diffusion quantization experiment")
     log(f"Model: {model} ({model_config['id']})")
+    log(f"Prompt set: {prompt_set}")
 
     # Create model-specific output directory
     output_dir = os.path.join(OUTPUT_DIR, model)
@@ -304,8 +361,13 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
     # -----------------------------
     # 2. Baseline images (for all prompts)
     # -----------------------------
+    # Load prompts from file
+    prompts_file = PROMPTS_FILES[prompt_set]
+    all_prompts = load_prompts(prompts_file)
+    log(f"Loaded {len(all_prompts)} prompts from {prompts_file}")
+
     # Limit prompts for debugging if requested
-    prompts_to_use = PROMPTS if num_prompts is None else PROMPTS[:num_prompts]
+    prompts_to_use = all_prompts if num_prompts is None else all_prompts[:num_prompts]
     log(f"Generating baseline images for {len(prompts_to_use)} prompts")
     baseline_data = []  # List of (prompt_idx, prompt, baseline_img, baseline_t)
     for idx, prompt in enumerate(prompts_to_use):
@@ -392,10 +454,10 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
                 # 5. Create and save comparison image
                 # -----------------------------
                 comparison_img = create_comparison_image(
-                    baseline_img, modified_img, lpips_value
+                    baseline_img, modified_img, lpips_value, prompt=prompt
                 )
                 comparison_path = os.path.join(
-                    output_dir, f"comparison_{fqn}_{prompt_idx}.png"
+                    output_dir, f"comparison_{prompt_set}_{fqn}_{prompt_idx}.png"
                 )
                 comparison_img.save(comparison_path)
                 log(f"Saved comparison image to: {comparison_path}")
@@ -415,7 +477,7 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
             print(f"{fqn}: {lpips_values} (avg={avg_lpips:.4f})")
 
         # Save results to CSV (normalized format: each prompt_idx as column)
-        csv_path = os.path.join(output_dir, "fqn_to_lpips.csv")
+        csv_path = os.path.join(output_dir, f"fqn_to_lpips_{prompt_set}.csv")
         log(f"Saving results to {csv_path}")
 
         # Create header with prompt_idx columns based on prompts actually used
@@ -431,8 +493,8 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
         log(f"Results saved to {csv_path}")
 
     elif mode == "use_sweep_results":
-        lpips_avg_upper_bound = 0.14
-        lpips_max_upper_bound = 0.30
+        lpips_avg_upper_bound = 0.035
+        lpips_max_upper_bound = 0.09
 
         log("Using sweep results to selectively quantize layers")
         log(
@@ -440,7 +502,9 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
         )
 
         # Load CSV file and group by FQN (aggregate across prompts)
-        csv_path = os.path.join(output_dir, "fqn_to_lpips.csv")
+        # note: the sweep results are always from calibration data, even if we are testing on the
+        # `test` prompt set
+        csv_path = os.path.join(output_dir, f"fqn_to_lpips_calibration.csv")
         log(f"Loading results from {csv_path}")
 
         # Compute average and max LPIPS per FQN across all prompts - read normalized format
@@ -522,12 +586,12 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
 
             # Create and save comparison image
             comparison_img = create_comparison_image(
-                baseline_img, modified_img, lpips_value
+                baseline_img, modified_img, lpips_value, prompt=prompt
             )
             selective_comparison_images.append(comparison_img)
             comparison_path = os.path.join(
                 output_dir,
-                f"comparison_selective_avg{lpips_avg_upper_bound}_max{lpips_max_upper_bound}_{prompt_idx}.png",
+                f"comparison_prompt_{prompt_set}_mode_use_sweep_results_avg_{lpips_avg_upper_bound}_max_{lpips_max_upper_bound}_{prompt_idx}.png",
             )
             comparison_img.save(comparison_path)
             log(f"Saved comparison image to: {comparison_path}")
@@ -537,7 +601,7 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
             combined_img = create_combined_comparison_image(selective_comparison_images)
             combined_path = os.path.join(
                 output_dir,
-                f"comparison_selective_avg{lpips_avg_upper_bound}_max{lpips_max_upper_bound}_combined.png",
+                f"comparison_prompt_{prompt_set}_mode_use_sweep_results_avg_{lpips_avg_upper_bound}_max_{lpips_max_upper_bound}_combined.png",
             )
             combined_img.save(combined_path)
             log(f"Saved combined comparison image to: {combined_path}")
@@ -554,16 +618,40 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
         log(f"  Non-quantized layers: {non_quantized_layers}")
         log("")
         log("LPIPS Results:")
-        log(
-            f"  Average LPIPS: {sum(selective_lpips_values) / len(selective_lpips_values):.4f}"
-        )
-        log(f"  Max LPIPS: {max(selective_lpips_values):.4f}")
-        log(f"  Min LPIPS: {min(selective_lpips_values):.4f}")
+        avg_lpips = sum(selective_lpips_values) / len(selective_lpips_values)
+        max_lpips = max(selective_lpips_values)
+        min_lpips = min(selective_lpips_values)
+        log(f"  Average LPIPS: {avg_lpips:.4f}")
+        log(f"  Max LPIPS: {max_lpips:.4f}")
+        log(f"  Min LPIPS: {min_lpips:.4f}")
         log(f"  All values: {[f'{v:.4f}' for v in selective_lpips_values]}")
         log("=" * 80)
 
-    elif mode == "test":
-        log(f"Test mode: Quantizing all Linear layers in {main_component_name}")
+        # Save summary stats to CSV
+        summary_csv_path = os.path.join(
+            output_dir, f"summary_stats_prompt_{prompt_set}_mode_use_sweep_results.csv"
+        )
+        log(f"Saving summary stats to {summary_csv_path}")
+        with open(summary_csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["metric", "value"])
+            writer.writerow(["mode", "use_sweep_results"])
+            writer.writerow(["lpips_avg_upper_bound", f"{lpips_avg_upper_bound:.4f}"])
+            writer.writerow(["lpips_max_upper_bound", f"{lpips_max_upper_bound:.4f}"])
+            writer.writerow(["total_linear_layers", total_linear_layers])
+            writer.writerow(["quantized_layers", quantized_layers])
+            writer.writerow(["non_quantized_layers", non_quantized_layers])
+            writer.writerow(["prompts_tested", len(baseline_data)])
+            writer.writerow(["average_lpips", f"{avg_lpips:.4f}"])
+            writer.writerow(["max_lpips", f"{max_lpips:.4f}"])
+            writer.writerow(["min_lpips", f"{min_lpips:.4f}"])
+            # Write individual LPIPS values
+            for idx, val in enumerate(selective_lpips_values):
+                writer.writerow([f"lpips_prompt_{idx}", f"{val:.4f}"])
+        log(f"Summary stats saved to {summary_csv_path}")
+
+    elif mode == "full_quant":
+        log(f"full_quant mode: Quantizing all Linear layers in {main_component_name}")
 
         # Create FqnToConfig mapping for ALL Linear layers
         fqn_to_config_dict = {}
@@ -602,11 +690,12 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
             # Create and save comparison image
             log("Creating comparison image")
             comparison_img = create_comparison_image(
-                baseline_img, modified_img, lpips_value
+                baseline_img, modified_img, lpips_value, prompt=prompt
             )
             test_comparison_images.append(comparison_img)
             comparison_path = os.path.join(
-                output_dir, f"comparison_test_full_quant_{prompt_idx}.png"
+                output_dir,
+                f"comparison_prompt_{prompt_set}_mode_full_quant_{prompt_idx}.png",
             )
             comparison_img.save(comparison_path)
             log(f"Saved comparison image to: {comparison_path}")
@@ -615,7 +704,8 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
         if test_comparison_images:
             combined_img = create_combined_comparison_image(test_comparison_images)
             combined_path = os.path.join(
-                output_dir, "comparison_test_full_quant_combined.png"
+                output_dir,
+                f"comparison_prompt_{prompt_set}_mode_full_quant_combined.png",
             )
             combined_img.save(combined_path)
             log(f"Saved combined comparison image to: {combined_path}")
@@ -627,11 +717,33 @@ def run(mode: str, model: str = "stable-diffusion", num_prompts: int = None):
         log(f"  Prompts tested: {len(baseline_data)}")
         log("")
         log("LPIPS Results:")
-        log(f"  Average LPIPS: {sum(test_lpips_values) / len(test_lpips_values):.4f}")
-        log(f"  Max LPIPS: {max(test_lpips_values):.4f}")
-        log(f"  Min LPIPS: {min(test_lpips_values):.4f}")
+        avg_lpips = sum(test_lpips_values) / len(test_lpips_values)
+        max_lpips = max(test_lpips_values)
+        min_lpips = min(test_lpips_values)
+        log(f"  Average LPIPS: {avg_lpips:.4f}")
+        log(f"  Max LPIPS: {max_lpips:.4f}")
+        log(f"  Min LPIPS: {min_lpips:.4f}")
         log(f"  All values: {[f'{v:.4f}' for v in test_lpips_values]}")
         log("=" * 80)
+
+        # Save summary stats to CSV
+        summary_csv_path = os.path.join(
+            output_dir, f"summary_stats_prompt_{prompt_set}_mode_full_quant.csv"
+        )
+        log(f"Saving summary stats to {summary_csv_path}")
+        with open(summary_csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["metric", "value"])
+            writer.writerow(["mode", "full_quant"])
+            writer.writerow(["total_linear_layers_quantized", len(fqn_to_config_dict)])
+            writer.writerow(["prompts_tested", len(baseline_data)])
+            writer.writerow(["average_lpips", f"{avg_lpips:.4f}"])
+            writer.writerow(["max_lpips", f"{max_lpips:.4f}"])
+            writer.writerow(["min_lpips", f"{min_lpips:.4f}"])
+            # Write individual LPIPS values
+            for idx, val in enumerate(test_lpips_values):
+                writer.writerow([f"lpips_prompt_{idx}", f"{val:.4f}"])
+        log(f"Summary stats saved to {summary_csv_path}")
 
     else:
         raise AssertionError()
