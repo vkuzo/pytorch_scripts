@@ -2,7 +2,7 @@ import fire
 import copy
 import time
 import torch
-from diffusers import StableDiffusionPipeline, FluxPipeline
+from diffusers import StableDiffusionPipeline, FluxPipeline, Flux2Pipeline
 from PIL import Image, ImageDraw, ImageFont
 import lpips
 import os
@@ -39,6 +39,12 @@ MODEL_CONFIGS = {
         "pipeline_class": FluxPipeline,
         "main_component": "transformer",
         "components": ["vae", "transformer", "text_encoder", "text_encoder_2"],
+    },
+    "flux-2.dev": {
+        "id": "black-forest-labs/FLUX.2-dev",
+        "pipeline_class": Flux2Pipeline,
+        "main_component": "transformer",
+        "components": ["vae", "transformer", "text_encoder"],
     },
 }
 
@@ -113,7 +119,7 @@ def generate_image(pipe, prompt: str, seed: int, device: str) -> Image.Image:
     """
     generator = torch.Generator(device=device).manual_seed(seed)
     image = pipe(
-        prompt,
+        prompt=prompt,
         num_inference_steps=25,  # can tweak for speed vs quality
         guidance_scale=7.5,
         generator=generator,
@@ -299,7 +305,7 @@ def run(
 
     Args:
         mode: One of 'sweep', 'use_sweep_results', or 'full_quant'
-        model: Model to use ('stable-diffusion' or 'flux')
+        model: Model to use ('stable-diffusion' or 'flux' or 'flux-2.dev')
         num_prompts: Optional limit on number of prompts to use (for debugging)
         prompt_set: Which prompt set to use ('calibration' or 'test')
         quant_config: Quantization config to use ('nvfp4', 'f8d', 'f8wo'). Default: 'f8d'
@@ -375,13 +381,19 @@ def run(
 
     loss_fn = lpips.LPIPS(net="vgg").to(device)
 
-    # create a copy so that if we compile it it does not affect
-    # the original for quantization
-    pipe_copy = copy.deepcopy(pipe)
+    # For large models like flux-2.dev, avoid deep copying the entire pipeline
+    # to prevent OOM errors. Instead, use the original pipe for baseline generation.
+    # We'll compile the main component in-place if requested.
     main_component_name = model_config["main_component"]
-    main_component = getattr(pipe_copy, main_component_name)
+    main_component = getattr(pipe, main_component_name)
+
+    # Store original for restoration later
+    orig_main_component = main_component
+
     if use_compile:
-        setattr(pipe_copy, main_component_name, torch.compile(main_component))
+        log("Compiling main component for baseline generation")
+        compiled_component = torch.compile(main_component)
+        setattr(pipe, main_component_name, compiled_component)
 
     # -----------------------------
     # 2. Baseline images (for all prompts)
@@ -400,17 +412,22 @@ def run(
         prompt_idx = f"prompt_{idx}"
         log(f"Generating baseline for {prompt_idx}: {prompt}")
         t0 = time.time()
-        baseline_img = generate_image(pipe_copy, prompt, RANDOM_SEED, device)
+        baseline_img = generate_image(pipe, prompt, RANDOM_SEED, device)
         t1 = time.time()
         baseline_t = pil_to_lpips_tensor(baseline_img, device)
         baseline_data.append((prompt_idx, prompt, baseline_img, baseline_t))
         baseline_times.append(t1 - t0)
         log(f"  Baseline generated for {prompt_idx}")
 
+    # Restore original main component before quantization if it was compiled
+    if use_compile:
+        log("Restoring original (uncompiled) main component before quantization")
+        setattr(pipe, main_component_name, orig_main_component)
+
     # -----------------------------
     # Inspect Linear layers in main component (U-Net or Transformer)
     # -----------------------------
-    main_component_name = model_config["main_component"]
+    # Get fresh reference to main component (in case it was compiled/restored)
     main_component = getattr(pipe, main_component_name)
 
     log(f"Inspecting Linear layers in {main_component_name}")
@@ -700,6 +717,14 @@ def run(
         # Create FqnToConfig mapping for ALL Linear layers
         fqn_to_config_dict = {}
         for fqn, weight_shape in component_linear_fqns_and_weight_shapes:
+            if model == 'flux-2.dev':
+                # hardcode don't quantize layers we def don't want to quantize
+                if 'embed' in fqn:
+                    continue
+                elif 'modulation' in fqn:
+                    continue
+                elif weight_shape[0] < 1000 or weight_shape[1] < 1000:
+                    continue
             fqn_to_config_dict[fqn] = config_obj
 
         fqn_to_config = FqnToConfig(fqn_to_config=fqn_to_config_dict)
