@@ -1,5 +1,6 @@
 import fire
 import copy
+import time
 import torch
 from diffusers import StableDiffusionPipeline, FluxPipeline
 from PIL import Image, ImageDraw, ImageFont
@@ -289,6 +290,8 @@ def run(
     num_prompts: int = None,
     prompt_set: str = "calibration",
     quant_config: str = "f8d",
+    use_compile: bool = False,
+    benchmark_performance: bool = False,
 ):
     """
     Main execution function: generates baseline and modified images,
@@ -300,6 +303,8 @@ def run(
         num_prompts: Optional limit on number of prompts to use (for debugging)
         prompt_set: Which prompt set to use ('calibration' or 'test')
         quant_config: Quantization config to use ('nvfp4', 'f8d', 'f8wo'). Default: 'f8d'
+        use_compile: if true, uses torch.compile
+        benchmark_performance: if true, benchmarks performance
     """
     assert mode in ("sweep", "use_sweep_results", "full_quant"), f"unsupported {mode=}"
     assert model in MODEL_CONFIGS, (
@@ -311,6 +316,9 @@ def run(
     assert quant_config in ("nvfp4", "f8d", "f8wo"), (
         f"unsupported {quant_config=}, choose from ['nvfp4', 'f8d', 'f8wo']"
     )
+    if mode == "sweep":
+        assert not use_compile
+        assert not benchmark_performance
 
     # Enforce calibration prompts for sweep mode
     if mode == "sweep" and prompt_set != "calibration":
@@ -355,10 +363,10 @@ def run(
     )
     log("Moving model to device")
     pipe = pipe.to(device)
+
     # return
 
     # Print model architecture for inspection
-    log("Printing pipeline architecture")
     # print_pipeline_architecture(pipe, model_config)
 
     # Optional: enable memory optimizations
@@ -366,6 +374,14 @@ def run(
     pipe.enable_attention_slicing()
 
     loss_fn = lpips.LPIPS(net="vgg").to(device)
+
+    # create a copy so that if we compile it it does not affect
+    # the original for quantization
+    pipe_copy = copy.deepcopy(pipe)
+    main_component_name = model_config["main_component"]
+    main_component = getattr(pipe_copy, main_component_name)
+    if use_compile:
+        setattr(pipe_copy, main_component_name, torch.compile(main_component))
 
     # -----------------------------
     # 2. Baseline images (for all prompts)
@@ -379,12 +395,16 @@ def run(
     prompts_to_use = all_prompts if num_prompts is None else all_prompts[:num_prompts]
     log(f"Generating baseline images for {len(prompts_to_use)} prompts")
     baseline_data = []  # List of (prompt_idx, prompt, baseline_img, baseline_t)
+    baseline_times = []
     for idx, prompt in enumerate(prompts_to_use):
         prompt_idx = f"prompt_{idx}"
         log(f"Generating baseline for {prompt_idx}: {prompt}")
-        baseline_img = generate_image(pipe, prompt, RANDOM_SEED, device)
+        t0 = time.time()
+        baseline_img = generate_image(pipe_copy, prompt, RANDOM_SEED, device)
+        t1 = time.time()
         baseline_t = pil_to_lpips_tensor(baseline_img, device)
         baseline_data.append((prompt_idx, prompt, baseline_img, baseline_t))
+        baseline_times.append(t1 - t0)
         log(f"  Baseline generated for {prompt_idx}")
 
     # -----------------------------
@@ -578,14 +598,20 @@ def run(
         component_copy = copy.deepcopy(orig_main_component)
         quantize_(component_copy, fqn_to_config, filter_fn=None)
         setattr(pipe, main_component_name, component_copy)
+        if use_compile:
+            setattr(pipe, main_component_name, torch.compile(component_copy))
         print_pipeline_architecture(pipe, model_config)
 
         # Generate images with selectively quantized model for all prompts
         selective_lpips_values = []
         selective_comparison_images = []
+        times = []
         for prompt_idx, prompt, baseline_img, baseline_t in baseline_data:
             log(f"Generating image for {prompt_idx}")
+            t0 = time.time()
             modified_img = generate_image(pipe, prompt, RANDOM_SEED, device)
+            t1 = time.time()
+            times.append(t1 - t0)
 
             # Compute LPIPS for selectively quantized model
             modified_t = pil_to_lpips_tensor(modified_img, device)
@@ -640,6 +666,9 @@ def run(
         log(f"  Min LPIPS: {min_lpips:.4f}")
         log(f"  All values: {[f'{v:.4f}' for v in selective_lpips_values]}")
         log("=" * 80)
+        print('baseline_times', baseline_times)
+        print('times', times)
+        print('speedups', [x / y for (x, y) in zip(baseline_times, times)])
 
         # Save summary stats to CSV
         summary_csv_path = os.path.join(
@@ -682,15 +711,21 @@ def run(
         quantize_(component_copy, fqn_to_config, filter_fn=None)
         setattr(pipe, main_component_name, component_copy)
         log("Quantization complete")
+        if use_compile:
+            setattr(pipe, main_component_name, torch.compile(component_copy))
         print_pipeline_architecture(pipe, model_config)
 
         # Generate images with fully quantized model for all prompts
         log("Generating images with fully quantized model for all prompts")
         test_lpips_values = []
         test_comparison_images = []
+        times = []
         for prompt_idx, prompt, baseline_img, baseline_t in baseline_data:
             log(f"Generating image for {prompt_idx}")
+            t0 = time.time()
             modified_img = generate_image(pipe, prompt, RANDOM_SEED, device)
+            t1 = time.time()
+            times.append(t1 - t0)
 
             # Compute LPIPS for fully quantized model
             log(f"Computing LPIPS for {prompt_idx}")
@@ -740,6 +775,9 @@ def run(
         log(f"  Min LPIPS: {min_lpips:.4f}")
         log(f"  All values: {[f'{v:.4f}' for v in test_lpips_values]}")
         log("=" * 80)
+        print('baseline_times', baseline_times)
+        print('times', times)
+        print('speedups', [x / y for (x, y) in zip(baseline_times, times)])
 
         # Save summary stats to CSV
         summary_csv_path = os.path.join(
