@@ -163,8 +163,12 @@ def create_comparison_image(
 
     # Try to use reasonable font sizes, fallback to default if truetype fails
     try:
-        prompt_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
-        lpips_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+        prompt_font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20
+        )
+        lpips_font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24
+        )
     except Exception:
         try:
             prompt_font = ImageFont.truetype("arial.ttf", 20)
@@ -183,7 +187,7 @@ def create_comparison_image(
         current_line = []
 
         for word in words:
-            test_line = ' '.join(current_line + [word])
+            test_line = " ".join(current_line + [word])
             bbox = draw.textbbox((0, 0), test_line, font=prompt_font)
             line_width = bbox[2] - bbox[0]
 
@@ -191,11 +195,11 @@ def create_comparison_image(
                 current_line.append(word)
             else:
                 if current_line:
-                    prompt_lines.append(' '.join(current_line))
+                    prompt_lines.append(" ".join(current_line))
                 current_line = [word]
 
         if current_line:
-            prompt_lines.append(' '.join(current_line))
+            prompt_lines.append(" ".join(current_line))
 
         # Draw each line of the prompt
         for line in prompt_lines:
@@ -284,6 +288,7 @@ def run(
     model: str = "stable-diffusion",
     num_prompts: int = None,
     prompt_set: str = "calibration",
+    quant_config: str = "f8d",
 ):
     """
     Main execution function: generates baseline and modified images,
@@ -294,6 +299,7 @@ def run(
         model: Model to use ('stable-diffusion' or 'flux')
         num_prompts: Optional limit on number of prompts to use (for debugging)
         prompt_set: Which prompt set to use ('calibration' or 'test')
+        quant_config: Quantization config to use ('nvfp4', 'f8d', 'f8wo'). Default: 'f8d'
     """
     assert mode in ("sweep", "use_sweep_results", "full_quant"), f"unsupported {mode=}"
     assert model in MODEL_CONFIGS, (
@@ -301,6 +307,9 @@ def run(
     )
     assert prompt_set in PROMPTS_FILES, (
         f"unsupported {prompt_set=}, choose from {list(PROMPTS_FILES.keys())}"
+    )
+    assert quant_config in ("nvfp4", "f8d", "f8wo"), (
+        f"unsupported {quant_config=}, choose from ['nvfp4', 'f8d', 'f8wo']"
     )
 
     # Enforce calibration prompts for sweep mode
@@ -395,18 +404,23 @@ def run(
     # -----------------------------
     # 3. "Quantized" image
     # -----------------------------
-    log(f"Applying Float8 quantization to {main_component_name}")
+    log(f"Applying quantization to {main_component_name}")
+    log(f"Using quantization config: {quant_config}")
+
+    # Map quant_config string to actual config class
+    if quant_config == "nvfp4":
+        config_obj = NVFP4DynamicActivationNVFP4WeightConfig(
+            use_triton_kernel=True, use_dynamic_per_tensor_scale=True
+        )
+    elif quant_config == "f8d":
+        config_obj = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
+    elif quant_config == "f8wo":
+        config_obj = Float8WeightOnlyConfig()
+    else:
+        raise AssertionError(f"Unsupported quant_config: {quant_config}")
 
     # Create a copy so that we can test multiple experiments vs baseline
     orig_main_component = main_component
-
-    if False:
-        quant_config = Float8WeightOnlyConfig()
-    if False:
-        quant_config = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
-    quant_config = NVFP4DynamicActivationNVFP4WeightConfig(
-        use_triton_kernel=True, use_dynamic_per_tensor_scale=True
-    )
 
     if mode == "sweep":
         # Clear output directory in sweep mode
@@ -425,7 +439,7 @@ def run(
             component_linear_fqns_and_weight_shapes, desc="Quantizing layers"
         ):
             log(f"{fqn=}")
-            fqn_to_config = FqnToConfig(fqn_to_config={fqn: quant_config})
+            fqn_to_config = FqnToConfig(fqn_to_config={fqn: config_obj})
 
             component_copy = copy.deepcopy(orig_main_component)
             quantize_(component_copy, fqn_to_config, filter_fn=None)
@@ -493,8 +507,8 @@ def run(
         log(f"Results saved to {csv_path}")
 
     elif mode == "use_sweep_results":
-        lpips_avg_upper_bound = 0.035
-        lpips_max_upper_bound = 0.09
+        lpips_avg_upper_bound = 0.0175
+        lpips_max_upper_bound = 0.06
 
         log("Using sweep results to selectively quantize layers")
         log(
@@ -504,7 +518,7 @@ def run(
         # Load CSV file and group by FQN (aggregate across prompts)
         # note: the sweep results are always from calibration data, even if we are testing on the
         # `test` prompt set
-        csv_path = os.path.join(output_dir, f"fqn_to_lpips_calibration.csv")
+        csv_path = os.path.join(output_dir, "fqn_to_lpips_calibration.csv")
         log(f"Loading results from {csv_path}")
 
         # Compute average and max LPIPS per FQN across all prompts - read normalized format
@@ -556,7 +570,7 @@ def run(
         # Create FqnToConfig mapping only for layers passing the threshold
         fqn_to_config_dict = {}
         for fqn in fqns_to_quantize:
-            fqn_to_config_dict[fqn] = quant_config
+            fqn_to_config_dict[fqn] = config_obj
 
         fqn_to_config = FqnToConfig(fqn_to_config=fqn_to_config_dict)
 
@@ -591,7 +605,7 @@ def run(
             selective_comparison_images.append(comparison_img)
             comparison_path = os.path.join(
                 output_dir,
-                f"comparison_prompt_{prompt_set}_mode_use_sweep_results_avg_{lpips_avg_upper_bound}_max_{lpips_max_upper_bound}_{prompt_idx}.png",
+                f"comparison_prompt_{prompt_set}_mode_use_sweep_results_avg_{lpips_avg_upper_bound}_max_{lpips_max_upper_bound}_quant_config_{quant_config}_{prompt_idx}.png",
             )
             comparison_img.save(comparison_path)
             log(f"Saved comparison image to: {comparison_path}")
@@ -601,7 +615,7 @@ def run(
             combined_img = create_combined_comparison_image(selective_comparison_images)
             combined_path = os.path.join(
                 output_dir,
-                f"comparison_prompt_{prompt_set}_mode_use_sweep_results_avg_{lpips_avg_upper_bound}_max_{lpips_max_upper_bound}_combined.png",
+                f"comparison_prompt_{prompt_set}_mode_use_sweep_results_avg_{lpips_avg_upper_bound}_max_{lpips_max_upper_bound}_quant_config_{quant_config}_combined.png",
             )
             combined_img.save(combined_path)
             log(f"Saved combined comparison image to: {combined_path}")
@@ -629,7 +643,8 @@ def run(
 
         # Save summary stats to CSV
         summary_csv_path = os.path.join(
-            output_dir, f"summary_stats_prompt_{prompt_set}_mode_use_sweep_results.csv"
+            output_dir,
+            f"summary_stats_prompt_{prompt_set}_mode_use_sweep_results_quant_config_{quant_config}.csv",
         )
         log(f"Saving summary stats to {summary_csv_path}")
         with open(summary_csv_path, "w", newline="") as f:
@@ -656,7 +671,7 @@ def run(
         # Create FqnToConfig mapping for ALL Linear layers
         fqn_to_config_dict = {}
         for fqn, weight_shape in component_linear_fqns_and_weight_shapes:
-            fqn_to_config_dict[fqn] = quant_config
+            fqn_to_config_dict[fqn] = config_obj
 
         fqn_to_config = FqnToConfig(fqn_to_config=fqn_to_config_dict)
         log(f"Created FqnToConfig with all {len(fqn_to_config_dict)} Linear layers")
@@ -695,7 +710,7 @@ def run(
             test_comparison_images.append(comparison_img)
             comparison_path = os.path.join(
                 output_dir,
-                f"comparison_prompt_{prompt_set}_mode_full_quant_{prompt_idx}.png",
+                f"comparison_prompt_{prompt_set}_mode_full_quant_config_{quant_config}_{prompt_idx}.png",
             )
             comparison_img.save(comparison_path)
             log(f"Saved comparison image to: {comparison_path}")
@@ -705,7 +720,7 @@ def run(
             combined_img = create_combined_comparison_image(test_comparison_images)
             combined_path = os.path.join(
                 output_dir,
-                f"comparison_prompt_{prompt_set}_mode_full_quant_combined.png",
+                f"comparison_prompt_{prompt_set}_mode_full_quant_config_{quant_config}_combined.png",
             )
             combined_img.save(combined_path)
             log(f"Saved combined comparison image to: {combined_path}")
@@ -728,7 +743,8 @@ def run(
 
         # Save summary stats to CSV
         summary_csv_path = os.path.join(
-            output_dir, f"summary_stats_prompt_{prompt_set}_mode_full_quant.csv"
+            output_dir,
+            f"summary_stats_prompt_{prompt_set}_mode_full_quant_config_{quant_config}.csv",
         )
         log(f"Saving summary stats to {summary_csv_path}")
         with open(summary_csv_path, "w", newline="") as f:

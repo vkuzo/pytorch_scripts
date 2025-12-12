@@ -4,7 +4,8 @@
       "Bash(ruff check:*)",
       "Bash(git push:*)",
       "Bash(gh pr create:*)",
-      "Bash(with-proxy python:*)"
+      "Bash(with-proxy python:*)",
+      "Bash(python diffusion_quant/main.py:*)"
     ],
     "deny": [],
     "ask": []
