@@ -10,6 +10,7 @@ from datetime import datetime
 from tqdm import tqdm
 import csv
 import shutil
+import gc
 
 from torchao.quantization import (
     quantize_,
@@ -476,6 +477,19 @@ def run(
             component_linear_fqns_and_weight_shapes, desc="Quantizing layers"
         ):
             log(f"{fqn=}")
+
+            if model == 'flux-2.dev':
+                # hardcode don't quantize layers we def don't want to quantize
+                if 'embed' in fqn:
+                    print('skipping for embed')
+                    continue
+                elif 'modulation' in fqn:
+                    print('skipping for modulation')
+                    continue
+                elif weight_shape[0] < 1000 or weight_shape[1] < 1000:
+                    print('skipping for weight shape')
+                    continue
+
             fqn_to_config = FqnToConfig(fqn_to_config={fqn: config_obj})
 
             component_copy = copy.deepcopy(orig_main_component)
@@ -521,6 +535,10 @@ def run(
             # clean up
             setattr(pipe, main_component_name, orig_main_component)
             del component_copy
+            # very basic gpu mem management, TODO improve me
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # Print summary
         for fqn, lpips_values in fqn_to_lpips.items():
@@ -577,6 +595,7 @@ def run(
         fqns_rejected_by_avg = []
         fqns_rejected_by_max = []
 
+        # TODO custom rules for flux-2.dev here
         for fqn, lpips_values in fqn_to_lpips.items():
             avg_lpips = sum(lpips_values) / len(lpips_values)
             max_lpips = max(lpips_values)
