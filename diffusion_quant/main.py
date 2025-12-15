@@ -299,6 +299,7 @@ def run(
     quant_config: str = "f8d",
     use_compile: bool = False,
     benchmark_performance: bool = False,
+    torch_compile_mode: str = "default",
 ):
     """
     Main execution function: generates baseline and modified images,
@@ -393,7 +394,7 @@ def run(
 
     if use_compile:
         log("Compiling main component for baseline generation")
-        compiled_component = torch.compile(main_component)
+        compiled_component = torch.compile(main_component, mode=torch_compile_mode)
         setattr(pipe, main_component_name, compiled_component)
 
     # -----------------------------
@@ -562,8 +563,8 @@ def run(
         log(f"Results saved to {csv_path}")
 
     elif mode == "use_sweep_results":
-        lpips_avg_upper_bound = 0.0175
-        lpips_max_upper_bound = 0.06
+        lpips_avg_upper_bound = 0.0185
+        lpips_max_upper_bound = 0.07
 
         log("Using sweep results to selectively quantize layers")
         log(
@@ -635,7 +636,7 @@ def run(
         quantize_(component_copy, fqn_to_config, filter_fn=None)
         setattr(pipe, main_component_name, component_copy)
         if use_compile:
-            setattr(pipe, main_component_name, torch.compile(component_copy))
+            setattr(pipe, main_component_name, torch.compile(component_copy, mode=torch_compile_mode))
         print_pipeline_architecture(pipe, model_config)
 
         # Generate images with selectively quantized model for all prompts
@@ -756,7 +757,7 @@ def run(
         setattr(pipe, main_component_name, component_copy)
         log("Quantization complete")
         if use_compile:
-            setattr(pipe, main_component_name, torch.compile(component_copy))
+            setattr(pipe, main_component_name, torch.compile(component_copy, mode=torch_compile_mode))
         print_pipeline_architecture(pipe, model_config)
 
         # Generate images with fully quantized model for all prompts
