@@ -23,6 +23,7 @@ from torchao.quantization import (
 # import torchao.prototype.mx_formats
 from torchao.prototype.mx_formats.inference_workflow import (
     NVFP4DynamicActivationNVFP4WeightConfig,
+    MXDynamicActivationMXWeightConfig,
 )
 
 # -----------------------------
@@ -223,7 +224,6 @@ def create_comparison_image(
     # Get text bounding box for centering
     bbox = draw.textbbox((0, 0), lpips_text, font=lpips_font)
     text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
 
     # Center the LPIPS text horizontally, place it below the prompt
     text_x = (total_width - text_width) // 2
@@ -321,8 +321,8 @@ def run(
     assert prompt_set in PROMPTS_FILES, (
         f"unsupported {prompt_set=}, choose from {list(PROMPTS_FILES.keys())}"
     )
-    assert quant_config in ("nvfp4", "f8d", "f8wo"), (
-        f"unsupported {quant_config=}, choose from ['nvfp4', 'f8d', 'f8wo']"
+    assert quant_config in ("nvfp4", "f8d", "f8wo", "mxfp8"), (
+        f"unsupported {quant_config=}, choose from ['nvfp4', 'f8d', 'f8wo', 'mxfp8']"
     )
     if mode == "sweep":
         assert not use_compile
@@ -455,6 +455,11 @@ def run(
         config_obj = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
     elif quant_config == "f8wo":
         config_obj = Float8WeightOnlyConfig()
+    elif quant_config == "mxfp8":
+        config_obj = MXDynamicActivationMXWeightConfig(
+            activation_dtype=torch.float8_e4m3fn,
+            weight_dtype=torch.float8_e4m3fn,
+        )
     else:
         raise AssertionError(f"Unsupported quant_config: {quant_config}")
 
@@ -479,16 +484,16 @@ def run(
         ):
             log(f"{fqn=}")
 
-            if model == 'flux-2.dev':
+            if model == "flux-2.dev":
                 # hardcode don't quantize layers we def don't want to quantize
-                if 'embed' in fqn:
-                    print('skipping for embed')
+                if "embed" in fqn:
+                    print("skipping for embed")
                     continue
-                elif 'modulation' in fqn:
-                    print('skipping for modulation')
+                elif "modulation" in fqn:
+                    print("skipping for modulation")
                     continue
                 elif weight_shape[0] < 1000 or weight_shape[1] < 1000:
-                    print('skipping for weight shape')
+                    print("skipping for weight shape")
                     continue
 
             fqn_to_config = FqnToConfig(fqn_to_config={fqn: config_obj})
@@ -636,7 +641,11 @@ def run(
         quantize_(component_copy, fqn_to_config, filter_fn=None)
         setattr(pipe, main_component_name, component_copy)
         if use_compile:
-            setattr(pipe, main_component_name, torch.compile(component_copy, mode=torch_compile_mode))
+            setattr(
+                pipe,
+                main_component_name,
+                torch.compile(component_copy, mode=torch_compile_mode),
+            )
         print_pipeline_architecture(pipe, model_config)
 
         # Generate images with selectively quantized model for all prompts
@@ -703,9 +712,9 @@ def run(
         log(f"  Min LPIPS: {min_lpips:.4f}")
         log(f"  All values: {[f'{v:.4f}' for v in selective_lpips_values]}")
         log("=" * 80)
-        print('baseline_times', baseline_times)
-        print('times', times)
-        print('speedups', [x / y for (x, y) in zip(baseline_times, times)])
+        print("baseline_times", baseline_times)
+        print("times", times)
+        print("speedups", [x / y for (x, y) in zip(baseline_times, times)])
 
         # Save summary stats to CSV
         summary_csv_path = os.path.join(
@@ -737,11 +746,11 @@ def run(
         # Create FqnToConfig mapping for ALL Linear layers
         fqn_to_config_dict = {}
         for fqn, weight_shape in component_linear_fqns_and_weight_shapes:
-            if model == 'flux-2.dev':
+            if model == "flux-2.dev":
                 # hardcode don't quantize layers we def don't want to quantize
-                if 'embed' in fqn:
+                if "embed" in fqn:
                     continue
-                elif 'modulation' in fqn:
+                elif "modulation" in fqn:
                     continue
                 elif weight_shape[0] < 1000 or weight_shape[1] < 1000:
                     continue
@@ -757,7 +766,11 @@ def run(
         setattr(pipe, main_component_name, component_copy)
         log("Quantization complete")
         if use_compile:
-            setattr(pipe, main_component_name, torch.compile(component_copy, mode=torch_compile_mode))
+            setattr(
+                pipe,
+                main_component_name,
+                torch.compile(component_copy, mode=torch_compile_mode),
+            )
         print_pipeline_architecture(pipe, model_config)
 
         # Generate images with fully quantized model for all prompts
@@ -820,9 +833,9 @@ def run(
         log(f"  Min LPIPS: {min_lpips:.4f}")
         log(f"  All values: {[f'{v:.4f}' for v in test_lpips_values]}")
         log("=" * 80)
-        print('baseline_times', baseline_times)
-        print('times', times)
-        print('speedups', [x / y for (x, y) in zip(baseline_times, times)])
+        print("baseline_times", baseline_times)
+        print("times", times)
+        print("speedups", [x / y for (x, y) in zip(baseline_times, times)])
 
         # Save summary stats to CSV
         summary_csv_path = os.path.join(
