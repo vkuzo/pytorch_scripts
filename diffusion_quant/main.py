@@ -56,6 +56,8 @@ RANDOM_SEED = 42
 PROMPTS_FILES = {
     "calibration": "diffusion_quant/prompts_calibrate.txt",
     "test": "diffusion_quant/prompts_test.txt",
+    "drawbench_calibration": "hf://sayakpaul/drawbench:calibration",
+    "drawbench_test": "hf://sayakpaul/drawbench:test",
 }
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -66,6 +68,105 @@ def load_prompts(prompts_file: str) -> list[str]:
     with open(prompts_file, "r") as f:
         prompts = [line.strip() for line in f if line.strip()]
     return prompts
+
+
+def load_prompts_from_hf_dataset(
+    dataset_name: str, split_type: str = None
+) -> list[str]:
+    """
+    Load prompts from a HuggingFace dataset.
+
+    Args:
+        dataset_name: Name of the HuggingFace dataset (e.g., 'sayakpaul/drawbench')
+        split_type: Optional split type ('calibration' or 'test'). If provided, splits
+                   the dataset with 20% for calibration and 80% for test using a
+                   reproducible random seed.
+
+    Returns:
+        List of prompt strings
+
+    Raises:
+        ImportError: If datasets library is not installed
+        Exception: If dataset loading fails
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError(
+            "The 'datasets' library is required to load DrawBench dataset. "
+            "Please install it with: pip install datasets"
+        )
+
+    try:
+        log(f"Loading dataset from HuggingFace: {dataset_name}")
+        dataset = load_dataset(dataset_name, split="train")
+        prompts = [item["Prompts"] for item in dataset]
+
+        # Apply split if requested
+        if split_type is not None:
+            import random
+
+            # Use a fixed seed for reproducibility
+            rng = random.Random(42)
+
+            # Create indices and shuffle them reproducibly
+            indices = list(range(len(prompts)))
+            rng.shuffle(indices)
+
+            # Split: 20% calibration, 80% test
+            calibration_size = int(len(prompts) * 0.2)
+
+            if split_type == "calibration":
+                selected_indices = indices[:calibration_size]
+                prompts = [prompts[i] for i in selected_indices]
+                log(
+                    f"Loaded {len(prompts)} prompts from {dataset_name} (calibration split, 20%)"
+                )
+            elif split_type == "test":
+                selected_indices = indices[calibration_size:]
+                prompts = [prompts[i] for i in selected_indices]
+                log(
+                    f"Loaded {len(prompts)} prompts from {dataset_name} (test split, 80%)"
+                )
+            else:
+                raise ValueError(
+                    f"Invalid split_type: {split_type}. Must be 'calibration' or 'test'."
+                )
+        else:
+            log(f"Loaded {len(prompts)} prompts from {dataset_name}")
+
+        return prompts
+    except Exception as e:
+        raise Exception(
+            f"Failed to load dataset '{dataset_name}' from HuggingFace. "
+            f"Error: {str(e)}. Please check your network connection and dataset name."
+        )
+
+
+def load_prompts_unified(prompts_source: str) -> list[str]:
+    """
+    Load prompts from either a file or HuggingFace dataset.
+
+    Args:
+        prompts_source: Either a file path or HuggingFace dataset identifier
+                       (prefixed with 'hf://dataset_name' or 'hf://dataset_name:split_type')
+
+    Returns:
+        List of prompt strings
+    """
+    if prompts_source.startswith("hf://"):
+        # Remove 'hf://' prefix
+        source_spec = prompts_source[5:]
+
+        # Check if split type is specified (format: dataset_name:split_type)
+        if ":" in source_spec:
+            dataset_name, split_type = source_spec.split(":", 1)
+            return load_prompts_from_hf_dataset(dataset_name, split_type=split_type)
+        else:
+            dataset_name = source_spec
+            return load_prompts_from_hf_dataset(dataset_name)
+    else:
+        return load_prompts(prompts_source)
 
 
 def log(message: str):
@@ -400,10 +501,11 @@ def run(
     # -----------------------------
     # 2. Baseline images (for all prompts)
     # -----------------------------
-    # Load prompts from file
-    prompts_file = PROMPTS_FILES[prompt_set]
-    all_prompts = load_prompts(prompts_file)
-    log(f"Loaded {len(all_prompts)} prompts from {prompts_file}")
+    # Load prompts from file or HuggingFace dataset
+    prompts_source = PROMPTS_FILES[prompt_set]
+    all_prompts = load_prompts_unified(prompts_source)
+    if not prompts_source.startswith("hf://"):
+        log(f"Loaded {len(all_prompts)} prompts from {prompts_source}")
 
     # Limit prompts for debugging if requested
     prompts_to_use = all_prompts if num_prompts is None else all_prompts[:num_prompts]
