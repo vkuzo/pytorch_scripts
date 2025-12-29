@@ -5,7 +5,8 @@
       "Bash(git push:*)",
       "Bash(gh pr create:*)",
       "Bash(with-proxy python:*)",
-      "Bash(python diffusion_quant/main.py:*)"
+      "Bash(python diffusion_quant/main.py:*)",
+      "Bash(conda activate pytorch)"
     ],
     "deny": [],
     "ask": []
