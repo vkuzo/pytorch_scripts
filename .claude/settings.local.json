@@ -6,9 +6,13 @@
       "Bash(gh pr create:*)",
       "Bash(with-proxy python:*)",
       "Bash(python diffusion_quant/main.py:*)",
-      "Bash(conda activate pytorch)"
+      "Bash(conda activate pytorch)",
+      "Bash(python:*)",
+      "Bash(pip show:*)",
+      "Bash(pytest:*)"
     ],
     "deny": [],
     "ask": []
-  }
+  },
+  "outputStyle": "default"
 }
