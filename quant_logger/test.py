@@ -45,7 +45,6 @@ def test_hello_world():
     x = torch.randn(M, K)
     m = get_toy_model(K, N)
     add_activation_loggers(m)
-    m = torch.compile(m)
     m(x)
 
 
@@ -58,7 +57,6 @@ def test_loop():
     reset_counter()
 
     add_activation_loggers(m)
-    m = torch.compile(m)
     m(x)
 
 
@@ -78,7 +76,6 @@ def test_custom_logging_fn():
     x = torch.randn(M, K)
     m = get_toy_model(K, N)
     add_activation_loggers(m)
-    m = torch.compile(m)
     m(x)
 
 
@@ -117,7 +114,6 @@ def test_quantized_model():
     quantize_(m, Float8DynamicActivationFloat8WeightConfig())
 
     add_activation_loggers(m)
-    m = torch.compile(m)
     m(x)
 
 
