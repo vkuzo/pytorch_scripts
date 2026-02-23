@@ -41,7 +41,7 @@ class ModelWithLoop(nn.Module):
 
 
 def test_hello_world():
-    M, K, N = 2, 4, 6
+    M, K, N = 2, 32, 64
     x = torch.randn(M, K)
     m = get_toy_model(K, N)
     add_activation_loggers(m)
@@ -50,7 +50,7 @@ def test_hello_world():
 
 
 def test_loop():
-    dim = 4
+    dim = 32
     x = torch.randn(dim, dim)
     m = ModelWithLoop(dim)
 
@@ -63,7 +63,7 @@ def test_loop():
 
 
 def test_log_parameter_info():
-    K, N = 4, 6
+    K, N = 4, 32
     m = get_toy_model(K, N)
     log_parameter_info(m)
 
@@ -83,7 +83,7 @@ def test_custom_logging_fn():
 
 
 def test_custom_logging_fn_save_tensors():
-    save_dir = os.path.expanduser("~/local/tmp/20260102_activations_test/")
+    save_dir = os.path.expanduser("~/tmp/20260102_activations_test/")
     enable_log_tensor_save_tensors_to_disk(save_dir)
 
     M, K, N = 2, 4, 6
@@ -95,7 +95,7 @@ def test_custom_logging_fn_save_tensors():
 
 
 def test_custom_logging_fn_save_stats():
-    filename = "/home/vasiliy/local/tmp/20260106_test.csv"
+    filename = os.path.expanduser("~/tmp/20260106_test.csv")
     enable_log_stats_to_file(filename)
 
     M, K, N = 2, 32, 64
@@ -127,10 +127,7 @@ def test_opt_125m():
     model = AutoModelForCausalLM.from_pretrained(model_name)
     print(model)
 
-    # save_dir = os.path.expanduser("~/local/tmp/20260102_activations_opt-125m/")
-    # enable_log_tensor_save_tensors_to_disk(save_dir)
-
-    filename = "/home/vasiliy/local/tmp/20260106_test.csv"
+    filename = os.path.expanduser("~/tmp/20260106_test.csv")
     enable_log_stats_to_file(filename)
 
     log_parameter_info(model)

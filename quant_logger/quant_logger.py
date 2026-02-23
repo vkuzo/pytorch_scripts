@@ -234,6 +234,9 @@ def add_activation_loggers(model: torch.nn.Module):
         if (child_fqn == "bias") or ("embed" in fqn) or ("layer_norm" in fqn):
             continue
         parent_module = fqn_to_module[parent_fqn]
+        # for now just handle linears
+        if not isinstance(parent_module, torch.nn.Linear):
+            continue
         new_parameter = torch.nn.Parameter(ActivationLoggingTensor(parameter, fqn))
         setattr(parent_module, child_fqn, new_parameter)
 
