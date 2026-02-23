@@ -1,13 +1,8 @@
 import csv
 import os
 import torch
-from torch.utils._python_dispatch import return_and_correct_aliasing
 import scipy
 from dataclasses import dataclass, fields, astuple
-
-from torchao.utils import TorchAOBaseTensor
-
-aten = torch.ops.aten
 
 counter = [0]
 
@@ -166,22 +161,20 @@ def get_kurtosis(x, dim=None, keepdim=False):
     return k
 
 
-class ActivationLoggingTensor(TorchAOBaseTensor):
-    tensor_data_names = ["original_weight_tensor"]
-    tensor_attribute_names = ["fqn"]
-
+class ActivationLoggingTensor(torch.Tensor):
+    @staticmethod
     def __new__(
         cls,
         original_weight_tensor: torch.Tensor,
         fqn: str,
     ):
-        kwargs = {}
-        dtype = original_weight_tensor.dtype
-        kwargs["dtype"] = dtype
-        kwargs["requires_grad"] = False
-        kwargs["device"] = original_weight_tensor.device
-        shape = original_weight_tensor.shape
-        return torch.Tensor._make_wrapper_subclass(cls, shape, **kwargs)  # type: ignore[attr-defined]
+        return torch.Tensor._make_wrapper_subclass(
+            cls,
+            original_weight_tensor.shape,
+            dtype=original_weight_tensor.dtype,
+            device=original_weight_tensor.device,
+            requires_grad=False,
+        )
 
     def __init__(
         self,
@@ -191,38 +184,62 @@ class ActivationLoggingTensor(TorchAOBaseTensor):
         self.original_weight_tensor = original_weight_tensor
         self.fqn = fqn
 
+    def __repr__(self):
+        return f"ActivationLoggingTensor(fqn={self.fqn}, shape={self.shape})"
+
+    def __tensor_flatten__(self):
+        return ["original_weight_tensor"], {"fqn": self.fqn}
+
+    @staticmethod
+    def __tensor_unflatten__(tensor_data, metadata, outer_size, outer_stride):
+        return ActivationLoggingTensor(
+            tensor_data["original_weight_tensor"],
+            metadata["fqn"],
+        )
+
     @classmethod
-    def from_float(
-        cls,
-        input_float: torch.Tensor,
-    ):
-        return cls(input_float)
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
 
+        if func is torch.nn.functional.linear:
+            # F.linear signature: linear(input, weight, bias=None)
+            input_tensor = args[0]
+            weight = args[1]
+            bias = args[2] if len(args) > 2 else kwargs.get("bias", None)
 
-implements = ActivationLoggingTensor.implements
+            # Log the activation
+            torch.ops.quant_logger.log_tensor(
+                input_tensor, weight.fqn, "F.linear", "act"
+            )
 
+            # Call F.linear with the unwrapped weight
+            return func(input_tensor, weight.original_weight_tensor, bias)
 
-@implements(aten.addmm.default)
-def _(func, types, args, kwargs):
-    bias, x, w = args
-    torch.ops.quant_logger.log_tensor(x, w.fqn, str(func), "act")
-    out = func(bias, x, w.original_weight_tensor, **kwargs)
-    return out
+        # Fallback: disable torch function and call normally
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*args, **kwargs)
 
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs):
+        # Required by _make_wrapper_subclass, but we handle everything in __torch_function__
+        kwargs = kwargs or {}
 
-@implements(aten.mm.default)
-def _(func, types, args, kwargs):
-    x, w = args
-    torch.ops.quant_logger.log_tensor(x, w.fqn, str(func), "act")
-    out = func(x, w.original_weight_tensor, **kwargs)
-    return out
+        # Handle detach specially to preserve the tensor type (needed for nn.Parameter)
+        if func is torch.ops.aten.detach.default:
+            return ActivationLoggingTensor(
+                args[0].original_weight_tensor.detach(),
+                args[0].fqn,
+            )
 
+        # Fallback: unwrap and call
+        def unwrap(t):
+            if isinstance(t, ActivationLoggingTensor):
+                return t.original_weight_tensor
+            return t
 
-@implements(aten.t.default)
-def _(func, types, args, kwargs):
-    return return_and_correct_aliasing(
-        func, args, kwargs, args[0]._apply_fn_to_data(torch.t)
-    )
+        unwrapped_args = torch.utils._pytree.tree_map(unwrap, args)
+        unwrapped_kwargs = torch.utils._pytree.tree_map(unwrap, kwargs)
+        return func(*unwrapped_args, **unwrapped_kwargs)
 
 
 def add_activation_loggers(model: torch.nn.Module):
