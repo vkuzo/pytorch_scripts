@@ -3,7 +3,10 @@
     "allow": [
       "Bash(with-proxy python:*)",
       "Bash(python -c:*)",
-      "Bash(with-proxy pytest:*)"
+      "Bash(with-proxy pytest:*)",
+      "Bash(python3 -c \"\nfrom dataclasses import dataclass, fields, astuple\n\n@dataclass\nclass Base:\n    a: float\n    b: float\n\n@dataclass\nclass Child\\(Base\\):\n    c: float\n    d: float\n\nc = Child\\(1.0, 2.0, 3.0, 4.0\\)\nprint\\('fields:', [f.name for f in fields\\(c\\)]\\)\nprint\\('astuple:', astuple\\(c\\)\\)\nprint\\('isinstance Base:', isinstance\\(c, Base\\)\\)\n\n# Test that a function expecting Base can receive Child\ndef process\\(x: Base\\):\n    return fields\\(x\\), astuple\\(x\\)\n\nprint\\('process Child through Base-typed fn:', process\\(c\\)\\)\n\")",
+      "Bash(pytest test.py -v -x -k \"not test_quantized_model and not test_opt_125m\" 2>&1)",
+      "Bash(pytest test_kurtosis.py -v -x 2>&1)"
     ],
     "deny": [],
     "ask": []
