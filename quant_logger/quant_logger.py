@@ -71,6 +71,11 @@ def enable_log_stats_to_file(filename):
 
 
 class ActivationLoggingTensor(torch.Tensor):
+    """
+    A simple tensor subclass to log activations of common PyTorch ops.
+    For now, only supports `F.linear`.
+    """
+
     @staticmethod
     def __new__(
         cls,
@@ -117,9 +122,7 @@ class ActivationLoggingTensor(torch.Tensor):
             bias = args[2] if len(args) > 2 else kwargs.get("bias", None)
 
             # Log the activation
-            torch.ops.quant_logger.log_tensor(
-                input_tensor, weight.fqn, "F.linear", "act"
-            )
+            torch.ops.quant_logger.log_tensor(input_tensor, weight.fqn, "linear", "act")
 
             # Call F.linear with the unwrapped weight
             return func(input_tensor, weight.original_weight_tensor, bias)
@@ -154,6 +157,11 @@ class ActivationLoggingTensor(torch.Tensor):
 
 
 def add_activation_loggers(model: torch.nn.Module):
+    """
+    Adds logging for activations passing through `F.linear` ops. The logging
+    is user-configurable by redefining the `quant_logger::log_tensor` custom op.
+    """
+
     fqn_to_module = dict(model.named_modules())
     for fqn, parameter in model.named_parameters():
         parent_fqn = ".".join(fqn.split(".")[:-1])
@@ -170,5 +178,8 @@ def add_activation_loggers(model: torch.nn.Module):
 
 
 def log_parameter_info(model: torch.nn.Module):
+    """
+    Prints summary statistics about model parameters.
+    """
     for fqn, parameter in model.named_parameters():
         torch.ops.quant_logger.log_tensor(parameter, fqn, "", "param")
