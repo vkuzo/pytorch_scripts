@@ -189,6 +189,12 @@ class TestQuantLogger(unittest.TestCase):
             self.assertEqual(rows[3]["tag"], "act")
             self.assertEqual(rows[3]["fqn"], "2.weight")
 
+            # Verify MKN values in extra field for activation rows
+            # First linear: input (M, K) @ weight (N, K).T -> (M, N)
+            self.assertEqual(rows[2]["extra"], f"MKN={M}|{K}|{N}")
+            # Second linear: input (M, N) @ weight (K, N).T -> (M, K)
+            self.assertEqual(rows[3]["extra"], f"MKN={M}|{N}|{K}")
+
     def test_opt_125m(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = pathlib.Path(tmp_dir)
