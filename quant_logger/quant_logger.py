@@ -17,7 +17,9 @@ def get_default_stats(x: torch.Tensor):
 
 
 @torch.library.custom_op("quant_logger::log_tensor", mutates_args=("x",))
-def log_tensor(x: torch.Tensor, fqn: str, op: str, tag: str) -> None:
+def log_tensor(
+    x: torch.Tensor, fqn: str, op: str, tag: str, extra: str | None = None
+) -> None:
     """
     User can redefine this function in their code to customize logging (write to file,
     log custom stats, etc).
@@ -25,13 +27,16 @@ def log_tensor(x: torch.Tensor, fqn: str, op: str, tag: str) -> None:
     counter_val = counter[0]
     counter[0] += 1
     max_abs, avg, std = get_default_stats(x)
+    extra_str = ""
+    if extra is not None:
+        extra_str = f"{extra=}, "
     print(
-        f"t={tag}, c={counter_val}, {fqn=}, {op=}, max={max_abs:.2f}, avg={avg:.2f}, std={std:.2f}"
+        f"t={tag}, c={counter_val}, {fqn=}, {op=}, {extra_str}max={max_abs:.2f}, avg={avg:.2f}, std={std:.2f}"
     )
 
 
 @log_tensor.register_fake
-def _(x: torch.Tensor, fqn: str, op: str, tag: str) -> None:
+def _(x: torch.Tensor, fqn: str, op: str, tag: str, extra: str | None = None) -> None:
     pass
 
 
@@ -43,7 +48,9 @@ def enable_log_tensor_save_tensors_to_disk(save_dir):
     os.makedirs(save_dir, exist_ok=True)
 
     @torch.library.custom_op("quant_logger::log_tensor", mutates_args=("x",))
-    def log_tensor(x: torch.Tensor, fqn: str, op: str, tag: str) -> None:
+    def log_tensor(
+        x: torch.Tensor, fqn: str, op: str, tag: str, extra: str | None = None
+    ) -> None:
         filename = f"{fqn}_{op}_{tag}.pt"
         # Replace invalid path characters
         filename = filename.replace("/", "_").replace(":", "_")
@@ -60,7 +67,9 @@ def enable_log_stats_to_file(filename):
         writer.writerow(headers)
 
     @torch.library.custom_op("quant_logger::log_tensor", mutates_args=("x",))
-    def log_tensor(x: torch.Tensor, fqn: str, op: str, tag: str) -> None:
+    def log_tensor(
+        x: torch.Tensor, fqn: str, op: str, tag: str, extra: str | None = None
+    ) -> None:
         counter_val = counter[0]
         counter[0] += 1
         max_abs, avg, std = get_default_stats(x)
@@ -121,8 +130,16 @@ class ActivationLoggingTensor(torch.Tensor):
             weight = args[1]
             bias = args[2] if len(args) > 2 else kwargs.get("bias", None)
 
+            # set the extra argument to the gemm shape (MKN)
+            M, K = input_tensor.reshape(-1, input_tensor.shape[-1]).shape
+            N, K2 = weight.shape
+            assert K == K2
+            extra = f"MKN={M}|{K}|{N}"
+
             # Log the activation
-            torch.ops.quant_logger.log_tensor(input_tensor, weight.fqn, "linear", "act")
+            torch.ops.quant_logger.log_tensor(
+                input_tensor, weight.fqn, "linear", "act", extra
+            )
 
             # Call F.linear with the unwrapped weight
             return func(input_tensor, weight.original_weight_tensor, bias)
@@ -182,4 +199,4 @@ def log_parameter_info(model: torch.nn.Module):
     Prints summary statistics about model parameters.
     """
     for fqn, parameter in model.named_parameters():
-        torch.ops.quant_logger.log_tensor(parameter, fqn, "", "param")
+        torch.ops.quant_logger.log_tensor(parameter, fqn, "", "param", None)
