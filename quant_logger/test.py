@@ -1,6 +1,7 @@
 import csv
 import importlib
 import pathlib
+import sys
 import tempfile
 import unittest
 from io import StringIO
@@ -58,7 +59,30 @@ class TestQuantLogger(unittest.TestCase):
             m(x)
 
             output = mock_stdout.getvalue()
-            self.assertIn("t=act, c=0, fqn='0.weight', op='linear'", output)
+            print(output, file=sys.__stdout__)
+            lines = output.strip().split("\n")
+
+            self.assertIn("t=act, c=0, fqn='0.weight', op='linear'", lines[0])
+            self.assertIn("t=act, c=1, fqn='2.weight', op='linear'", lines[1])
+
+            # Parse and verify MKN shape from extra argument
+            import re
+
+            mkn_pattern = r"extra='MKN=(\d+)\|(\d+)\|(\d+)'"
+
+            # First linear: input (M, K) @ weight (N, K).T -> (M, N)
+            match0 = re.search(mkn_pattern, lines[0])
+            self.assertIsNotNone(match0)
+            self.assertEqual(int(match0.group(1)), M)
+            self.assertEqual(int(match0.group(2)), K)
+            self.assertEqual(int(match0.group(3)), N)
+
+            # Second linear: input (M, N) @ weight (K, N).T -> (M, K)
+            match1 = re.search(mkn_pattern, lines[1])
+            self.assertIsNotNone(match1)
+            self.assertEqual(int(match1.group(1)), M)
+            self.assertEqual(int(match1.group(2)), N)
+            self.assertEqual(int(match1.group(3)), K)
 
     def test_log_parameter_info_simple(self):
         with patch("sys.stdout", new_callable=StringIO) as mock_stdout:
@@ -67,6 +91,7 @@ class TestQuantLogger(unittest.TestCase):
             log_parameter_info(m)
 
             output = mock_stdout.getvalue()
+            print(output, file=sys.__stdout__)
             lines = output.strip().split("\n")
             self.assertIn("t=param, c=0, fqn='0.weight', op='',", lines[0])
             self.assertIn("t=param, c=1, fqn='2.weight', op='',", lines[1])
@@ -84,6 +109,7 @@ class TestQuantLogger(unittest.TestCase):
             m(x)
 
             output = mock_stdout.getvalue()
+            print(output, file=sys.__stdout__)
             lines = output.strip().split("\n")
             self.assertIn("t=param, c=0, fqn='fc.weight', op='',", lines[0])
             self.assertIn("t=param, c=1, fqn='fc.bias', op='',", lines[1])
@@ -94,7 +120,9 @@ class TestQuantLogger(unittest.TestCase):
         with patch("sys.stdout", new_callable=StringIO) as mock_stdout:
 
             @torch.library.custom_op("quant_logger::log_tensor", mutates_args=("x",))
-            def log_tensor(x: torch.Tensor, fqn: str, op: str, tag: str) -> None:
+            def log_tensor(
+                x: torch.Tensor, fqn: str, op: str, tag: str, extra: str | None = None
+            ) -> None:
                 min_val = torch.min(x)
                 print(f"custom {tag=}, {fqn=}, {min_val=}")
 
@@ -105,6 +133,7 @@ class TestQuantLogger(unittest.TestCase):
             m(x)
 
             output = mock_stdout.getvalue()
+            print(output, file=sys.__stdout__)
             lines = output.strip().split("\n")
             self.assertIn("custom tag='act', fqn='0.weight',", lines[0])
             self.assertIn("custom tag='act', fqn='2.weight',", lines[1])
