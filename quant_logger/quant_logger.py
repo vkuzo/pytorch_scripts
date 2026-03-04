@@ -56,12 +56,11 @@ def enable_log_tensor_save_tensors_to_disk(save_dir):
         filename = filename.replace("/", "_").replace(":", "_")
         filepath = os.path.join(save_dir, filename)
         torch.save(x.clone(), filepath)
-        print(f"Saved tensor to {filepath}")
 
 
 # save defaults stats to csv file
 def enable_log_stats_to_file(filename):
-    headers = ["tag", "counter_val", "fqn", "op", "max_abs", "avg", "std"]
+    headers = ["tag", "counter_val", "fqn", "op", "extra", "max_abs", "avg", "std"]
     with open(filename, "w") as f:
         writer = csv.writer(f)
         writer.writerow(headers)
@@ -73,7 +72,7 @@ def enable_log_stats_to_file(filename):
         counter_val = counter[0]
         counter[0] += 1
         max_abs, avg, std = get_default_stats(x)
-        data = [tag, counter_val, fqn, op, max_abs, avg, std]
+        data = [tag, counter_val, fqn, op, extra, max_abs, avg, std]
         with open(filename, "a") as f:
             writer = csv.writer(f)
             writer.writerow(data)
