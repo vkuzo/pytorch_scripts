@@ -9,7 +9,8 @@
       "Bash(conda activate pytorch)",
       "Bash(python:*)",
       "Bash(pip show:*)",
-      "Bash(pytest:*)"
+      "Bash(pytest:*)",
+      "Bash(python3:*)"
     ],
     "deny": [],
     "ask": []
