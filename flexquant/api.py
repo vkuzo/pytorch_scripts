@@ -18,88 +18,105 @@ def flex_cast_quant_dense(
     # user defined function to go from data tile + scale to value
     cast_to_dtype_fn: Callable,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert input.ndim >= 1
+    assert input.ndim == 2
+    assert input.is_contiguous()
 
     block_size_t = (block_size,) if isinstance(block_size, int) else tuple(block_size)
     dim_t = (dim,) if isinstance(dim, int) else tuple(dim)
     assert len(block_size_t) == len(dim_t)
 
     n_block_dims = len(block_size_t)
-    expected_dims = tuple(range(input.ndim - n_block_dims, input.ndim))
     normalized_dim_t = tuple(d if d >= 0 else d + input.ndim for d in dim_t)
-    assert normalized_dim_t == expected_dims, (
-        f"only trailing dims supported, got dim={dim} for ndim={input.ndim}"
-    )
+    M, K = input.shape
 
-    if block_size_t == (-1,):
-        # rowwise scaling
+    # TODO(future): more interesting cases, such as:
+    # 1. scale swizzling
+    # 2. grouped variants with offsets
+    # 3. padding and other edge cases
+    # 4. actual lowering to templates, to beat the compiler
 
-        # entire row is one block; the trailing block dim equals input.shape[-1]
-        amax = input.abs().amax(dim=-1, keepdim=True)
-        scale = amax_to_scale_fn(amax)
-        qdata = cast_to_dtype_fn(input, scale)
-
-    elif n_block_dims == 1:
-        # 1D scaling with `block_size` across the last dim
-
+    if n_block_dims == 1 and block_size_t[0] > 0:
+        # 1D blocked scaling
         block_size_int = block_size_t[0]
-        assert block_size_int > 0
-        last = input.shape[-1]
-        assert last % block_size_int == 0, (
-            f"input.shape[-1]={last} must be divisible by block_size={block_size_int}"
-        )
+        if normalized_dim_t == (1,):
+            # dim=-1: reduce across K; output qdata in (M, K), scale in (M, n_blocks)
+            assert K % block_size_int == 0, (
+                f"input.shape[-1]={K} must be divisible by block_size={block_size_int}"
+            )
+            n_blocks = K // block_size_int
+            x_b = input.reshape(M, n_blocks, block_size_int)
+            amax = x_b.abs().amax(dim=-1, keepdim=True)  # (M, n_blocks, 1)
+            scale_bc = amax_to_scale_fn(amax)
+            qdata_b = cast_to_dtype_fn(x_b, scale_bc)
+            qdata = qdata_b.reshape(M, K)
+            scale = scale_bc.squeeze(-1).to(scale_dtype)
+        elif normalized_dim_t == (0,):
+            # dim=-2: reduce across M; output qdata/scale row-major in (K, M) layout
+            assert M % block_size_int == 0, (
+                f"input.shape[-2]={M} must be divisible by block_size={block_size_int}"
+            )
+            n_blocks = M // block_size_int
+            x_b = input.reshape(n_blocks, block_size_int, K)
+            amax = x_b.abs().amax(dim=-2, keepdim=True)  # (n_blocks, 1, K)
+            scale_bc = amax_to_scale_fn(amax)
+            qdata_b = cast_to_dtype_fn(x_b, scale_bc)
+            qdata = qdata_b.reshape(M, K).transpose(-2, -1).contiguous()
+            scale = (
+                scale_bc.squeeze(-2).transpose(-2, -1).contiguous().to(scale_dtype)
+            )
+        else:
+            raise AssertionError(f"unsupported dim={dim} for 1D blocks")
 
-        lead = input.shape[:-1]
-        n_blocks = last // block_size_int
-        x_blocked = input.reshape(*lead, n_blocks, block_size_int)
-
-        amax = x_blocked.abs().amax(dim=-1, keepdim=True)
-        scale = amax_to_scale_fn(amax)
-        qdata_blocked = cast_to_dtype_fn(x_blocked, scale)
-
-        qdata = qdata_blocked.reshape(*lead, last)
+    elif n_block_dims == 1 and block_size_t == (-1,):
+        # rowwise scaling (entire row is one block)
+        if normalized_dim_t == (1,):
+            # dim=-1: reduce across K; output qdata in (M, K), scale shape (M,)
+            amax = input.abs().amax(dim=-1, keepdim=True)  # (M, 1)
+            scale_bc = amax_to_scale_fn(amax)
+            qdata = cast_to_dtype_fn(input, scale_bc)
+            scale = scale_bc.squeeze(-1).to(scale_dtype)
+        elif normalized_dim_t == (0,):
+            # dim=-2: reduce across M; output qdata in (K, M), scale shape (K,)
+            amax = input.abs().amax(dim=-2, keepdim=True)  # (1, K)
+            scale_bc = amax_to_scale_fn(amax)
+            qdata = cast_to_dtype_fn(input, scale_bc).transpose(-2, -1).contiguous()
+            scale = scale_bc.squeeze(-2).to(scale_dtype)
+        else:
+            raise AssertionError(f"unsupported dim={dim} for rowwise scaling")
 
     elif n_block_dims == 2:
-        # 2D scaling with `block_size` across the last 2 dims; tile is flattened
-        # to a single trailing dim so callbacks designed for 1D blocks work as-is.
+        # 2D blocked scaling; tile is flattened to a single trailing dim so callbacks
+        # designed for 1D blocks work as-is.
         # Note: likely to be slow with the current reference implementation
+        if normalized_dim_t == (0, 1):
+            B1, B2 = block_size_t
+            assert B1 > 0 and B2 > 0
+            assert M % B1 == 0 and K % B2 == 0, (
+                f"input trailing dims {(M, K)} must be divisible by block_size={(B1, B2)}"
+            )
+            n1, n2 = M // B1, K // B2
 
-        B1, B2 = block_size_t
-        assert B1 > 0 and B2 > 0
-        *lead, D1, D2 = input.shape
-        assert D1 % B1 == 0 and D2 % B2 == 0, (
-            f"input trailing dims {(D1, D2)} must be divisible by block_size={(B1, B2)}"
-        )
-        n1, n2 = D1 // B1, D2 // B2
-
-        # (..., D1, D2) -> (..., n1, B1, n2, B2) -> (..., n1, n2, B1, B2) -> (..., n1, n2, B1*B2)
-        x_blocked = (
-            input.reshape(*lead, n1, B1, n2, B2)
-            .transpose(-3, -2)
-            .contiguous()
-            .reshape(*lead, n1, n2, B1 * B2)
-        )
-
-        amax = x_blocked.abs().amax(dim=-1, keepdim=True)
-        scale = amax_to_scale_fn(amax)
-        qdata_blocked = cast_to_dtype_fn(x_blocked, scale)
-
-        qdata = (
-            qdata_blocked.reshape(*lead, n1, n2, B1, B2)
-            .transpose(-3, -2)
-            .contiguous()
-            .reshape(*lead, D1, D2)
-        )
+            # (M, K) -> (n1, B1, n2, B2) -> (n1, n2, B1, B2) -> (n1, n2, B1*B2)
+            x_b = (
+                input.reshape(n1, B1, n2, B2)
+                .transpose(-3, -2)
+                .contiguous()
+                .reshape(n1, n2, B1 * B2)
+            )
+            amax = x_b.abs().amax(dim=-1, keepdim=True)
+            scale_bc = amax_to_scale_fn(amax)
+            qdata_b = cast_to_dtype_fn(x_b, scale_bc)
+            qdata = (
+                qdata_b.reshape(n1, n2, B1, B2)
+                .transpose(-3, -2)
+                .contiguous()
+                .reshape(M, K)
+            )
+            scale = scale_bc.squeeze(-1).to(scale_dtype)
+        else:
+            raise AssertionError(f"unsupported dim={dim} for 2D blocks")
 
     else:
         raise AssertionError(f"unsupported block_size rank: {n_block_dims}")
 
-    # TODO(future): more interesting cases, such as:
-    # 1. casting across dim1 (for backward)
-    # 2. scale swizzling
-    # 3. grouped variants with offsets
-    # 4. padding and other edge cases
-    # 5. actual lowering to templates, to beat the compiler
-
-    scale = scale.squeeze(-1).to(scale_dtype)
     return qdata, scale

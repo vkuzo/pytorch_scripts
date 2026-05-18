@@ -8,11 +8,19 @@ from api import flex_cast_quant_dense
 from recipes import (
     Recipe,
     deepseek_fp8_1_128,
+    deepseek_fp8_1_128_dim_m,
     deepseek_fp8_128_128,
     rowwise_fp8,
+    rowwise_fp8_dim_m,
 )
 
-RECIPES = [deepseek_fp8_1_128, deepseek_fp8_128_128, rowwise_fp8]
+RECIPES = [
+    deepseek_fp8_1_128,
+    deepseek_fp8_1_128_dim_m,
+    deepseek_fp8_128_128,
+    rowwise_fp8,
+    rowwise_fp8_dim_m,
+]
 
 
 @pytest.mark.parametrize("recipe", RECIPES, ids=[r.name for r in RECIPES])

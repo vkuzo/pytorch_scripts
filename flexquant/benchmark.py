@@ -3,12 +3,26 @@ import torch
 import triton.testing
 
 from api import flex_cast_quant_dense
-from recipes import Recipe, deepseek_fp8_1_128, deepseek_fp8_128_128, rowwise_fp8
+from recipes import (
+    Recipe,
+    deepseek_fp8_1_128,
+    deepseek_fp8_1_128_dim_m,
+    deepseek_fp8_128_128,
+    rowwise_fp8,
+    rowwise_fp8_dim_m,
+)
 
 B200_PEAK_BW_GBPS = 8000.0  # 8 TB/s
 
 RECIPES_BY_NAME = {
-    r.name: r for r in (deepseek_fp8_1_128, deepseek_fp8_128_128, rowwise_fp8)
+    r.name: r
+    for r in (
+        deepseek_fp8_1_128,
+        deepseek_fp8_1_128_dim_m,
+        deepseek_fp8_128_128,
+        rowwise_fp8,
+        rowwise_fp8_dim_m,
+    )
 }
 
 
