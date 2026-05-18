@@ -10,7 +10,7 @@ Specifically:
 100% clauded
 
 Implemented so far:
-* flex_quant_dense API with support for single stage scaling
+* flex_cast_quant_dense API with support for single stage scaling
 * testing for the API for simplified deepseek 1x128, deepseek 128x128, float8 rowwise recipe stubs
 * torch.compile path only
 * dim=-1 and row-major output only
