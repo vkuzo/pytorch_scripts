@@ -32,6 +32,11 @@ def _deepseek_fp8_1_128_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.
     return qdata, scale.squeeze(-1).to(torch.float32)
 
 
+def _deepseek_fp8_1_128_dim_m_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # dim=-2: reduce across M, output in transposed (K, M) layout.
+    return _deepseek_fp8_1_128_reference(x.transpose(-2, -1).contiguous())
+
+
 def _deepseek_fp8_128_128_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     *lead, D1, D2 = x.shape
@@ -69,6 +74,11 @@ def _rowwise_fp8_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return qdata, scale.squeeze(-1).to(torch.float32)
 
 
+def _rowwise_fp8_dim_m_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # dim=-2: reduce across M (becomes "rowwise" of the transposed input).
+    return _rowwise_fp8_reference(x.transpose(-2, -1).contiguous())
+
+
 deepseek_fp8_1_128 = Recipe(
     name="deepseek_fp8_1_128",
     block_size=128,
@@ -100,4 +110,26 @@ rowwise_fp8 = Recipe(
     amax_to_scale_fn=_rowwise_fp8_amax_to_scale_fn,
     cast_to_dtype_fn=_rowwise_fp8_cast_to_dtype_fn,
     reference_fn=_rowwise_fp8_reference,
+)
+
+deepseek_fp8_1_128_dim_m = Recipe(
+    name="deepseek_fp8_1_128_dim_m",
+    block_size=128,
+    dim=-2,
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float32,
+    amax_to_scale_fn=_deepseek_fp8_1_128_amax_to_scale_fn,
+    cast_to_dtype_fn=_deepseek_fp8_1_128_cast_to_dtype_fn,
+    reference_fn=_deepseek_fp8_1_128_dim_m_reference,
+)
+
+rowwise_fp8_dim_m = Recipe(
+    name="rowwise_fp8_dim_m",
+    block_size=-1,
+    dim=-2,
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float32,
+    amax_to_scale_fn=_rowwise_fp8_amax_to_scale_fn,
+    cast_to_dtype_fn=_rowwise_fp8_cast_to_dtype_fn,
+    reference_fn=_rowwise_fp8_dim_m_reference,
 )
