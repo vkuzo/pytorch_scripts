@@ -3,7 +3,7 @@ from typing import Callable, Tuple, Union
 import torch
 
 
-def flex_quant_dense(
+def flex_cast_quant_dense(
     # input tensor
     input: torch.Tensor,
     *,
@@ -13,8 +13,8 @@ def flex_quant_dense(
     # statically known output dtypes are nice
     qdata_dtype: torch.dtype,
     scale_dtype: torch.dtype,
-    # user defined function to go from scaling tile to single scale
-    calc_scale_fn: Callable,
+    # user defined function to go from amax of tile to single scale
+    amax_to_scale_fn: Callable,
     # user defined function to go from data tile + scale to value
     cast_to_dtype_fn: Callable,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -35,7 +35,8 @@ def flex_quant_dense(
         # rowwise scaling
 
         # entire row is one block; the trailing block dim equals input.shape[-1]
-        scale = calc_scale_fn(input)
+        amax = input.abs().amax(dim=-1, keepdim=True)
+        scale = amax_to_scale_fn(amax)
         qdata = cast_to_dtype_fn(input, scale)
 
     elif n_block_dims == 1:
@@ -52,7 +53,8 @@ def flex_quant_dense(
         n_blocks = last // block_size_int
         x_blocked = input.reshape(*lead, n_blocks, block_size_int)
 
-        scale = calc_scale_fn(x_blocked)
+        amax = x_blocked.abs().amax(dim=-1, keepdim=True)
+        scale = amax_to_scale_fn(amax)
         qdata_blocked = cast_to_dtype_fn(x_blocked, scale)
 
         qdata = qdata_blocked.reshape(*lead, last)
@@ -78,7 +80,8 @@ def flex_quant_dense(
             .reshape(*lead, n1, n2, B1 * B2)
         )
 
-        scale = calc_scale_fn(x_blocked)
+        amax = x_blocked.abs().amax(dim=-1, keepdim=True)
+        scale = amax_to_scale_fn(amax)
         qdata_blocked = cast_to_dtype_fn(x_blocked, scale)
 
         qdata = (
