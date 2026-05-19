@@ -263,6 +263,169 @@ def triton_fp8_blockwise_act_quant_transposed_lhs_kernel(
     tl.store(s_ptr + scale_offs, scale, mask=scale_mask)
 
 
+# ----------------------------------------------------------------------------
+# Naive rowwise quant kernel — written from scratch (not adapted from ao).
+# One program per row; two passes over K (amax, then cast). No autotune yet.
+# ----------------------------------------------------------------------------
+
+
+@triton.jit
+def triton_fp8_rowwise_quant_kernel(
+    x_ptr,
+    x_stride_dim_0,
+    x_stride_dim_1,
+    y_ptr,
+    y_stride_dim_0,
+    y_stride_dim_1,
+    s_ptr,
+    M,
+    K: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    amax_to_scale_fn: tl.constexpr,
+    cast_to_dtype_fn: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    if pid_m >= M:
+        return
+
+    # Pass 1: compute amax over the entire row.
+    amax = tl.zeros((), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_SIZE):
+        k_offs = k_start + tl.arange(0, BLOCK_SIZE)
+        k_mask = k_offs < K
+        offs = pid_m * x_stride_dim_0 + k_offs * x_stride_dim_1
+        x_chunk = tl.load(x_ptr + offs, mask=k_mask, other=0.0)
+        chunk_amax = tl.max(tl.abs(x_chunk))
+        amax = tl.maximum(amax, chunk_amax.to(tl.float32))
+
+    scale = amax_to_scale_fn(amax)
+    tl.store(s_ptr + pid_m, scale)
+
+    # Pass 2: cast each chunk using the scale.
+    for k_start in range(0, K, BLOCK_SIZE):
+        k_offs = k_start + tl.arange(0, BLOCK_SIZE)
+        k_mask = k_offs < K
+        x_offs = pid_m * x_stride_dim_0 + k_offs * x_stride_dim_1
+        x_chunk = tl.load(x_ptr + x_offs, mask=k_mask, other=0.0)
+        y_chunk = cast_to_dtype_fn(x_chunk, scale)
+        y_offs = pid_m * y_stride_dim_0 + k_offs * y_stride_dim_1
+        tl.store(y_ptr + y_offs, y_chunk, mask=k_mask)
+
+
+def triton_fp8_rowwise_quant(
+    x: torch.Tensor,
+    amax_to_scale_fn: Callable,
+    cast_to_dtype_fn: Callable,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert x.dim() == 2, "Input tensor must have 2 dimensions"
+    dtype = torch.float8_e4m3fn
+    M, K = x.size()
+    y = torch.empty_like(x, dtype=dtype)
+    s = x.new_empty(M, dtype=torch.float32)
+
+    # Naive: process the row in 256-element chunks. No autotune.
+    BLOCK_SIZE = 256
+
+    triton_fp8_rowwise_quant_kernel[(M,)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        s,
+        M,
+        K=K,
+        BLOCK_SIZE=BLOCK_SIZE,
+        amax_to_scale_fn=amax_to_scale_fn,
+        cast_to_dtype_fn=cast_to_dtype_fn,
+    )
+    return y, s
+
+
+# ----------------------------------------------------------------------------
+# Naive rowwise dim_m quant kernel — one program per K column, two passes over
+# M. Output qdata in (K, M) row-major, scale shape (K,). No autotune.
+# ----------------------------------------------------------------------------
+
+
+@triton.jit
+def triton_fp8_rowwise_quant_dim_m_kernel(
+    x_ptr,
+    x_stride_dim_0,
+    x_stride_dim_1,
+    y_ptr,
+    y_stride_dim_0,
+    y_stride_dim_1,
+    s_ptr,
+    M: tl.constexpr,
+    K,
+    BLOCK_SIZE: tl.constexpr,
+    amax_to_scale_fn: tl.constexpr,
+    cast_to_dtype_fn: tl.constexpr,
+):
+    pid_k = tl.program_id(axis=0)
+    if pid_k >= K:
+        return
+
+    # Pass 1: amax across M for column pid_k.
+    amax = tl.zeros((), dtype=tl.float32)
+    for m_start in range(0, M, BLOCK_SIZE):
+        m_offs = m_start + tl.arange(0, BLOCK_SIZE)
+        m_mask = m_offs < M
+        offs = m_offs * x_stride_dim_0 + pid_k * x_stride_dim_1
+        x_chunk = tl.load(x_ptr + offs, mask=m_mask, other=0.0)
+        chunk_amax = tl.max(tl.abs(x_chunk))
+        amax = tl.maximum(amax, chunk_amax.to(tl.float32))
+
+    scale = amax_to_scale_fn(amax)
+    tl.store(s_ptr + pid_k, scale)
+
+    # Pass 2: cast each chunk and write to (K, M) row-major output.
+    for m_start in range(0, M, BLOCK_SIZE):
+        m_offs = m_start + tl.arange(0, BLOCK_SIZE)
+        m_mask = m_offs < M
+        x_offs = m_offs * x_stride_dim_0 + pid_k * x_stride_dim_1
+        x_chunk = tl.load(x_ptr + x_offs, mask=m_mask, other=0.0)
+        y_chunk = cast_to_dtype_fn(x_chunk, scale)
+        # Output is (K, M) row-major: row pid_k, column m_offs.
+        y_offs = pid_k * y_stride_dim_0 + m_offs * y_stride_dim_1
+        tl.store(y_ptr + y_offs, y_chunk, mask=m_mask)
+
+
+def triton_fp8_rowwise_quant_dim_m(
+    x: torch.Tensor,
+    amax_to_scale_fn: Callable,
+    cast_to_dtype_fn: Callable,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert x.dim() == 2, "Input tensor must have 2 dimensions"
+    dtype = torch.float8_e4m3fn
+    M, K = x.size()
+    y = torch.empty(K, M, dtype=dtype, device=x.device)  # row-major (K, M)
+    s = x.new_empty(K, dtype=torch.float32)
+
+    # Naive: process the column in 256-element chunks. No autotune.
+    BLOCK_SIZE = 256
+
+    triton_fp8_rowwise_quant_dim_m_kernel[(K,)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        s,
+        M=M,
+        K=K,
+        BLOCK_SIZE=BLOCK_SIZE,
+        amax_to_scale_fn=amax_to_scale_fn,
+        cast_to_dtype_fn=cast_to_dtype_fn,
+    )
+    return y, s
+
+
 def triton_fp8_blockwise_act_quant_transposed_lhs(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,

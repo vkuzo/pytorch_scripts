@@ -176,7 +176,8 @@ deepseek_fp8_128_128_triton = Recipe(
 
 
 def _rowwise_fp8_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
-    return (amax.clamp(min=EPS) / FP8_MAX).to(torch.float32)
+    # fp32-throughout (matches the deepseek family).
+    return amax.clamp(min=EPS).to(torch.float32) / FP8_MAX
 
 
 def _rowwise_fp8_cast_to_dtype_fn(
@@ -186,8 +187,24 @@ def _rowwise_fp8_cast_to_dtype_fn(
     return y.to(torch.float8_e4m3fn)
 
 
+@triton.jit
+def rowwise_fp8_amax_to_scale_fn_triton(amax):
+    EPS: tl.constexpr = 1e-12
+    FP8_MAX_C: tl.constexpr = 448.0
+    amax_fp32 = tl.maximum(amax.to(tl.float32), EPS)
+    return amax_fp32 / FP8_MAX_C
+
+
+@triton.jit
+def rowwise_fp8_cast_to_dtype_fn_triton(tile, scale):
+    y = tile / scale
+    return y.to(tl.float8e4nv)
+
+
 def _rowwise_fp8_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = (x.abs().amax(dim=-1, keepdim=True).clamp(min=EPS) / FP8_MAX).to(torch.float32)
+    # fp32-throughout (matches the deepseek family).
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=EPS).to(torch.float32)
+    scale = amax / FP8_MAX
     qdata = (x / scale).to(torch.float8_e4m3fn)
     return qdata, scale.squeeze(-1)
 
@@ -201,6 +218,20 @@ rowwise_fp8 = Recipe(
     amax_to_scale_fn=_rowwise_fp8_amax_to_scale_fn,
     cast_to_dtype_fn=_rowwise_fp8_cast_to_dtype_fn,
     reference_fn=_rowwise_fp8_reference,
+)
+
+rowwise_fp8_triton = Recipe(
+    name="rowwise_fp8_triton",
+    block_size=-1,
+    dim=-1,
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float32,
+    amax_to_scale_fn=_rowwise_fp8_amax_to_scale_fn,
+    cast_to_dtype_fn=_rowwise_fp8_cast_to_dtype_fn,
+    reference_fn=_rowwise_fp8_reference,
+    amax_to_scale_fn_triton=rowwise_fp8_amax_to_scale_fn_triton,
+    cast_to_dtype_fn_triton=rowwise_fp8_cast_to_dtype_fn_triton,
+    use_triton_kernel=True,
 )
 
 
@@ -218,4 +249,18 @@ rowwise_fp8_dim_m = Recipe(
     amax_to_scale_fn=_rowwise_fp8_amax_to_scale_fn,
     cast_to_dtype_fn=_rowwise_fp8_cast_to_dtype_fn,
     reference_fn=_rowwise_fp8_dim_m_reference,
+)
+
+rowwise_fp8_dim_m_triton = Recipe(
+    name="rowwise_fp8_dim_m_triton",
+    block_size=-1,
+    dim=-2,
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float32,
+    amax_to_scale_fn=_rowwise_fp8_amax_to_scale_fn,
+    cast_to_dtype_fn=_rowwise_fp8_cast_to_dtype_fn,
+    reference_fn=_rowwise_fp8_dim_m_reference,
+    amax_to_scale_fn_triton=rowwise_fp8_amax_to_scale_fn_triton,
+    cast_to_dtype_fn_triton=rowwise_fp8_cast_to_dtype_fn_triton,
+    use_triton_kernel=True,
 )
