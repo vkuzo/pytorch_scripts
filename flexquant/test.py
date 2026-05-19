@@ -12,6 +12,7 @@ from recipes import (
     deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_1_128_triton,
     deepseek_fp8_128_128,
+    deepseek_fp8_128_128_hop,
     deepseek_fp8_128_128_triton,
 )
 
@@ -22,6 +23,7 @@ RECIPES = [
     deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_128_128,
     deepseek_fp8_128_128_triton,
+    deepseek_fp8_128_128_hop,
 ]
 
 
@@ -37,6 +39,7 @@ def _call(recipe: Recipe, x: torch.Tensor, fn=flex_cast_quant_dense):
         use_triton_kernel=recipe.use_triton_kernel,
         amax_to_scale_fn_triton=recipe.amax_to_scale_fn_triton,
         cast_to_dtype_fn_triton=recipe.cast_to_dtype_fn_triton,
+        use_hop_path=recipe.use_hop_path,
     )
 
 

@@ -10,6 +10,7 @@ from recipes import (
     deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_1_128_triton,
     deepseek_fp8_128_128,
+    deepseek_fp8_128_128_hop,
     deepseek_fp8_128_128_triton,
 )
 
@@ -24,6 +25,7 @@ RECIPES_BY_NAME = {
         deepseek_fp8_1_128_dim_m_triton,
         deepseek_fp8_128_128,
         deepseek_fp8_128_128_triton,
+        deepseek_fp8_128_128_hop,
     )
 }
 
@@ -56,6 +58,7 @@ def _bench_one(
             use_triton_kernel=recipe_obj.use_triton_kernel,
             amax_to_scale_fn_triton=recipe_obj.amax_to_scale_fn_triton,
             cast_to_dtype_fn_triton=recipe_obj.cast_to_dtype_fn_triton,
+            use_hop_path=recipe_obj.use_hop_path,
         )
 
     qdata, scale = run()
