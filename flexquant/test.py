@@ -13,10 +13,6 @@ from recipes import (
     deepseek_fp8_1_128_triton,
     deepseek_fp8_128_128,
     deepseek_fp8_128_128_triton,
-    rowwise_fp8,
-    rowwise_fp8_dim_m,
-    rowwise_fp8_dim_m_triton,
-    rowwise_fp8_triton,
 )
 
 RECIPES = [
@@ -26,10 +22,6 @@ RECIPES = [
     deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_128_128,
     deepseek_fp8_128_128_triton,
-    rowwise_fp8,
-    rowwise_fp8_triton,
-    rowwise_fp8_dim_m,
-    rowwise_fp8_dim_m_triton,
 ]
 
 

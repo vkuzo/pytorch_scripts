@@ -6,8 +6,6 @@ from triton_kernels import (
     triton_fp8_blockwise_act_quant_lhs,
     triton_fp8_blockwise_act_quant_transposed_lhs,
     triton_fp8_blockwise_weight_quant_128_128,
-    triton_fp8_rowwise_quant,
-    triton_fp8_rowwise_quant_dim_m,
 )
 
 
@@ -43,13 +41,9 @@ def flex_cast_quant_dense(
     - **2D blocked** ``block_size: tuple[int, int]``, ``dim=(-2, -1)``
       - qdata is `(M, K)`, scale is `(M // B1, K // B2)`.
 
-    - **Rowwise**: ``block_size=-1``, ``dim: int``
-      - dim=-1: output qdata is `(M, K)`, scale is `(M, 1)`
-      - dim=-2: output qdata is '(K, M)`, scale is `(K, 1)`
-
     Args:
         input: 2D contiguous tensor.
-        block_size: tile size along ``dim`` (or ``-1`` for whole-row scaling).
+        block_size: tile size along ``dim``.
         dim: dimension(s) the tile spans.
         qdata_dtype: dtype of returned qdata. Statically known to enable
             template specialization.
@@ -146,52 +140,6 @@ def flex_cast_quant_dense(
                 scale = scale_bc.squeeze(-2).transpose(-2, -1).contiguous()
         else:
             raise AssertionError(f"unsupported dim={dim} for 1D blocks")
-
-    elif n_block_dims == 1 and block_size_t == (-1,):
-        # rowwise scaling (entire row is one block)
-
-        if normalized_dim_t == (1,):
-            # dim=-1: reduce across K; output qdata in (M, K), scale shape (M,)
-            if (
-                use_triton_kernel
-                and qdata_dtype == torch.float8_e4m3fn
-                and scale_dtype == torch.float32
-            ):
-                assert amax_to_scale_fn_triton is not None
-                assert cast_to_dtype_fn_triton is not None
-                qdata, scale = triton_fp8_rowwise_quant(
-                    input, amax_to_scale_fn_triton, cast_to_dtype_fn_triton
-                )
-            else:
-                assert not use_triton_kernel, (
-                    "use_triton_kernel for rowwise dim=-1 only supports fp8_e4m3fn + fp32"
-                )
-                amax = input.abs().amax(dim=-1, keepdim=True)  # (M, 1)
-                scale_bc = amax_to_scale_fn(amax)
-                qdata = cast_to_dtype_fn(input, scale_bc)
-                scale = scale_bc.squeeze(-1)
-        elif normalized_dim_t == (0,):
-            # dim=-2: reduce across M; output qdata in (K, M), scale shape (K,)
-            if (
-                use_triton_kernel
-                and qdata_dtype == torch.float8_e4m3fn
-                and scale_dtype == torch.float32
-            ):
-                assert amax_to_scale_fn_triton is not None
-                assert cast_to_dtype_fn_triton is not None
-                qdata, scale = triton_fp8_rowwise_quant_dim_m(
-                    input, amax_to_scale_fn_triton, cast_to_dtype_fn_triton
-                )
-            else:
-                assert not use_triton_kernel, (
-                    "use_triton_kernel for rowwise dim=-2 only supports fp8_e4m3fn + fp32"
-                )
-                amax = input.abs().amax(dim=-2, keepdim=True)  # (1, K)
-                scale_bc = amax_to_scale_fn(amax)
-                qdata = cast_to_dtype_fn(input, scale_bc).transpose(-2, -1).contiguous()
-                scale = scale_bc.squeeze(-2)
-        else:
-            raise AssertionError(f"unsupported dim={dim} for rowwise scaling")
 
     elif n_block_dims == 2:
         # 2D blocked scaling; tile is flattened to a single trailing dim so callbacks

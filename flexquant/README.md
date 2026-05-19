@@ -18,7 +18,6 @@ Implemented so far:
 * `flex_cast_quant_dense` API with the following recipes:
   * fp8 deepseek 1x128
   * fp8 deepseek 128x128
-  * fp8 rowwise
 * scaling across dim=-1 and dim=-2
 * a triton template for 128x128 blockwise, torch.compile path for all others
 
