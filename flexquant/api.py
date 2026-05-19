@@ -2,6 +2,8 @@ from typing import Callable, Tuple, Union
 
 import torch
 
+from triton_kernels import triton_fp8_blockwise_weight_quant_128_128
+
 
 def flex_cast_quant_dense(
     # input tensor
@@ -17,6 +19,12 @@ def flex_cast_quant_dense(
     amax_to_scale_fn: Callable,
     # user defined function to go from data tile + scale to value
     cast_to_dtype_fn: Callable,
+    # if True, route to a hand-written Triton kernel instead of the
+    # compile-friendly reference path (only deepseek 128x128 supported)
+    use_triton_kernel: bool = False,
+    # Triton-flavored callbacks; required when use_triton_kernel=True
+    amax_to_scale_fn_triton: Callable | None = None,
+    cast_to_dtype_fn_triton: Callable | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert input.ndim == 2
     assert input.is_contiguous()
@@ -37,6 +45,9 @@ def flex_cast_quant_dense(
 
     if n_block_dims == 1 and block_size_t[0] > 0:
         # 1D blocked scaling
+        assert not use_triton_kernel, (
+            "use_triton_kernel only supports 128x128 deepseek for 2D blocks"
+        )
         block_size_int = block_size_t[0]
         if normalized_dim_t == (1,):
             # dim=-1: reduce across K; output qdata in (M, K), scale in (M, n_blocks)
@@ -69,6 +80,9 @@ def flex_cast_quant_dense(
 
     elif n_block_dims == 1 and block_size_t == (-1,):
         # rowwise scaling (entire row is one block)
+        assert not use_triton_kernel, (
+            "use_triton_kernel only supports 128x128 deepseek for 2D blocks"
+        )
         if normalized_dim_t == (1,):
             # dim=-1: reduce across K; output qdata in (M, K), scale shape (M,)
             amax = input.abs().amax(dim=-1, keepdim=True)  # (M, 1)
@@ -94,25 +108,40 @@ def flex_cast_quant_dense(
             assert M % B1 == 0 and K % B2 == 0, (
                 f"input trailing dims {(M, K)} must be divisible by block_size={(B1, B2)}"
             )
-            n1, n2 = M // B1, K // B2
+            if (
+                use_triton_kernel
+                and (B1, B2) == (128, 128)
+                and qdata_dtype == torch.float8_e4m3fn
+                and scale_dtype == torch.float32
+            ):
+                assert amax_to_scale_fn_triton is not None
+                assert cast_to_dtype_fn_triton is not None
+                qdata, scale = triton_fp8_blockwise_weight_quant_128_128(
+                    input, amax_to_scale_fn_triton, cast_to_dtype_fn_triton
+                )
+            else:
+                assert not use_triton_kernel, (
+                    "use_triton_kernel only supports 128x128 deepseek for 2D blocks"
+                )
+                n1, n2 = M // B1, K // B2
 
-            # (M, K) -> (n1, B1, n2, B2) -> (n1, n2, B1, B2) -> (n1, n2, B1*B2)
-            x_b = (
-                input.reshape(n1, B1, n2, B2)
-                .transpose(-3, -2)
-                .contiguous()
-                .reshape(n1, n2, B1 * B2)
-            )
-            amax = x_b.abs().amax(dim=-1, keepdim=True)
-            scale_bc = amax_to_scale_fn(amax)
-            qdata_b = cast_to_dtype_fn(x_b, scale_bc)
-            qdata = (
-                qdata_b.reshape(n1, n2, B1, B2)
-                .transpose(-3, -2)
-                .contiguous()
-                .reshape(M, K)
-            )
-            scale = scale_bc.squeeze(-1).to(scale_dtype)
+                # (M, K) -> (n1, B1, n2, B2) -> (n1, n2, B1, B2) -> (n1, n2, B1*B2)
+                x_b = (
+                    input.reshape(n1, B1, n2, B2)
+                    .transpose(-3, -2)
+                    .contiguous()
+                    .reshape(n1, n2, B1 * B2)
+                )
+                amax = x_b.abs().amax(dim=-1, keepdim=True)
+                scale_bc = amax_to_scale_fn(amax)
+                qdata_b = cast_to_dtype_fn(x_b, scale_bc)
+                qdata = (
+                    qdata_b.reshape(n1, n2, B1, B2)
+                    .transpose(-3, -2)
+                    .contiguous()
+                    .reshape(M, K)
+                )
+                scale = scale_bc.squeeze(-1).to(scale_dtype)
         else:
             raise AssertionError(f"unsupported dim={dim} for 2D blocks")
 

@@ -10,6 +10,7 @@ from recipes import (
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,
     deepseek_fp8_128_128,
+    deepseek_fp8_128_128_triton,
     rowwise_fp8,
     rowwise_fp8_dim_m,
 )
@@ -18,9 +19,25 @@ RECIPES = [
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,
     deepseek_fp8_128_128,
+    deepseek_fp8_128_128_triton,
     rowwise_fp8,
     rowwise_fp8_dim_m,
 ]
+
+
+def _call(recipe: Recipe, x: torch.Tensor, fn=flex_cast_quant_dense):
+    return fn(
+        x,
+        block_size=recipe.block_size,
+        dim=recipe.dim,
+        qdata_dtype=recipe.qdata_dtype,
+        scale_dtype=recipe.scale_dtype,
+        amax_to_scale_fn=recipe.amax_to_scale_fn,
+        cast_to_dtype_fn=recipe.cast_to_dtype_fn,
+        use_triton_kernel=recipe.use_triton_kernel,
+        amax_to_scale_fn_triton=recipe.amax_to_scale_fn_triton,
+        cast_to_dtype_fn_triton=recipe.cast_to_dtype_fn_triton,
+    )
 
 
 @pytest.mark.parametrize("recipe", RECIPES, ids=[r.name for r in RECIPES])
@@ -28,46 +45,27 @@ def test_eager_vs_reference(recipe: Recipe):
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_cast_quant_dense(
-        x,
-        block_size=recipe.block_size,
-        dim=recipe.dim,
-        qdata_dtype=recipe.qdata_dtype,
-        scale_dtype=recipe.scale_dtype,
-        amax_to_scale_fn=recipe.amax_to_scale_fn,
-        cast_to_dtype_fn=recipe.cast_to_dtype_fn,
-    )
+    qdata, scale = _call(recipe, x)
     qdata_ref, scale_ref = recipe.reference_fn(x)
 
     assert torch.equal(qdata.to(torch.float32), qdata_ref.to(torch.float32))
     assert torch.equal(scale, scale_ref)
 
 
-@pytest.mark.parametrize("recipe", RECIPES, ids=[r.name for r in RECIPES])
+@pytest.mark.parametrize(
+    "recipe",
+    [r for r in RECIPES if not r.use_triton_kernel],
+    ids=[r.name for r in RECIPES if not r.use_triton_kernel],
+)
 def test_eager_vs_compile(recipe: Recipe):
+    # Skipped for triton-backed recipes; they bypass torch.compile.
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    qdata_eager, scale_eager = flex_cast_quant_dense(
-        x,
-        block_size=recipe.block_size,
-        dim=recipe.dim,
-        qdata_dtype=recipe.qdata_dtype,
-        scale_dtype=recipe.scale_dtype,
-        amax_to_scale_fn=recipe.amax_to_scale_fn,
-        cast_to_dtype_fn=recipe.cast_to_dtype_fn,
-    )
+    qdata_eager, scale_eager = _call(recipe, x)
 
     compiled = torch.compile(flex_cast_quant_dense, fullgraph=True)
-    qdata_compiled, scale_compiled = compiled(
-        x,
-        block_size=recipe.block_size,
-        dim=recipe.dim,
-        qdata_dtype=recipe.qdata_dtype,
-        scale_dtype=recipe.scale_dtype,
-        amax_to_scale_fn=recipe.amax_to_scale_fn,
-        cast_to_dtype_fn=recipe.cast_to_dtype_fn,
-    )
+    qdata_compiled, scale_compiled = _call(recipe, x, fn=compiled)
 
     # Inductor may reorder fp ops, causing tiny scale drift that flips a small
     # fraction of fp8 values by one quantization bin. Compare with tolerances
