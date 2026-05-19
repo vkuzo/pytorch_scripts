@@ -6,26 +6,64 @@ from triton_kernels import triton_fp8_blockwise_weight_quant_128_128
 
 
 def flex_cast_quant_dense(
-    # input tensor
     input: torch.Tensor,
     *,
-    # block_size and dim define the scaling
     block_size: Union[int, Tuple[int, int]],
     dim: Union[int, Tuple[int, int]],
-    # statically known output dtypes are nice
     qdata_dtype: torch.dtype,
     scale_dtype: torch.dtype,
-    # user defined function to go from amax of tile to single scale
     amax_to_scale_fn: Callable,
-    # user defined function to go from data tile + scale to value
     cast_to_dtype_fn: Callable,
-    # if True, route to a hand-written Triton kernel instead of the
-    # compile-friendly reference path (only deepseek 128x128 supported)
+    # the arguments below are temporary and should be removed from the final
+    # version of this API
     use_triton_kernel: bool = False,
-    # Triton-flavored callbacks; required when use_triton_kernel=True
     amax_to_scale_fn_triton: Callable | None = None,
     cast_to_dtype_fn_triton: Callable | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2D tensor with user-defined per-tile scaling.
+
+    The framework owns the layout-sensitive parts of quantization (which
+    elements form a tile, how the tile reduction is computed, and how qdata
+    and scale outputs are laid out in memory). The user owns two pointwise
+    callbacks: how to turn a tile's amax into a scale, and how to cast a tile
+    given its scale.
+
+    Tiles are defined by ``block_size`` and ``dim``. Supported shapes:
+
+    - **1D blocked**: ``block_size: int``, ``dim: int``
+      - dim=-1: output qdata is `(M, K)`, scale is `(M, K // block_size)`
+      - dim=-2: output qdata is `(K, M)`, scale is `(K, M // block_size)`
+
+    - **2D blocked** ``block_size: tuple[int, int]``, ``dim=(-2, -1)``
+      - qdata is `(M, K)`, scale is `(M // B1, K // B2)`.
+
+    - **Rowwise**: ``block_size=-1``, ``dim: int``
+      - dim=-1: output qdata is `(M, K)`, scale is `(M, 1)`
+      - dim=-2: output qdata is '(K, M)`, scale is `(K, 1)`
+
+    Args:
+        input: 2D contiguous tensor.
+        block_size: tile size along ``dim`` (or ``-1`` for whole-row scaling).
+        dim: dimension(s) the tile spans.
+        qdata_dtype: dtype of returned qdata. Statically known to enable
+            template specialization.
+        scale_dtype: dtype of returned scale.
+        amax_to_scale_fn: ``(amax) -> scale``. Called by the framework on the
+            per-tile amax it computed. Must be a pure pointwise op.
+        cast_to_dtype_fn: ``(tile, scale) -> qdata``. Called per-tile to
+            produce the quantized values. Must be a pure pointwise op.
+        use_triton_kernel: if True, route to a hand-written Triton kernel
+            instead of the compile-friendly path. Currently only the 128x128
+            deepseek fp8 recipe has a Triton template; other recipes assert.
+        amax_to_scale_fn_triton: `@triton.jit` version of amax_to_scale_fn, this
+            is temporary to avoid dealing with HOPs for now
+        cast_to_dtype_fn_triton: `@triton.jit` version of cast_to_dtype_fn, this
+            is temporary to avoid dealing with HOPs for now
+
+    Returns:
+        ``(qdata, scale)`` with dtypes ``qdata_dtype`` / ``scale_dtype`` and
+        the layouts described above.
+    """
     assert input.ndim == 2
     assert input.is_contiguous()
 
@@ -34,20 +72,18 @@ def flex_cast_quant_dense(
     assert len(block_size_t) == len(dim_t)
 
     n_block_dims = len(block_size_t)
+    # normalized_dim_t can be either (0,), (1,) or (0, 1)
     normalized_dim_t = tuple(d if d >= 0 else d + input.ndim for d in dim_t)
     M, K = input.shape
 
-    # TODO(future): more interesting cases, such as:
-    # 1. scale swizzling
-    # 2. grouped variants with offsets
-    # 3. padding and other edge cases
-    # 4. actual lowering to templates, to beat the compiler
+    # TODO(future):
+    # * scale swizzling
+    # * padding and other edge cases
 
     if n_block_dims == 1 and block_size_t[0] > 0:
         # 1D blocked scaling
-        assert not use_triton_kernel, (
-            "use_triton_kernel only supports 128x128 deepseek for 2D blocks"
-        )
+
+        assert not use_triton_kernel, "unsupported"
         block_size_int = block_size_t[0]
         if normalized_dim_t == (1,):
             # dim=-1: reduce across K; output qdata in (M, K), scale in (M, n_blocks)
@@ -60,7 +96,7 @@ def flex_cast_quant_dense(
             scale_bc = amax_to_scale_fn(amax)
             qdata_b = cast_to_dtype_fn(x_b, scale_bc)
             qdata = qdata_b.reshape(M, K)
-            scale = scale_bc.squeeze(-1).to(scale_dtype)
+            scale = scale_bc.squeeze(-1)
         elif normalized_dim_t == (0,):
             # dim=-2: reduce across M; output qdata/scale row-major in (K, M) layout
             assert M % block_size_int == 0, (
@@ -72,36 +108,33 @@ def flex_cast_quant_dense(
             scale_bc = amax_to_scale_fn(amax)
             qdata_b = cast_to_dtype_fn(x_b, scale_bc)
             qdata = qdata_b.reshape(M, K).transpose(-2, -1).contiguous()
-            scale = (
-                scale_bc.squeeze(-2).transpose(-2, -1).contiguous().to(scale_dtype)
-            )
+            scale = scale_bc.squeeze(-2).transpose(-2, -1).contiguous()
         else:
             raise AssertionError(f"unsupported dim={dim} for 1D blocks")
 
     elif n_block_dims == 1 and block_size_t == (-1,):
         # rowwise scaling (entire row is one block)
-        assert not use_triton_kernel, (
-            "use_triton_kernel only supports 128x128 deepseek for 2D blocks"
-        )
+
+        assert not use_triton_kernel, "unsupported"
         if normalized_dim_t == (1,):
             # dim=-1: reduce across K; output qdata in (M, K), scale shape (M,)
             amax = input.abs().amax(dim=-1, keepdim=True)  # (M, 1)
             scale_bc = amax_to_scale_fn(amax)
             qdata = cast_to_dtype_fn(input, scale_bc)
-            scale = scale_bc.squeeze(-1).to(scale_dtype)
+            scale = scale_bc.squeeze(-1)
         elif normalized_dim_t == (0,):
             # dim=-2: reduce across M; output qdata in (K, M), scale shape (K,)
             amax = input.abs().amax(dim=-2, keepdim=True)  # (1, K)
             scale_bc = amax_to_scale_fn(amax)
             qdata = cast_to_dtype_fn(input, scale_bc).transpose(-2, -1).contiguous()
-            scale = scale_bc.squeeze(-2).to(scale_dtype)
+            scale = scale_bc.squeeze(-2)
         else:
             raise AssertionError(f"unsupported dim={dim} for rowwise scaling")
 
     elif n_block_dims == 2:
         # 2D blocked scaling; tile is flattened to a single trailing dim so callbacks
         # designed for 1D blocks work as-is.
-        # Note: likely to be slow with the current reference implementation
+
         if normalized_dim_t == (0, 1):
             B1, B2 = block_size_t
             assert B1 > 0 and B2 > 0
@@ -141,7 +174,8 @@ def flex_cast_quant_dense(
                     .contiguous()
                     .reshape(M, K)
                 )
-                scale = scale_bc.squeeze(-1).to(scale_dtype)
+                scale = scale_bc.squeeze(-1)
+
         else:
             raise AssertionError(f"unsupported dim={dim} for 2D blocks")
 

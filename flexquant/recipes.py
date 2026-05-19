@@ -24,11 +24,14 @@ class Recipe(NamedTuple):
 
 
 def _fp8_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
-    return amax / torch.finfo(torch.float8_e4m3fn).max
+    # Recipe owns the cast to scale_dtype (torch.float32).
+    return (amax / torch.finfo(torch.float8_e4m3fn).max).to(torch.float32)
 
 
 def _fp8_cast_to_dtype_fn(tile: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return (tile / scale).to(torch.float8_e4m3fn)
+    # Bring scale back to the tile dtype so the divide happens at tile precision
+    # (matches the reference's bf16/bf16 -> bf16 -> fp8 chain).
+    return (tile / scale.to(tile.dtype)).to(torch.float8_e4m3fn)
 
 
 # Triton-flavored versions of the deepseek fp8 callbacks. The kernel template in
@@ -41,21 +44,26 @@ def _fp8_cast_to_dtype_fn(tile: torch.Tensor, scale: torch.Tensor) -> torch.Tens
 
 @triton.jit
 def deepseek_fp8_amax_to_scale_fn_triton(amax):
-    # Mirrors `_fp8_amax_to_scale_fn` above: amax / FP8_MAX in the input dtype.
+    # Mirrors `_fp8_amax_to_scale_fn` above: divide in the input dtype, then
+    # cast to fp32 for storage (recipe owns the scale_dtype cast).
     # TODO(future) fix this: production clamps amax with EPS=1e-12 and computes
     # the scale in fp64. Our reference does neither.
     FP8_MAX: tl.constexpr = 448.0
     fp8_max = tl.full((), FP8_MAX, dtype=amax.dtype)
-    return (amax / fp8_max).to(amax.dtype).to(tl.float32).to(amax.dtype)
+    scale_in_dtype = (amax / fp8_max).to(amax.dtype).to(tl.float32).to(amax.dtype)
+    return scale_in_dtype.to(tl.float32)
 
 
 @triton.jit
 def deepseek_fp8_cast_to_dtype_fn_triton(tile, scale):
-    # Mirrors `_fp8_cast_to_dtype_fn` above: (tile / scale).to(fp8).
+    # Mirrors `_fp8_cast_to_dtype_fn` above. Scale arrives in fp32 (the recipe's
+    # scale_dtype); cast back to tile.dtype so the divide happens at tile
+    # precision, matching the reference's bf16/bf16 -> bf16 -> fp8 chain.
     # TODO(future) fix this: production stores reciprocal scale and multiplies
     # tile by it; production also clamps the result to [-FP8_MAX, FP8_MAX]
     # before the fp8 cast. Our reference does neither.
-    y = (tile / scale).to(tile.dtype).to(tl.float32).to(tile.dtype)
+    scale_in_dtype = scale.to(tile.dtype).to(tl.float32).to(tile.dtype)
+    y = (tile / scale_in_dtype).to(tile.dtype).to(tl.float32).to(tile.dtype)
     return y.to(tl.float8e4nv)
 
 
