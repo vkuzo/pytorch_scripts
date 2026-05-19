@@ -9,6 +9,8 @@ from recipes import (
     Recipe,
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,
+    deepseek_fp8_1_128_dim_m_triton,
+    deepseek_fp8_1_128_triton,
     deepseek_fp8_128_128,
     deepseek_fp8_128_128_triton,
     rowwise_fp8,
@@ -17,7 +19,9 @@ from recipes import (
 
 RECIPES = [
     deepseek_fp8_1_128,
+    deepseek_fp8_1_128_triton,
     deepseek_fp8_1_128_dim_m,
+    deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_128_128,
     deepseek_fp8_128_128_triton,
     rowwise_fp8,

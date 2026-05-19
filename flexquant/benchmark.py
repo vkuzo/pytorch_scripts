@@ -7,6 +7,8 @@ from recipes import (
     Recipe,
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,
+    deepseek_fp8_1_128_dim_m_triton,
+    deepseek_fp8_1_128_triton,
     deepseek_fp8_128_128,
     deepseek_fp8_128_128_triton,
     rowwise_fp8,
@@ -19,7 +21,9 @@ RECIPES_BY_NAME = {
     r.name: r
     for r in (
         deepseek_fp8_1_128,
+        deepseek_fp8_1_128_triton,
         deepseek_fp8_1_128_dim_m,
+        deepseek_fp8_1_128_dim_m_triton,
         deepseek_fp8_128_128,
         deepseek_fp8_128_128_triton,
         rowwise_fp8,
@@ -87,12 +91,12 @@ def main(
         names = list(RECIPES_BY_NAME)
 
     print(f"shape: ({M}, {K}) bfloat16")
-    print(f"{'recipe':<30} {'time (ms)':>10} {'GB/s':>10} {'% peak':>8}")
+    print(f"{'recipe':<31} {'time (ms)':>10} {'GB/s':>10} {'% peak':>8}")
     for name in names:
         avg_ms, gbps, pct_peak = _bench_one(
             RECIPES_BY_NAME[name], M, K, warmup_ms, rep_ms
         )
-        print(f"{name:<30} {avg_ms:>10.4f} {gbps:>10.1f} {pct_peak:>7.1f}%")
+        print(f"{name:<31} {avg_ms:>10.4f} {gbps:>10.1f} {pct_peak:>7.1f}%")
 
 
 if __name__ == "__main__":
