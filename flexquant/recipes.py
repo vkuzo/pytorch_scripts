@@ -1,6 +1,8 @@
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 
 class Recipe(NamedTuple):
@@ -12,6 +14,13 @@ class Recipe(NamedTuple):
     amax_to_scale_fn: Callable
     cast_to_dtype_fn: Callable
     reference_fn: Callable
+    # Triton-flavored callbacks for the use_triton_kernel path. Optional —
+    # only recipes with a corresponding template need to provide them.
+    amax_to_scale_fn_triton: Optional[Callable] = None
+    cast_to_dtype_fn_triton: Optional[Callable] = None
+    # When True, route this recipe through its hand-written Triton kernel
+    # rather than the compile-friendly reference path.
+    use_triton_kernel: bool = False
 
 
 def _fp8_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
@@ -20,6 +29,34 @@ def _fp8_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
 
 def _fp8_cast_to_dtype_fn(tile: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (tile / scale).to(torch.float8_e4m3fn)
+
+
+# Triton-flavored versions of the deepseek fp8 callbacks. The kernel template in
+# triton_kernels.py owns the layout-sensitive parts (load tile, reduce amax,
+# store qdata + scale); these jit functions express the recipe-specific
+# pointwise logic. Triton keeps register values in fp32 even when typed as a
+# narrower dtype, so the .to(bf16)/.to(fp32) round-trips force actual rounding
+# to match the eager reference bit-for-bit.
+
+
+@triton.jit
+def deepseek_fp8_amax_to_scale_fn_triton(amax):
+    # Mirrors `_fp8_amax_to_scale_fn` above: amax / FP8_MAX in the input dtype.
+    # TODO(future) fix this: production clamps amax with EPS=1e-12 and computes
+    # the scale in fp64. Our reference does neither.
+    FP8_MAX: tl.constexpr = 448.0
+    fp8_max = tl.full((), FP8_MAX, dtype=amax.dtype)
+    return (amax / fp8_max).to(amax.dtype).to(tl.float32).to(amax.dtype)
+
+
+@triton.jit
+def deepseek_fp8_cast_to_dtype_fn_triton(tile, scale):
+    # Mirrors `_fp8_cast_to_dtype_fn` above: (tile / scale).to(fp8).
+    # TODO(future) fix this: production stores reciprocal scale and multiplies
+    # tile by it; production also clamps the result to [-FP8_MAX, FP8_MAX]
+    # before the fp8 cast. Our reference does neither.
+    y = (tile / scale).to(tile.dtype).to(tl.float32).to(tile.dtype)
+    return y.to(tl.float8e4nv)
 
 
 def _deepseek_fp8_1_128_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -78,6 +115,20 @@ deepseek_fp8_128_128 = Recipe(
     amax_to_scale_fn=_fp8_amax_to_scale_fn,
     cast_to_dtype_fn=_fp8_cast_to_dtype_fn,
     reference_fn=_deepseek_fp8_128_128_reference,
+)
+
+deepseek_fp8_128_128_triton = Recipe(
+    name="deepseek_fp8_128_128_triton",
+    block_size=(128, 128),
+    dim=(-2, -1),
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float32,
+    amax_to_scale_fn=_fp8_amax_to_scale_fn,
+    cast_to_dtype_fn=_fp8_cast_to_dtype_fn,
+    reference_fn=_deepseek_fp8_128_128_reference,
+    amax_to_scale_fn_triton=deepseek_fp8_amax_to_scale_fn_triton,
+    cast_to_dtype_fn_triton=deepseek_fp8_cast_to_dtype_fn_triton,
+    use_triton_kernel=True,
 )
 
 deepseek_fp8_1_128_dim_m = Recipe(
