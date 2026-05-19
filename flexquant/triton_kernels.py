@@ -54,8 +54,8 @@ def triton_fp8_blockwise_weight_quant_rhs_kernel(
     x = tl.load(x_ptr + x_offs, mask=x_mask)
 
     # Reduce amax in the input dtype, forcing bf16 rounding. The recipe's
-    # callbacks then take amax (input-dtype) → scale (input-dtype) and
-    # (tile, scale) → qdata (output-dtype).
+    # callbacks then take amax (input-dtype) → scale (recipe's scale_dtype)
+    # and (tile, scale) → qdata (output-dtype).
     amax = tl.max(tl.abs(x)).to(x.dtype).to(tl.float32).to(x.dtype)
     scale = amax_to_scale_fn(amax)
     y = cast_to_dtype_fn(x, scale)
@@ -65,10 +65,10 @@ def triton_fp8_blockwise_weight_quant_rhs_kernel(
     y_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(y_ptr + y_offs, y, mask=y_mask)
 
-    # Write scale (scalar value) cast up to fp32 for storage
+    # Write scale (scalar value); the callback already produced scale_dtype.
     scale_m_off = pid_m * s_stride_dim_0
     scale_n_off = pid_n * s_stride_dim_1
-    tl.store(s_ptr + scale_m_off + scale_n_off, scale.to(tl.float32))
+    tl.store(s_ptr + scale_m_off + scale_n_off, scale)
 
 
 def triton_fp8_blockwise_weight_quant_128_128(

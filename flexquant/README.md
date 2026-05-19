@@ -1,28 +1,35 @@
 # flexquant prototype
 
-Goal: unified flexible API for quantizing a tensor, backed by performant kernels
-Specifically:
-* tiling for calculating the scale is constrained by the API
-* function to calculate the scale from a tile is provided by the user (with constraints)
-* function to quantize a single value is provided by the user (with constraints)
-* the API either uses torch.compile to generate the kernel from scratch or lowers to a pre-selected template
+Goal: unified flexible API for quantizing a tensor, backed by performant kernels.
 
-100% clauded
+User provides:
+* spec for how to tile the tensor (currently with `block_size` and `dim`)
+* callables for how to calculate the scale (`amax_to_scale_fn`) and cast
+a datum to low precision (`cast_to_dtype_fn`)
+
+API handles behind the scenes:
+* tiling the tensor in preparation for calculating the scale
+* selecting from `torch.compile` or a manual kernel, based on what we expect
+  to be faster for the provided tiling spec
+
+99% clauded
 
 Implemented so far:
-* flex_cast_quant_dense API with support for single stage scaling
-* testing for the API for simplified deepseek 1x128, deepseek 128x128, float8 rowwise recipe stubs
-* torch.compile path only
-* dim=-1 and row-major output only
-* no scale swizzle
+* `flex_cast_quant_dense` API with the following recipes:
+  * fp8 deepseek 1x128
+  * fp8 deepseek 128x128
+  * fp8 rowwise
+* scaling across dim=-1 and dim=-2
+* a triton template for 128x128 blockwise, torch.compile path for all others
 
-Not implemented:
-* hierarchical scaling (nvfp4, etc)
+Not implemented yet:
+* hierarchical scaling (such as nvfp4)
 * zero_point
-* actual recipes (with epsilon, other edge case handling, etc)
-* actual templates to lower to for cases where compile is not going to generate a good kernel from scratch
+* battle tested recipes (with epsilon, other edge case handling, etc)
+* mx formats and nvfp4
+* scale swizzle
 
-Alternative 1: - just write custom kernels for every variant
+Alternative 1: - write custom kernels for every variant
   - main pro is simplicity
   - main con is maintainability
 Alternative 2: - just teach torch.compile to be good at all possible quantizations

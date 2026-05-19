@@ -87,12 +87,12 @@ def main(
         names = list(RECIPES_BY_NAME)
 
     print(f"shape: ({M}, {K}) bfloat16")
-    print(f"{'recipe':<25} {'time (ms)':>10} {'GB/s':>10} {'% peak':>8}")
+    print(f"{'recipe':<30} {'time (ms)':>10} {'GB/s':>10} {'% peak':>8}")
     for name in names:
         avg_ms, gbps, pct_peak = _bench_one(
             RECIPES_BY_NAME[name], M, K, warmup_ms, rep_ms
         )
-        print(f"{name:<25} {avg_ms:>10.4f} {gbps:>10.1f} {pct_peak:>7.1f}%")
+        print(f"{name:<30} {avg_ms:>10.4f} {gbps:>10.1f} {pct_peak:>7.1f}%")
 
 
 if __name__ == "__main__":
