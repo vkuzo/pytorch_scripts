@@ -13,6 +13,8 @@ from recipes import (
     deepseek_fp8_128_128_triton,
     rowwise_fp8,
     rowwise_fp8_dim_m,
+    rowwise_fp8_dim_m_triton,
+    rowwise_fp8_triton,
 )
 
 B200_PEAK_BW_GBPS = 8000.0  # 8 TB/s
@@ -27,7 +29,9 @@ RECIPES_BY_NAME = {
         deepseek_fp8_128_128,
         deepseek_fp8_128_128_triton,
         rowwise_fp8,
+        rowwise_fp8_triton,
         rowwise_fp8_dim_m,
+        rowwise_fp8_dim_m_triton,
     )
 }
 
