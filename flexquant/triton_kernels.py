@@ -264,11 +264,21 @@ def triton_fp8_blockwise_act_quant_transposed_lhs_kernel(
 
 
 # ----------------------------------------------------------------------------
-# Naive rowwise quant kernel — written from scratch (not adapted from ao).
-# One program per row; two passes over K (amax, then cast). No autotune yet.
+# Rowwise quant kernel. Single-pass: each program loads BLOCK_M whole rows
+# into registers, reduces to a per-row amax, and writes qdata in the same
+# pass. Autotuned over BLOCK_M, num_warps, num_stages.
 # ----------------------------------------------------------------------------
 
 
+rowwise_quant_configs = [
+    triton.Config({"BLOCK_M": bm}, num_warps=w, num_stages=s)
+    for bm in [1, 2, 4, 8]
+    for w in [4, 8, 16]
+    for s in [2, 3, 4]
+]
+
+
+@triton.autotune(configs=rowwise_quant_configs, key=["K"])
 @triton.jit
 def triton_fp8_rowwise_quant_kernel(
     x_ptr,
@@ -280,36 +290,28 @@ def triton_fp8_rowwise_quant_kernel(
     s_ptr,
     M,
     K: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     amax_to_scale_fn: tl.constexpr,
     cast_to_dtype_fn: tl.constexpr,
 ):
-    pid_m = tl.program_id(axis=0)
-    if pid_m >= M:
-        return
+    pid = tl.program_id(axis=0)
+    m_offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    k_offs = tl.arange(0, K)
+    m_mask = m_offs[:, None] < M
 
-    # Pass 1: compute amax over the entire row.
-    amax = tl.zeros((), dtype=tl.float32)
-    for k_start in range(0, K, BLOCK_SIZE):
-        k_offs = k_start + tl.arange(0, BLOCK_SIZE)
-        k_mask = k_offs < K
-        offs = pid_m * x_stride_dim_0 + k_offs * x_stride_dim_1
-        x_chunk = tl.load(x_ptr + offs, mask=k_mask, other=0.0)
-        chunk_amax = tl.max(tl.abs(x_chunk))
-        amax = tl.maximum(amax, chunk_amax.to(tl.float32))
+    # Load BLOCK_M whole rows in one shot.
+    x_offs = m_offs[:, None] * x_stride_dim_0 + k_offs[None, :] * x_stride_dim_1
+    x = tl.load(x_ptr + x_offs, mask=m_mask, other=0.0)
 
+    # Per-row amax.
+    amax = tl.max(tl.abs(x), axis=1)
     scale = amax_to_scale_fn(amax)
-    tl.store(s_ptr + pid_m, scale)
 
-    # Pass 2: cast each chunk using the scale.
-    for k_start in range(0, K, BLOCK_SIZE):
-        k_offs = k_start + tl.arange(0, BLOCK_SIZE)
-        k_mask = k_offs < K
-        x_offs = pid_m * x_stride_dim_0 + k_offs * x_stride_dim_1
-        x_chunk = tl.load(x_ptr + x_offs, mask=k_mask, other=0.0)
-        y_chunk = cast_to_dtype_fn(x_chunk, scale)
-        y_offs = pid_m * y_stride_dim_0 + k_offs * y_stride_dim_1
-        tl.store(y_ptr + y_offs, y_chunk, mask=k_mask)
+    tl.store(s_ptr + m_offs, scale, mask=m_offs < M)
+
+    y = cast_to_dtype_fn(x, scale[:, None])
+    y_offs = m_offs[:, None] * y_stride_dim_0 + k_offs[None, :] * y_stride_dim_1
+    tl.store(y_ptr + y_offs, y, mask=m_mask)
 
 
 def triton_fp8_rowwise_quant(
@@ -324,10 +326,10 @@ def triton_fp8_rowwise_quant(
     y = torch.empty_like(x, dtype=dtype)
     s = x.new_empty(M, dtype=torch.float32)
 
-    # Naive: process the row in 256-element chunks. No autotune.
-    BLOCK_SIZE = 256
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]),)
 
-    triton_fp8_rowwise_quant_kernel[(M,)](
+    triton_fp8_rowwise_quant_kernel[grid](
         x,
         x.stride(0),
         x.stride(1),
@@ -337,7 +339,6 @@ def triton_fp8_rowwise_quant(
         s,
         M,
         K=K,
-        BLOCK_SIZE=BLOCK_SIZE,
         amax_to_scale_fn=amax_to_scale_fn,
         cast_to_dtype_fn=cast_to_dtype_fn,
     )
@@ -345,53 +346,116 @@ def triton_fp8_rowwise_quant(
 
 
 # ----------------------------------------------------------------------------
-# Naive rowwise dim_m quant kernel — one program per K column, two passes over
-# M. Output qdata in (K, M) row-major, scale shape (K,). No autotune.
+# Rowwise dim_m quant — output is (K, M) row-major, one fp32 scale per
+# column of the input. Two-kernel design so that all global memory access
+# is row-major-coalesced:
+#
+#   Pass 1 (amax): tile (BLOCK_M, BLOCK_K) row-major, reduce over M with a
+#                  fp32 buffer of column amaxes via atomic max.
+#   Pass 2 (cast): tile (BLOCK_M, BLOCK_K) row-major from x; in-kernel
+#                  amax→scale via the recipe callback; transpose, write
+#                  (BLOCK_K, BLOCK_M) row-major into the (K, M) output. Also
+#                  writes the per-column scale (only from pid_m == 0).
 # ----------------------------------------------------------------------------
 
 
+rowwise_quant_dim_m_amax_configs = [
+    triton.Config(
+        {"BLOCK_M": bm, "BLOCK_K": bk},
+        num_warps=w,
+        num_stages=s,
+    )
+    for bm in [512, 1024]
+    for bk in [128, 256]
+    for w in [4]
+    for s in [2, 3]
+]
+
+
+@triton.autotune(configs=rowwise_quant_dim_m_amax_configs, key=["M", "K"])
 @triton.jit
-def triton_fp8_rowwise_quant_dim_m_kernel(
+def _rowwise_quant_dim_m_amax_kernel(
     x_ptr,
     x_stride_dim_0,
     x_stride_dim_1,
-    y_ptr,
+    amax_ptr,  # fp32 (K,) output, pre-zeroed
+    M,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    k_offs = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = (m_offs[:, None] < M) & (k_offs[None, :] < K)
+
+    x_offs = m_offs[:, None] * x_stride_dim_0 + k_offs[None, :] * x_stride_dim_1
+    x = tl.load(x_ptr + x_offs, mask=mask, other=0.0)
+
+    # Per-column amax over the BLOCK_M rows in this tile.
+    tile_amax = tl.max(tl.abs(x), axis=0).to(tl.float32)
+
+    k_mask = k_offs < K
+    tl.atomic_max(amax_ptr + k_offs, tile_amax, mask=k_mask)
+
+
+rowwise_quant_dim_m_cast_configs = [
+    triton.Config(
+        {"BLOCK_M": bm, "BLOCK_K": bk},
+        num_warps=w,
+        num_stages=s,
+    )
+    for bm in [64, 128]
+    for bk in [128, 256]
+    for w in [8]
+    for s in [2, 3]
+]
+
+
+@triton.autotune(configs=rowwise_quant_dim_m_cast_configs, key=["M", "K"])
+@triton.jit
+def _rowwise_quant_dim_m_cast_kernel(
+    x_ptr,
+    x_stride_dim_0,
+    x_stride_dim_1,
+    y_ptr,  # (K, M) row-major
     y_stride_dim_0,
     y_stride_dim_1,
-    s_ptr,
-    M: tl.constexpr,
+    amax_ptr,  # (K,) fp32, populated by the amax kernel
+    s_ptr,  # (K,) fp32 forward scale (output)
+    M,
     K,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     amax_to_scale_fn: tl.constexpr,
     cast_to_dtype_fn: tl.constexpr,
 ):
-    pid_k = tl.program_id(axis=0)
-    if pid_k >= K:
-        return
+    pid_m = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    k_offs = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = k_offs < K
 
-    # Pass 1: amax across M for column pid_k.
-    amax = tl.zeros((), dtype=tl.float32)
-    for m_start in range(0, M, BLOCK_SIZE):
-        m_offs = m_start + tl.arange(0, BLOCK_SIZE)
-        m_mask = m_offs < M
-        offs = m_offs * x_stride_dim_0 + pid_k * x_stride_dim_1
-        x_chunk = tl.load(x_ptr + offs, mask=m_mask, other=0.0)
-        chunk_amax = tl.max(tl.abs(x_chunk))
-        amax = tl.maximum(amax, chunk_amax.to(tl.float32))
-
+    # Load the per-column amax produced by pass 1, then derive the scale
+    # via the recipe's amax→scale callback. Every program along the M axis
+    # recomputes the same scale (cheap, in-register), but only pid_m == 0
+    # writes it to the s_ptr output.
+    amax = tl.load(amax_ptr + k_offs, mask=k_mask, other=0.0)
     scale = amax_to_scale_fn(amax)
-    tl.store(s_ptr + pid_k, scale)
+    if pid_m == 0:
+        tl.store(s_ptr + k_offs, scale, mask=k_mask)
 
-    # Pass 2: cast each chunk and write to (K, M) row-major output.
-    for m_start in range(0, M, BLOCK_SIZE):
-        m_offs = m_start + tl.arange(0, BLOCK_SIZE)
-        m_mask = m_offs < M
-        x_offs = m_offs * x_stride_dim_0 + pid_k * x_stride_dim_1
-        x_chunk = tl.load(x_ptr + x_offs, mask=m_mask, other=0.0)
-        y_chunk = cast_to_dtype_fn(x_chunk, scale)
-        # Output is (K, M) row-major: row pid_k, column m_offs.
-        y_offs = pid_k * y_stride_dim_0 + m_offs * y_stride_dim_1
-        tl.store(y_ptr + y_offs, y_chunk, mask=m_mask)
+    in_mask = (m_offs[:, None] < M) & k_mask[None, :]
+    x_offs = m_offs[:, None] * x_stride_dim_0 + k_offs[None, :] * x_stride_dim_1
+    x = tl.load(x_ptr + x_offs, mask=in_mask, other=0.0)
+
+    y = cast_to_dtype_fn(x, scale[None, :])
+
+    # Output is (K, M) row-major: row k_offs, col m_offs.
+    y_offs = k_offs[:, None] * y_stride_dim_0 + m_offs[None, :] * y_stride_dim_1
+    out_mask = k_mask[:, None] & (m_offs[None, :] < M)
+    tl.store(y_ptr + y_offs, tl.trans(y, 1, 0), mask=out_mask)
 
 
 def triton_fp8_rowwise_quant_dim_m(
@@ -406,20 +470,35 @@ def triton_fp8_rowwise_quant_dim_m(
     y = torch.empty(K, M, dtype=dtype, device=x.device)  # row-major (K, M)
     s = x.new_empty(K, dtype=torch.float32)
 
-    # Naive: process the column in 256-element chunks. No autotune.
-    BLOCK_SIZE = 256
+    # Pre-zeroed amax buffer; atomic_max will accumulate column maxima.
+    amax_buf = torch.zeros(K, dtype=torch.float32, device=x.device)
 
-    triton_fp8_rowwise_quant_dim_m_kernel[(K,)](
+    def amax_grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(K, meta["BLOCK_K"]))
+
+    _rowwise_quant_dim_m_amax_kernel[amax_grid](
+        x,
+        x.stride(0),
+        x.stride(1),
+        amax_buf,
+        M,
+        K,
+    )
+
+    def cast_grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(K, meta["BLOCK_K"]))
+
+    _rowwise_quant_dim_m_cast_kernel[cast_grid](
         x,
         x.stride(0),
         x.stride(1),
         y,
         y.stride(0),
         y.stride(1),
+        amax_buf,
         s,
-        M=M,
-        K=K,
-        BLOCK_SIZE=BLOCK_SIZE,
+        M,
+        K,
         amax_to_scale_fn=amax_to_scale_fn,
         cast_to_dtype_fn=cast_to_dtype_fn,
     )
