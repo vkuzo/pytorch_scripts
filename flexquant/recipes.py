@@ -34,11 +34,6 @@ class Recipe:
     # rather than the compile-friendly reference path.
     _use_triton_kernel: bool = False
 
-    # When True, route this recipe through the FlexQuant HigherOrderOperator.
-    # Under torch.compile this lets Inductor codegen the user's PyTorch
-    # callbacks into a hand-written Triton template.
-    _use_hop_path: bool = False
-
 
 def _deepseek_fp8_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
     amax_fp32 = amax.clamp(min=EPS).to(torch.float32)
@@ -123,19 +118,6 @@ deepseek_fp8_1_128_dim_m_triton = Recipe(
     _use_triton_kernel=True,
 )
 
-deepseek_fp8_1_128_dim_m_hop = Recipe(
-    name="deepseek_fp8_1_128_dim_m_hop",
-    block_size=128,
-    dim=-2,
-    qdata_dtype=torch.float8_e4m3fn,
-    scale_dtype=torch.float32,
-    amax_to_scale_fn=_deepseek_fp8_amax_to_scale_fn,
-    cast_to_dtype_fn=_deepseek_fp8_cast_to_dtype_fn,
-    _reference_fn=_deepseek_fp8_1_128_dim_m_reference,
-    _use_hop_path=True,
-)
-
-
 def _deepseek_fp8_128_128_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     *lead, D1, D2 = x.shape
     n1, n2 = D1 // 128, D2 // 128
@@ -184,17 +166,4 @@ deepseek_fp8_128_128_triton = Recipe(
     _cast_to_dtype_fn_triton=deepseek_fp8_cast_to_dtype_fn_triton,
     _use_triton_kernel=True,
 )
-
-deepseek_fp8_128_128_hop = Recipe(
-    name="deepseek_fp8_128_128_hop",
-    block_size=(128, 128),
-    dim=(-2, -1),
-    qdata_dtype=torch.float8_e4m3fn,
-    scale_dtype=torch.float32,
-    amax_to_scale_fn=_deepseek_fp8_amax_to_scale_fn,
-    cast_to_dtype_fn=_deepseek_fp8_cast_to_dtype_fn,
-    _reference_fn=_deepseek_fp8_128_128_reference,
-    _use_hop_path=True,
-)
-
 

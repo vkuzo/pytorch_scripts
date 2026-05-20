@@ -3,33 +3,32 @@ import torch
 import torch.profiler
 from torch._inductor.utils import do_bench_using_profiling
 
-from api import flex_cast_quant_dense
+from api import _HopMode, flex_cast_quant_dense
 from api_triton_for_debugging import flex_cast_quant_dense_triton
 from recipes import (
     Recipe,
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,
-    deepseek_fp8_1_128_dim_m_hop,
     deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_128_128,
-    deepseek_fp8_128_128_hop,
     deepseek_fp8_128_128_triton,
 )
 
 B200_PEAK_BW_GBPS = 8000.0  # 8 TB/s
 
-RECIPES_BY_NAME = {
-    r.name: r
-    for r in (
-        deepseek_fp8_1_128,
-        deepseek_fp8_1_128_dim_m,
-        deepseek_fp8_1_128_dim_m_triton,
-        deepseek_fp8_1_128_dim_m_hop,
-        deepseek_fp8_128_128,
-        deepseek_fp8_128_128_triton,
-        deepseek_fp8_128_128_hop,
-    )
-}
+# (label, recipe, hop_mode). Recipes that support both HOP and non-HOP routes
+# are listed twice with the two modes; triton-only recipes carry NO_HOP since
+# the flag is unused for them.
+RECIPES: list[tuple[str, Recipe, _HopMode]] = [
+    ("deepseek_fp8_1_128", deepseek_fp8_1_128, _HopMode.NO_HOP),
+    ("deepseek_fp8_1_128_dim_m", deepseek_fp8_1_128_dim_m, _HopMode.NO_HOP),
+    ("deepseek_fp8_1_128_dim_m_hop", deepseek_fp8_1_128_dim_m, _HopMode.HOP),
+    ("deepseek_fp8_1_128_dim_m_triton", deepseek_fp8_1_128_dim_m_triton, _HopMode.NO_HOP),
+    ("deepseek_fp8_128_128", deepseek_fp8_128_128, _HopMode.NO_HOP),
+    ("deepseek_fp8_128_128_hop", deepseek_fp8_128_128, _HopMode.HOP),
+    ("deepseek_fp8_128_128_triton", deepseek_fp8_128_128_triton, _HopMode.NO_HOP),
+]
+RECIPES_BY_LABEL = {label: (recipe, mode) for label, recipe, mode in RECIPES}
 
 
 def _bytes_moved(x: torch.Tensor, qdata: torch.Tensor, scale: torch.Tensor) -> int:
@@ -107,6 +106,7 @@ def _bench_relu(
 
 def _bench_one(
     recipe_obj: Recipe,
+    hop_mode: _HopMode,
     M: int,
     K: int,
     trace_path: str | None = None,
@@ -140,7 +140,7 @@ def _bench_one(
                 scale_dtype=recipe_obj.scale_dtype,
                 amax_to_scale_fn=recipe_obj.amax_to_scale_fn,
                 cast_to_dtype_fn=recipe_obj.cast_to_dtype_fn,
-                _use_hop_path=recipe_obj._use_hop_path,
+                _hop_mode=hop_mode,
             )
 
     qdata, scale = run()
@@ -169,13 +169,13 @@ def main(
     assert "B200" in device_name, f"this benchmark assumes B200, got {device_name!r}"
 
     if recipe_filter is not None:
-        if recipe_filter not in RECIPES_BY_NAME:
+        if recipe_filter not in RECIPES_BY_LABEL:
             raise ValueError(
-                f"unknown recipe {recipe_filter!r}; available: {list(RECIPES_BY_NAME)}"
+                f"unknown recipe {recipe_filter!r}; available: {list(RECIPES_BY_LABEL)}"
             )
-        names = [recipe_filter]
+        labels = [recipe_filter]
     else:
-        names = list(RECIPES_BY_NAME)
+        labels = list(RECIPES_BY_LABEL)
 
     rows = []
 
@@ -191,16 +191,17 @@ def main(
         )
         rows.append(("relu (eager baseline)", gpu_time_ms, gpu_gbps, gpu_pct_peak, cpu_time_ms))
 
-    for name in names:
+    for label in labels:
         trace_path = (
-            f"{profile_prefix}_{name}_M{M}_K{K}.json"
+            f"{profile_prefix}_{label}_M{M}_K{K}.json"
             if profile_prefix is not None
             else None
         )
+        recipe_obj, hop_mode = RECIPES_BY_LABEL[label]
         gpu_time_ms, gpu_gbps, gpu_pct_peak, cpu_time_ms = _bench_one(
-            RECIPES_BY_NAME[name], M, K, trace_path=trace_path
+            recipe_obj, hop_mode, M, K, trace_path=trace_path
         )
-        rows.append((name, gpu_time_ms, gpu_gbps, gpu_pct_peak, cpu_time_ms))
+        rows.append((label, gpu_time_ms, gpu_gbps, gpu_pct_peak, cpu_time_ms))
 
     print(f"shape: ({M}, {K}) bfloat16")
     print(
