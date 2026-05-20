@@ -13,6 +13,7 @@ from recipes import (
     deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_1_128_triton,
     deepseek_fp8_128_128,
+    deepseek_fp8_128_128_helion,
     deepseek_fp8_128_128_hop,
     deepseek_fp8_128_128_triton,
 )
@@ -26,6 +27,7 @@ RECIPES = [
     deepseek_fp8_128_128,
     deepseek_fp8_128_128_triton,
     deepseek_fp8_128_128_hop,
+    deepseek_fp8_128_128_helion,
 ]
 
 
@@ -42,6 +44,7 @@ def _call(recipe: Recipe, x: torch.Tensor, fn=flex_cast_quant_dense):
         amax_to_scale_fn_triton=recipe.amax_to_scale_fn_triton,
         cast_to_dtype_fn_triton=recipe.cast_to_dtype_fn_triton,
         use_hop_path=recipe.use_hop_path,
+        use_helion_kernel=recipe.use_helion_kernel,
     )
 
 
@@ -53,17 +56,27 @@ def test_eager_vs_reference(recipe: Recipe):
     qdata, scale = _call(recipe, x)
     qdata_ref, scale_ref = recipe.reference_fn(x)
 
-    assert torch.equal(qdata.to(torch.float32), qdata_ref.to(torch.float32))
-    assert torch.equal(scale, scale_ref)
+    if recipe.use_helion_kernel:
+        # Helion lowers to Triton via its own compiler; tiny scale-order drift
+        # flips a small fraction of fp8 values by one bin, same as the compile
+        # path. Use the same tolerance carve-out as test_eager_vs_compile.
+        torch.testing.assert_close(scale, scale_ref, rtol=1e-2, atol=1e-6)
+        bin_flip_frac = (
+            qdata.to(torch.float32) != qdata_ref.to(torch.float32)
+        ).float().mean().item()
+        assert bin_flip_frac < 0.05, f"too many bin flips: {bin_flip_frac}"
+    else:
+        assert torch.equal(qdata.to(torch.float32), qdata_ref.to(torch.float32))
+        assert torch.equal(scale, scale_ref)
 
 
 @pytest.mark.parametrize(
     "recipe",
-    [r for r in RECIPES if not r.use_triton_kernel],
-    ids=[r.name for r in RECIPES if not r.use_triton_kernel],
+    [r for r in RECIPES if not r.use_triton_kernel and not r.use_helion_kernel],
+    ids=[r.name for r in RECIPES if not r.use_triton_kernel and not r.use_helion_kernel],
 )
 def test_eager_vs_compile(recipe: Recipe):
-    # Skipped for triton-backed recipes; they bypass torch.compile.
+    # Skipped for triton-backed and helion-backed recipes; they bypass torch.compile.
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 

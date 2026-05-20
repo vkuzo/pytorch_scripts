@@ -12,6 +12,7 @@ from recipes import (
     deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_1_128_triton,
     deepseek_fp8_128_128,
+    deepseek_fp8_128_128_helion,
     deepseek_fp8_128_128_hop,
     deepseek_fp8_128_128_triton,
 )
@@ -29,6 +30,7 @@ RECIPES_BY_NAME = {
         deepseek_fp8_128_128,
         deepseek_fp8_128_128_triton,
         deepseek_fp8_128_128_hop,
+        deepseek_fp8_128_128_helion,
     )
 }
 
@@ -115,8 +117,8 @@ def _bench_one(
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
 
-    # Triton-backed recipes skip torch.compile — they're already a kernel.
-    if recipe_obj.use_triton_kernel:
+    # Triton- and Helion-backed recipes skip torch.compile — they're already kernels.
+    if recipe_obj.use_triton_kernel or recipe_obj.use_helion_kernel:
         fn = flex_cast_quant_dense
     else:
         fn = torch.compile(flex_cast_quant_dense, fullgraph=True)
@@ -134,6 +136,7 @@ def _bench_one(
             amax_to_scale_fn_triton=recipe_obj.amax_to_scale_fn_triton,
             cast_to_dtype_fn_triton=recipe_obj.cast_to_dtype_fn_triton,
             use_hop_path=recipe_obj.use_hop_path,
+            use_helion_kernel=recipe_obj.use_helion_kernel,
         )
 
     qdata, scale = run()

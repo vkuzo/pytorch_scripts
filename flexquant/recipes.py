@@ -28,6 +28,9 @@ class Recipe(NamedTuple):
     # Under torch.compile this lets Inductor codegen the user's PyTorch
     # callbacks into a hand-written Triton template.
     use_hop_path: bool = False
+    # When True, route this recipe through a Helion kernel that re-implements
+    # the body with `hl.tile`. Bypasses torch.compile.
+    use_helion_kernel: bool = False
 
 
 def _deepseek_fp8_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
@@ -200,6 +203,18 @@ deepseek_fp8_128_128_hop = Recipe(
     cast_to_dtype_fn=_deepseek_fp8_cast_to_dtype_fn,
     reference_fn=_deepseek_fp8_128_128_reference,
     use_hop_path=True,
+)
+
+deepseek_fp8_128_128_helion = Recipe(
+    name="deepseek_fp8_128_128_helion",
+    block_size=(128, 128),
+    dim=(-2, -1),
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float32,
+    amax_to_scale_fn=_deepseek_fp8_amax_to_scale_fn,
+    cast_to_dtype_fn=_deepseek_fp8_cast_to_dtype_fn,
+    reference_fn=_deepseek_fp8_128_128_reference,
+    use_helion_kernel=True,
 )
 
 

@@ -2,6 +2,7 @@ from typing import Callable, Tuple, Union
 
 import torch
 
+from helion_kernels import deepseek_fp8_128_128_helion
 from triton_kernels import (
     triton_fp8_blockwise_act_quant_lhs,
     triton_fp8_blockwise_act_quant_transposed_lhs,
@@ -32,6 +33,9 @@ def flex_cast_quant_dense(
     # into a hand-written Triton template; in eager mode it falls back to the
     # same body as the compile path.
     use_hop_path: bool = False,
+    # if True, route through a Helion kernel that mirrors the eager body.
+    # Bypasses torch.compile.
+    use_helion_kernel: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor with user-defined per-tile scaling.
 
@@ -197,6 +201,15 @@ def flex_cast_quant_dense(
                     scale_dtype,
                 )
             elif (
+                use_helion_kernel
+                and (B1, B2) == (128, 128)
+                and qdata_dtype == torch.float8_e4m3fn
+                and scale_dtype == torch.float32
+            ):
+                qdata, scale = deepseek_fp8_128_128_helion(
+                    input, amax_to_scale_fn, cast_to_dtype_fn
+                )
+            elif (
                 use_triton_kernel
                 and (B1, B2) == (128, 128)
                 and qdata_dtype == torch.float8_e4m3fn
@@ -213,6 +226,9 @@ def flex_cast_quant_dense(
                 )
                 assert not use_hop_path, (
                     "use_hop_path only supports 128x128 deepseek for 2D blocks"
+                )
+                assert not use_helion_kernel, (
+                    "use_helion_kernel only supports 128x128 deepseek for 2D blocks"
                 )
                 n1, n2 = M // B1, K // B2
 
