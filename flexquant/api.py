@@ -3,7 +3,6 @@ from typing import Callable, Tuple, Union
 import torch
 
 from triton_kernels import (
-    triton_fp8_blockwise_act_quant_lhs,
     triton_fp8_blockwise_act_quant_transposed_lhs,
     triton_fp8_blockwise_weight_quant_128_128,
 )
@@ -98,31 +97,19 @@ def flex_cast_quant_dense(
             assert not use_hop_path, (
                 "use_hop_path for 1D blocks is only supported for dim=-2"
             )
+            assert not use_triton_kernel, (
+                "use_triton_kernel is not supported for 1D blocks dim=-1"
+            )
             assert K % block_size_int == 0, (
                 f"input.shape[-1]={K} must be divisible by block_size={block_size_int}"
             )
-            if (
-                use_triton_kernel
-                and block_size_int == 128
-                and qdata_dtype == torch.float8_e4m3fn
-                and scale_dtype == torch.float32
-            ):
-                assert amax_to_scale_fn_triton is not None
-                assert cast_to_dtype_fn_triton is not None
-                qdata, scale = triton_fp8_blockwise_act_quant_lhs(
-                    input, amax_to_scale_fn_triton, cast_to_dtype_fn_triton
-                )
-            else:
-                assert not use_triton_kernel, (
-                    "use_triton_kernel for 1D blocks dim=-1 only supports 1x128 deepseek"
-                )
-                n_blocks = K // block_size_int
-                x_b = input.reshape(M, n_blocks, block_size_int)
-                amax = x_b.abs().amax(dim=-1, keepdim=True)  # (M, n_blocks, 1)
-                scale_bc = amax_to_scale_fn(amax)
-                qdata_b = cast_to_dtype_fn(x_b, scale_bc)
-                qdata = qdata_b.reshape(M, K)
-                scale = scale_bc.squeeze(-1)
+            n_blocks = K // block_size_int
+            x_b = input.reshape(M, n_blocks, block_size_int)
+            amax = x_b.abs().amax(dim=-1, keepdim=True)  # (M, n_blocks, 1)
+            scale_bc = amax_to_scale_fn(amax)
+            qdata_b = cast_to_dtype_fn(x_b, scale_bc)
+            qdata = qdata_b.reshape(M, K)
+            scale = scale_bc.squeeze(-1)
         elif normalized_dim_t == (0,):
             # dim=-2: reduce across M; output qdata/scale row-major in (K, M) layout
             assert M % block_size_int == 0, (

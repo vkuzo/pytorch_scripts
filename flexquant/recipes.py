@@ -83,21 +83,6 @@ deepseek_fp8_1_128 = Recipe(
     reference_fn=_deepseek_fp8_1_128_reference,
 )
 
-deepseek_fp8_1_128_triton = Recipe(
-    name="deepseek_fp8_1_128_triton",
-    block_size=128,
-    dim=-1,
-    qdata_dtype=torch.float8_e4m3fn,
-    scale_dtype=torch.float32,
-    amax_to_scale_fn=_deepseek_fp8_amax_to_scale_fn,
-    cast_to_dtype_fn=_deepseek_fp8_cast_to_dtype_fn,
-    reference_fn=_deepseek_fp8_1_128_reference,
-    amax_to_scale_fn_triton=deepseek_fp8_amax_to_scale_fn_triton,
-    cast_to_dtype_fn_triton=deepseek_fp8_cast_to_dtype_fn_triton,
-    use_triton_kernel=True,
-)
-
-
 def _deepseek_fp8_1_128_dim_m_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # dim=-2: reduce across M, output in transposed (K, M) layout.
     return _deepseek_fp8_1_128_reference(x.transpose(-2, -1).contiguous())
