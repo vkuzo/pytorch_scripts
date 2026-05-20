@@ -94,7 +94,8 @@ def test_fuses_with_preceding_pointwise():
     recipe = deepseek_fp8_1_128
 
     def fn(x):
-        return flex_cast_quant_dense(
+        flex_cast_quant_dense_c = torch.compile(flex_cast_quant_dense)
+        return flex_cast_quant_dense_c(
             F.relu(x),
             block_size=recipe.block_size,
             dim=recipe.dim,
