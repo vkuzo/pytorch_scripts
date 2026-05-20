@@ -85,7 +85,7 @@ hop/* - out of tree lowering to templates (100% clauded, didn't look much)
 ## Open questions
 
 * API bike shedding
-* validate that the design will fit the features not yet implemented (nvfp4, RS, etc)
+* validate that the design will fit the features not yet implemented (casts with offsets+padding, nvfp4, RS, etc)
 * validate that we can lower to cuteDSL for performant versions of the casts needed for MoE
 * validate API with potential users
 
