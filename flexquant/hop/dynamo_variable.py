@@ -98,6 +98,7 @@ class FlexQuantHigherOrderVariable(TorchHigherOrderOperatorVariable):
             amax_to_scale_fn,
             cast_to_dtype_fn,
             block_size,
+            dim,
             qdata_dtype,
             scale_dtype,
         ) = all_args
@@ -109,7 +110,7 @@ class FlexQuantHigherOrderVariable(TorchHigherOrderOperatorVariable):
             tx, x, cast_to_dtype_fn, "cast_to_dtype_fn", n_inputs=2
         )
 
-        # x is the only Tensor we need to proxy; the others (block_size,
+        # x is the only Tensor we need to proxy; the others (block_size, dim,
         # dtypes) are Python constants the lowering reads directly.
         proxied_args = [x]
         inp_args, _ = proxy_args_kwargs(proxied_args, {})
@@ -125,6 +126,7 @@ class FlexQuantHigherOrderVariable(TorchHigherOrderOperatorVariable):
                         amax_node,
                         cast_node,
                         block_size.as_python_constant(),
+                        dim.as_python_constant(),
                         qdata_dtype.as_python_constant(),
                         scale_dtype.as_python_constant(),
                     ),

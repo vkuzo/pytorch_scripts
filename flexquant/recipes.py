@@ -128,6 +128,18 @@ deepseek_fp8_1_128_dim_m_triton = Recipe(
     use_triton_kernel=True,
 )
 
+deepseek_fp8_1_128_dim_m_hop = Recipe(
+    name="deepseek_fp8_1_128_dim_m_hop",
+    block_size=128,
+    dim=-2,
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float32,
+    amax_to_scale_fn=_deepseek_fp8_amax_to_scale_fn,
+    cast_to_dtype_fn=_deepseek_fp8_cast_to_dtype_fn,
+    reference_fn=_deepseek_fp8_1_128_dim_m_reference,
+    use_hop_path=True,
+)
+
 
 def _deepseek_fp8_128_128_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     *lead, D1, D2 = x.shape

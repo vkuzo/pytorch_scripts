@@ -1,7 +1,7 @@
 """Inductor lowering for FlexQuantHOP.
 
-Picks the FlexQuant Triton template, builds subgraph buffers from the two
-captured callbacks, and registers a kernel choice via maybe_append_choice.
+Picks one of the per-tiling Triton templates, builds subgraph buffers from the
+two captured callbacks, and registers a kernel choice via maybe_append_choice.
 Modeled after torch._inductor.kernel.flex.flex_attention:flex_attention.
 """
 
@@ -22,59 +22,45 @@ from torch._inductor.select_algorithm import (
     TritonTemplate,
 )
 
-from .hop import flex_quant
+from .hop import _TILING_128_128, _TILING_1_128_DIM_M, _tiling_key, flex_quant
 
 
 _HERE = os.path.dirname(__file__)
-with open(os.path.join(_HERE, "template.py.jinja")) as _f:
-    _TEMPLATE_SOURCE = _f.read()
+
+
+def _read_template(name: str) -> str:
+    with open(os.path.join(_HERE, name)) as f:
+        return f.read()
+
+
+# ---- 128x128 weight-quant template ----------------------------------------
 
 
 @SymbolicGridFn
-def _flex_quant_grid(M, N, meta, *, cdiv):
+def _grid_128_128(M, N, meta, *, cdiv):
     return (cdiv(M, meta["BLOCK_SIZE"]), cdiv(N, meta["BLOCK_SIZE"]), 1)
 
 
-flex_quant_template = TritonTemplate(
-    name="flex_quant",
-    grid=_flex_quant_grid,
-    source=_TEMPLATE_SOURCE,
+_TEMPLATE_128_128 = TritonTemplate(
+    name="flex_quant_128_128",
+    grid=_grid_128_128,
+    source=_read_template("template_128_128.py.jinja"),
 )
 
 
-_AUTOTUNE_CONFIGS = [
+_AUTOTUNE_CONFIGS_128_128 = [
     {"BLOCK_SIZE": 128, "num_warps": w, "num_stages": s}
     for w in (4, 8)
     for s in (2, 4)
 ]
 
 
-@register_lowering(flex_quant, type_promotion_kind=None)
-def _flex_quant_lowering(
-    x,
-    amax_subgraph,
-    cast_subgraph,
-    block_size,
-    qdata_dtype,
-    scale_dtype,
-):
-    """Lowering for the FlexQuantHOP. Only handles the 128x128 e4m3fn+fp32
-    case; raises otherwise (no fallback for now)."""
-
-    # Static config sanity checks.
-    assert tuple(block_size) == (128, 128), f"block_size {block_size!r} unsupported"
-    # Note: qdata_dtype is parameterized so we can A/B fp8 vs fp32 output during
-    # debugging; production scope is fp8_e4m3fn / fp32.
-    assert qdata_dtype in (torch.float8_e4m3fn, torch.float32)
-    assert scale_dtype == torch.float32
-
+def _lower_128_128(x, amax_subgraph, cast_subgraph, block_size, qdata_dtype, scale_dtype):
     device = x.get_device()
     M = x.get_size()[0]
     N = x.get_size()[1]
     B1, B2 = block_size
 
-    # Output layouts. qdata is (M, N) row-major in qdata_dtype; scale is
-    # (M//B1, N//B2) row-major in scale_dtype.
     qdata_layout = FixedLayout(
         device,
         qdata_dtype,
@@ -83,11 +69,8 @@ def _flex_quant_lowering(
     )
     n1 = (M + B1 - 1) // B1
     n2 = (N + B2 - 1) // B2
-    # Allocate a scale buffer that will be mutated in-place by the kernel.
     scale = empty_strided([n1, n2], None, dtype=scale_dtype, device=device)
 
-    # Build the subgraph buffers. The placeholder names ("amax", "tile",
-    # "scale") match the kwargs to {{ modification(...) }} in the template.
     amax_placeholders = [create_placeholder("amax", x.get_dtype(), device)]
     cast_placeholders = [
         create_placeholder("tile", x.get_dtype(), device),
@@ -100,8 +83,8 @@ def _flex_quant_lowering(
     freeze_irnodes(cast_buffer)
 
     choices: list[Any] = []
-    for cfg in _AUTOTUNE_CONFIGS:
-        flex_quant_template.maybe_append_choice(
+    for cfg in _AUTOTUNE_CONFIGS_128_128:
+        _TEMPLATE_128_128.maybe_append_choice(
             choices=choices,
             input_nodes=[x, scale],
             layout=qdata_layout,
@@ -114,10 +97,116 @@ def _flex_quant_lowering(
         )
 
     qdata, _ = autotune_select_algorithm(
-        "flex_quant",
+        "flex_quant_128_128",
         choices,
         [x, scale],
         qdata_layout,
     )
-
     return (qdata, scale)
+
+
+# ---- 1x128 dim_m act-quant template ---------------------------------------
+
+
+@SymbolicGridFn
+def _grid_1_128_dim_m(M, K, meta, *, cdiv):
+    return (cdiv(M, meta["BLOCK_SIZE"]), cdiv(K, meta["NUM_GROUPS"]), 1)
+
+
+_TEMPLATE_1_128_DIM_M = TritonTemplate(
+    name="flex_quant_1_128_dim_m",
+    grid=_grid_1_128_dim_m,
+    source=_read_template("template_1_128_dim_m.py.jinja"),
+)
+
+
+_AUTOTUNE_CONFIGS_1_128_DIM_M = [
+    {"BLOCK_SIZE": 128, "NUM_GROUPS": g, "num_warps": w, "num_stages": s}
+    for g in (2, 16, 32, 64, 128)
+    for w in (2, 4, 8)
+    for s in (2, 4, 6)
+]
+
+
+def _lower_1_128_dim_m(x, amax_subgraph, cast_subgraph, block_size, qdata_dtype, scale_dtype):
+    device = x.get_device()
+    M = x.get_size()[0]
+    K = x.get_size()[1]
+    B = int(block_size)
+
+    # Output qdata is (K, M) row-major, scale is (K, M // B) row-major.
+    qdata_layout = FixedLayout(
+        device,
+        qdata_dtype,
+        [K, M],
+        stride=[M, 1],
+    )
+    n_m = (M + B - 1) // B
+    scale = empty_strided([K, n_m], None, dtype=scale_dtype, device=device)
+
+    amax_placeholders = [create_placeholder("amax", x.get_dtype(), device)]
+    cast_placeholders = [
+        create_placeholder("tile", x.get_dtype(), device),
+        create_placeholder("scale", scale_dtype, device),
+    ]
+
+    amax_buffer = build_subgraph_buffer(amax_placeholders, amax_subgraph)
+    freeze_irnodes(amax_buffer)
+    cast_buffer = build_subgraph_buffer(cast_placeholders, cast_subgraph)
+    freeze_irnodes(cast_buffer)
+
+    choices: list[Any] = []
+    for cfg in _AUTOTUNE_CONFIGS_1_128_DIM_M:
+        _TEMPLATE_1_128_DIM_M.maybe_append_choice(
+            choices=choices,
+            input_nodes=[x, scale],
+            layout=qdata_layout,
+            subgraphs=[amax_buffer, cast_buffer],
+            mutated_inputs=[scale],
+            call_sizes=[M, K],
+            BLOCK_SIZE=cfg["BLOCK_SIZE"],
+            NUM_GROUPS=cfg["NUM_GROUPS"],
+            num_warps=cfg["num_warps"],
+            num_stages=cfg["num_stages"],
+        )
+
+    qdata, _ = autotune_select_algorithm(
+        "flex_quant_1_128_dim_m",
+        choices,
+        [x, scale],
+        qdata_layout,
+    )
+    return (qdata, scale)
+
+
+# ---- Dispatcher -----------------------------------------------------------
+
+
+@register_lowering(flex_quant, type_promotion_kind=None)
+def _flex_quant_lowering(
+    x,
+    amax_subgraph,
+    cast_subgraph,
+    block_size,
+    dim,
+    qdata_dtype,
+    scale_dtype,
+):
+    """Pick the right Triton template based on the (block_size, dim) tiling."""
+    assert qdata_dtype in (torch.float8_e4m3fn, torch.float32), (
+        f"unsupported qdata_dtype: {qdata_dtype!r}"
+    )
+    assert scale_dtype == torch.float32, f"unsupported scale_dtype: {scale_dtype!r}"
+
+    key = _tiling_key(block_size, dim)
+    if key == _TILING_128_128:
+        return _lower_128_128(
+            x, amax_subgraph, cast_subgraph, tuple(block_size), qdata_dtype, scale_dtype
+        )
+    if key == _TILING_1_128_DIM_M:
+        return _lower_1_128_dim_m(
+            x, amax_subgraph, cast_subgraph, int(block_size), qdata_dtype, scale_dtype
+        )
+    raise NotImplementedError(
+        f"flex_quant lowering: unsupported tiling (block_size={block_size!r}, dim={dim!r})"
+    )
