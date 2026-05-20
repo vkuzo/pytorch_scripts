@@ -1,32 +1,17 @@
-# flexquant prototype
+# flex_cast_quant_dense prototype
 
 ## Goal
 
-Flexible API for quantizing a tensor, backed by performant JIT generated kernels.
+Flexible API for quantizing a tensor, backed by performant JIT generated kernels. 90% clauded as this is a POC.
 
-90% clauded as this is a POC
-
-Basically:
+tl;dr:
 * user specifies how the scaling grid works and how they want to scale and cast the data
 * `torch.compile(flex_cast_quant_dense)` spits out a fast kernel, either with inductor or
   a handwritten triton template
 
 Delta vs just using `torch.compile`:
-1. today, templates beat compile on anything except (1, B) casts across the K dim
+1. today, templates are faster than compile on anything except (1, B) casts across the K dim
 2. API is more constrained (some users might prefer that, some might not)
-
-## Status
-
-* toy examples run on a B200 for deepseek 1x128 and 128x128 recipes
-* out-of-tree hop machinery works fine (although this is 100% clauded)
-* heuristic based dispatch to inductor or HOP based on the scaling grid works fine
-* API looks nice (I'd use it)
-
-## Open questions
-
-* validate that the design will fit the features not yet implemented (nvfp4, RS, etc)
-* validate that we can lower to cuteDSL for performant versions of the casts needed for MoE
-* validate API with potential users
 
 ## Example
 
@@ -70,6 +55,40 @@ w_q, w_scale = flex_cast_quant_dense_c(
 )
 ```
 
+## Code structure
+
+```
+api.py - the public API, and the logic when to use inductor vs templates
+example.py - one e2e example of just doing the casts
+recipes.py - deepseek recipes (for testing and benchmarking)
+test.py - smoke tests
+benchmark.py - bench all the deepseek casts (assumes B200)
+hop/* - out of tree lowering to templates (100% clauded, didn't look much)
+```
+
+## Status
+
+* toy examples run on a B200 for deepseek 1x128 and 128x128 recipes, with inductor generating 1x128 kernels and faster HOPs for 128x1 and 128x128 kernels
+* out-of-tree hop machinery works fine (although this is 100% clauded)
+* heuristic based dispatch to inductor or HOP based on the scaling grid works fine
+* API looks nice (I'd use it)
+
+## Not implemented
+
+* hierarchical scaling (such as nvfp4)
+* zero_point
+* mx formats 
+* scale swizzling
+* stochastic rounding
+* any real e2e use cases
+
+## Open questions
+
+* API bike shedding
+* validate that the design will fit the features not yet implemented (nvfp4, RS, etc)
+* validate that we can lower to cuteDSL for performant versions of the casts needed for MoE
+* validate API with potential users
+
 ## Performance (on a B200)
 
 ```bash
@@ -91,20 +110,12 @@ deepseek_fp8_128_128_hop              0.1297     6208.3         77.6%       0.07
 deepseek_fp8_128_128_triton           0.1290     6244.4         78.1%       0.0544
 ```
 
-## Not implemented
-
-* hierarchical scaling (such as nvfp4)
-* zero_point
-* mx formats 
-* scale swizzling
-* stochastic rounding
-* any real e2e use cases
-
 ## Alternatives
 
 Alternative 1: - write custom kernels for every variant
   - pros: simplicity
   - cons: maintainability
+
 Alternative 2: - just teach torch.compile to be good at all possible quantizations
   - pros: generality
   - cons: long term good, but this is not viable to quickly chase SOTA as compiler improvements take time
