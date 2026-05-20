@@ -68,6 +68,7 @@ hop/* - out of tree lowering to templates (100% clauded, didn't look much)
 
 ## Status
 
+* dense quant only for now (no MoE)
 * toy examples run on a B200 for deepseek 1x128 and 128x128 recipes, with inductor generating 1x128 kernels and faster HOPs for 128x1 and 128x128 kernels
 * out-of-tree hop machinery works fine (although this is 100% clauded)
 * heuristic based dispatch to inductor or HOP based on the scaling grid works fine
@@ -75,6 +76,7 @@ hop/* - out of tree lowering to templates (100% clauded, didn't look much)
 
 ## Not implemented
 
+* MoE variants with offsets
 * hierarchical scaling (such as nvfp4)
 * zero_point
 * mx formats 
