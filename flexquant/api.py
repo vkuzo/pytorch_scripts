@@ -2,10 +2,6 @@ from typing import Callable, Tuple, Union
 
 import torch
 
-from triton_kernels import (
-    triton_fp8_blockwise_act_quant_transposed_lhs,
-    triton_fp8_blockwise_weight_quant_128_128,
-)
 # Side-effect import: registers the FlexQuant HOP, its Dynamo variable,
 # and its Inductor lowering. Imported eagerly so the registrations are in
 # place before the user's first torch.compile call.
@@ -21,11 +17,6 @@ def flex_cast_quant_dense(
     scale_dtype: torch.dtype,
     amax_to_scale_fn: Callable,
     cast_to_dtype_fn: Callable,
-    # the arguments below are temporary and should be removed from the final
-    # version of this API
-    use_triton_kernel: bool = False,
-    amax_to_scale_fn_triton: Callable | None = None,
-    cast_to_dtype_fn_triton: Callable | None = None,
     # if True, route through the FlexQuant HigherOrderOperator. Under
     # torch.compile this lets Inductor codegen the user's PyTorch callbacks
     # into a hand-written Triton template; in eager mode it falls back to the
@@ -60,13 +51,6 @@ def flex_cast_quant_dense(
             per-tile amax it computed. Must be a pure pointwise op.
         cast_to_dtype_fn: ``(tile, scale) -> qdata``. Called per-tile to
             produce the quantized values. Must be a pure pointwise op.
-        use_triton_kernel: if True, route to a hand-written Triton kernel
-            instead of the compile-friendly path. Currently only the 128x128
-            deepseek fp8 recipe has a Triton template; other recipes assert.
-        amax_to_scale_fn_triton: `@triton.jit` version of amax_to_scale_fn, this
-            is temporary to avoid dealing with HOPs for now
-        cast_to_dtype_fn_triton: `@triton.jit` version of cast_to_dtype_fn, this
-            is temporary to avoid dealing with HOPs for now
 
     Returns:
         ``(qdata, scale)`` with dtypes ``qdata_dtype`` / ``scale_dtype`` and
@@ -96,9 +80,6 @@ def flex_cast_quant_dense(
             # dim=-1: reduce across K; output qdata in (M, K), scale in (M, n_blocks)
             assert not use_hop_path, (
                 "use_hop_path for 1D blocks is only supported for dim=-2"
-            )
-            assert not use_triton_kernel, (
-                "use_triton_kernel is not supported for 1D blocks dim=-1"
             )
             assert K % block_size_int == 0, (
                 f"input.shape[-1]={K} must be divisible by block_size={block_size_int}"
@@ -130,21 +111,7 @@ def flex_cast_quant_dense(
                     qdata_dtype,
                     scale_dtype,
                 )
-            elif (
-                use_triton_kernel
-                and block_size_int == 128
-                and qdata_dtype == torch.float8_e4m3fn
-                and scale_dtype == torch.float32
-            ):
-                assert amax_to_scale_fn_triton is not None
-                assert cast_to_dtype_fn_triton is not None
-                qdata, scale = triton_fp8_blockwise_act_quant_transposed_lhs(
-                    input, amax_to_scale_fn_triton, cast_to_dtype_fn_triton
-                )
             else:
-                assert not use_triton_kernel, (
-                    "use_triton_kernel for 1D blocks dim=-2 only supports 1x128 deepseek"
-                )
                 assert not use_hop_path, (
                     "use_hop_path for 1D blocks dim=-2 only supports 1x128 deepseek"
                 )
@@ -183,21 +150,7 @@ def flex_cast_quant_dense(
                     qdata_dtype,
                     scale_dtype,
                 )
-            elif (
-                use_triton_kernel
-                and (B1, B2) == (128, 128)
-                and qdata_dtype == torch.float8_e4m3fn
-                and scale_dtype == torch.float32
-            ):
-                assert amax_to_scale_fn_triton is not None
-                assert cast_to_dtype_fn_triton is not None
-                qdata, scale = triton_fp8_blockwise_weight_quant_128_128(
-                    input, amax_to_scale_fn_triton, cast_to_dtype_fn_triton
-                )
             else:
-                assert not use_triton_kernel, (
-                    "use_triton_kernel only supports 128x128 deepseek for 2D blocks"
-                )
                 assert not use_hop_path, (
                     "use_hop_path only supports 128x128 deepseek for 2D blocks"
                 )

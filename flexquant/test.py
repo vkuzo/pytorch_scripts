@@ -5,6 +5,7 @@ from torch._inductor.utils import run_and_get_code
 from torch.testing import FileCheck
 
 from api import flex_cast_quant_dense
+from api_triton_for_debugging import flex_cast_quant_dense_triton
 from recipes import (
     Recipe,
     deepseek_fp8_1_128,
@@ -27,8 +28,20 @@ RECIPES = [
 ]
 
 
-def _call(recipe: Recipe, x: torch.Tensor, fn=flex_cast_quant_dense):
-    return fn(
+def _call(recipe: Recipe, x: torch.Tensor, fn=None):
+    if recipe.use_triton_kernel:
+        triton_fn = fn if fn is not None else flex_cast_quant_dense_triton
+        return triton_fn(
+            x,
+            block_size=recipe.block_size,
+            dim=recipe.dim,
+            qdata_dtype=recipe.qdata_dtype,
+            scale_dtype=recipe.scale_dtype,
+            amax_to_scale_fn_triton=recipe.amax_to_scale_fn_triton,
+            cast_to_dtype_fn_triton=recipe.cast_to_dtype_fn_triton,
+        )
+    pt_fn = fn if fn is not None else flex_cast_quant_dense
+    return pt_fn(
         x,
         block_size=recipe.block_size,
         dim=recipe.dim,
@@ -36,9 +49,6 @@ def _call(recipe: Recipe, x: torch.Tensor, fn=flex_cast_quant_dense):
         scale_dtype=recipe.scale_dtype,
         amax_to_scale_fn=recipe.amax_to_scale_fn,
         cast_to_dtype_fn=recipe.cast_to_dtype_fn,
-        use_triton_kernel=recipe.use_triton_kernel,
-        amax_to_scale_fn_triton=recipe.amax_to_scale_fn_triton,
-        cast_to_dtype_fn_triton=recipe.cast_to_dtype_fn_triton,
         use_hop_path=recipe.use_hop_path,
     )
 

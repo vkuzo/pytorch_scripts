@@ -4,6 +4,7 @@ import torch.profiler
 from torch._inductor.utils import do_bench_using_profiling
 
 from api import flex_cast_quant_dense
+from api_triton_for_debugging import flex_cast_quant_dense_triton
 from recipes import (
     Recipe,
     deepseek_fp8_1_128,
@@ -115,24 +116,32 @@ def _bench_one(
 
     # Triton-backed recipes skip torch.compile — they're already a kernel.
     if recipe_obj.use_triton_kernel:
-        fn = flex_cast_quant_dense
-    else:
-        fn = torch.compile(flex_cast_quant_dense, fullgraph=True)
+        triton_fn = flex_cast_quant_dense_triton
 
-    def run():
-        return fn(
-            x,
-            block_size=recipe_obj.block_size,
-            dim=recipe_obj.dim,
-            qdata_dtype=recipe_obj.qdata_dtype,
-            scale_dtype=recipe_obj.scale_dtype,
-            amax_to_scale_fn=recipe_obj.amax_to_scale_fn,
-            cast_to_dtype_fn=recipe_obj.cast_to_dtype_fn,
-            use_triton_kernel=recipe_obj.use_triton_kernel,
-            amax_to_scale_fn_triton=recipe_obj.amax_to_scale_fn_triton,
-            cast_to_dtype_fn_triton=recipe_obj.cast_to_dtype_fn_triton,
-            use_hop_path=recipe_obj.use_hop_path,
-        )
+        def run():
+            return triton_fn(
+                x,
+                block_size=recipe_obj.block_size,
+                dim=recipe_obj.dim,
+                qdata_dtype=recipe_obj.qdata_dtype,
+                scale_dtype=recipe_obj.scale_dtype,
+                amax_to_scale_fn_triton=recipe_obj.amax_to_scale_fn_triton,
+                cast_to_dtype_fn_triton=recipe_obj.cast_to_dtype_fn_triton,
+            )
+    else:
+        pt_fn = torch.compile(flex_cast_quant_dense, fullgraph=True)
+
+        def run():
+            return pt_fn(
+                x,
+                block_size=recipe_obj.block_size,
+                dim=recipe_obj.dim,
+                qdata_dtype=recipe_obj.qdata_dtype,
+                scale_dtype=recipe_obj.scale_dtype,
+                amax_to_scale_fn=recipe_obj.amax_to_scale_fn,
+                cast_to_dtype_fn=recipe_obj.cast_to_dtype_fn,
+                use_hop_path=recipe_obj.use_hop_path,
+            )
 
     qdata, scale = run()
     bytes_per_iter = _bytes_moved(x, qdata, scale)
