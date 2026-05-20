@@ -7,6 +7,10 @@ from triton_kernels import (
     triton_fp8_blockwise_act_quant_transposed_lhs,
     triton_fp8_blockwise_weight_quant_128_128,
 )
+# Side-effect import: registers the FlexQuant HOP, its Dynamo variable,
+# and its Inductor lowering. Imported eagerly so the registrations are in
+# place before the user's first torch.compile call.
+from hop import flex_quant
 
 
 def flex_cast_quant_dense(
@@ -23,6 +27,11 @@ def flex_cast_quant_dense(
     use_triton_kernel: bool = False,
     amax_to_scale_fn_triton: Callable | None = None,
     cast_to_dtype_fn_triton: Callable | None = None,
+    # if True, route through the FlexQuant HigherOrderOperator. Under
+    # torch.compile this lets Inductor codegen the user's PyTorch callbacks
+    # into a hand-written Triton template; in eager mode it falls back to the
+    # same body as the compile path.
+    use_hop_path: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor with user-defined per-tile scaling.
 
@@ -83,6 +92,7 @@ def flex_cast_quant_dense(
     if n_block_dims == 1 and block_size_t[0] > 0:
         # 1D blocked scaling
 
+        assert not use_hop_path, "use_hop_path only supports 128x128 deepseek for 2D blocks"
         block_size_int = block_size_t[0]
         if normalized_dim_t == (1,):
             # dim=-1: reduce across K; output qdata in (M, K), scale in (M, n_blocks)
@@ -152,6 +162,20 @@ def flex_cast_quant_dense(
                 f"input trailing dims {(M, K)} must be divisible by block_size={(B1, B2)}"
             )
             if (
+                use_hop_path
+                and (B1, B2) == (128, 128)
+                and qdata_dtype == torch.float8_e4m3fn
+                and scale_dtype == torch.float32
+            ):
+                qdata, scale = flex_quant(
+                    input,
+                    amax_to_scale_fn,
+                    cast_to_dtype_fn,
+                    (B1, B2),
+                    qdata_dtype,
+                    scale_dtype,
+                )
+            elif (
                 use_triton_kernel
                 and (B1, B2) == (128, 128)
                 and qdata_dtype == torch.float8_e4m3fn
@@ -165,6 +189,9 @@ def flex_cast_quant_dense(
             else:
                 assert not use_triton_kernel, (
                     "use_triton_kernel only supports 128x128 deepseek for 2D blocks"
+                )
+                assert not use_hop_path, (
+                    "use_hop_path only supports 128x128 deepseek for 2D blocks"
                 )
                 n1, n2 = M // B1, K // B2
 
