@@ -12,13 +12,20 @@ Dispatch keys registered:
                              how Inductor receives the callbacks as FX subgraphs.
 """
 
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Tuple, Union
 
 import torch
 from torch._C import DispatchKey
 from torch._higher_order_ops.utils import reenter_make_fx, register_fake
 from torch._ops import HigherOrderOperator
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode
+
+
+# (block_size, dim) pairs identifying each supported tiling. block_size and dim
+# are runtime args (not constexpr) so a single HOP instance covers all
+# tilings; the lowering picks the right Triton template per pair.
+_TILING_128_128 = ((128, 128), (-2, -1))
+_TILING_1_128_DIM_M = (128, -2)
 
 
 class FlexQuantHOP(HigherOrderOperator):
@@ -30,7 +37,8 @@ class FlexQuantHOP(HigherOrderOperator):
         x: torch.Tensor,
         amax_to_scale_fn: Callable,
         cast_to_dtype_fn: Callable,
-        block_size: Tuple[int, int],
+        block_size: Union[int, Tuple[int, int]],
+        dim: Union[int, Tuple[int, int]],
         qdata_dtype: torch.dtype,
         scale_dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -39,6 +47,7 @@ class FlexQuantHOP(HigherOrderOperator):
             amax_to_scale_fn,
             cast_to_dtype_fn,
             block_size,
+            dim,
             qdata_dtype,
             scale_dtype,
         )
@@ -47,15 +56,19 @@ class FlexQuantHOP(HigherOrderOperator):
 flex_quant = FlexQuantHOP()
 
 
-def _eager_body(
+def _tiling_key(block_size, dim):
+    bs = tuple(block_size) if isinstance(block_size, (list, tuple)) else block_size
+    d = tuple(dim) if isinstance(dim, (list, tuple)) else dim
+    return (bs, d)
+
+
+def _eager_body_128_128(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,
     cast_to_dtype_fn: Callable,
     block_size: Tuple[int, int],
-    qdata_dtype: torch.dtype,
-    scale_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Reshape → amax → callbacks → un-reshape. Mirrors api.py:148-163."""
+    """Reshape → amax → callbacks → un-reshape. Mirrors api.py:196-214."""
     M, K = x.shape
     B1, B2 = block_size
     assert M % B1 == 0 and K % B2 == 0
@@ -80,17 +93,55 @@ def _eager_body(
     return qdata, scale
 
 
+def _eager_body_dim_m(
+    x: torch.Tensor,
+    amax_to_scale_fn: Callable,
+    cast_to_dtype_fn: Callable,
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """1D blocks along M with transposed (K, M) output. Mirrors api.py:144-150."""
+    M, K = x.shape
+    assert M % block_size == 0
+    n_blocks = M // block_size
+
+    x_b = x.reshape(n_blocks, block_size, K)
+    amax = x_b.abs().amax(dim=-2, keepdim=True)  # (n_blocks, 1, K)
+    scale_bc = amax_to_scale_fn(amax)
+    qdata_b = cast_to_dtype_fn(x_b, scale_bc)
+    qdata = qdata_b.reshape(M, K).transpose(-2, -1).contiguous()
+    scale = scale_bc.squeeze(-2).transpose(-2, -1).contiguous()
+    return qdata, scale
+
+
+def _eager_body(
+    x: torch.Tensor,
+    amax_to_scale_fn: Callable,
+    cast_to_dtype_fn: Callable,
+    block_size,
+    dim,
+    qdata_dtype: torch.dtype,
+    scale_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    key = _tiling_key(block_size, dim)
+    if key == _TILING_128_128:
+        return _eager_body_128_128(x, amax_to_scale_fn, cast_to_dtype_fn, tuple(block_size))
+    if key == _TILING_1_128_DIM_M:
+        return _eager_body_dim_m(x, amax_to_scale_fn, cast_to_dtype_fn, int(block_size))
+    raise NotImplementedError(f"flex_quant: unsupported tiling (block_size={block_size!r}, dim={dim!r})")
+
+
 @flex_quant.py_impl(DispatchKey.CompositeExplicitAutograd)
 def _flex_quant_eager(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,
     cast_to_dtype_fn: Callable,
-    block_size: Tuple[int, int],
+    block_size,
+    dim,
     qdata_dtype: torch.dtype,
     scale_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return _eager_body(
-        x, amax_to_scale_fn, cast_to_dtype_fn, block_size, qdata_dtype, scale_dtype
+        x, amax_to_scale_fn, cast_to_dtype_fn, block_size, dim, qdata_dtype, scale_dtype
     )
 
 
@@ -99,7 +150,8 @@ def _trace_flex_quant(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,
     cast_to_dtype_fn: Callable,
-    block_size: Tuple[int, int],
+    block_size,
+    dim,
     qdata_dtype: torch.dtype,
     scale_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -112,7 +164,7 @@ def _trace_flex_quant(
     # Eager run on the (real or fake) inputs to get the example output for the
     # FX node's `meta`.
     example_out = flex_quant(
-        x, amax_to_scale_fn, cast_to_dtype_fn, block_size, qdata_dtype, scale_dtype
+        x, amax_to_scale_fn, cast_to_dtype_fn, block_size, dim, qdata_dtype, scale_dtype
     )
 
     # Trace each callback into its own GraphModule. The placeholders are 0-d
@@ -135,7 +187,7 @@ def _trace_flex_quant(
     cast_qualname = proxy_mode.tracer.get_fresh_qualname("flex_quant_cast")
     proxy_mode.tracer.root.register_module(cast_qualname, cast_graph)
 
-    node_args = (x, amax_graph, cast_graph, block_size, qdata_dtype, scale_dtype)
+    node_args = (x, amax_graph, cast_graph, block_size, dim, qdata_dtype, scale_dtype)
     import torch.utils._pytree as pytree
     proxy_args = pytree.tree_map(
         proxy_mode.tracer.unwrap_proxy, node_args
@@ -160,7 +212,8 @@ def _flex_quant_proxy_torch_dispatch_mode(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,
     cast_to_dtype_fn: Callable,
-    block_size: Tuple[int, int],
+    block_size,
+    dim,
     qdata_dtype: torch.dtype,
     scale_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -172,6 +225,7 @@ def _flex_quant_proxy_torch_dispatch_mode(
         amax_to_scale_fn,
         cast_to_dtype_fn,
         block_size,
+        dim,
         qdata_dtype,
         scale_dtype,
     )
@@ -182,7 +236,8 @@ def _flex_quant_autograd(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,
     cast_to_dtype_fn: Callable,
-    block_size: Tuple[int, int],
+    block_size,
+    dim,
     qdata_dtype: torch.dtype,
     scale_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -194,6 +249,7 @@ def _flex_quant_autograd(
             amax_to_scale_fn,
             cast_to_dtype_fn,
             block_size,
+            dim,
             qdata_dtype,
             scale_dtype,
         )
@@ -205,7 +261,8 @@ def _flex_quant_functionalize(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,
     cast_to_dtype_fn: Callable,
-    block_size: Tuple[int, int],
+    block_size,
+    dim,
     qdata_dtype: torch.dtype,
     scale_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -220,6 +277,7 @@ def _flex_quant_functionalize(
             functional_amax,
             functional_cast,
             block_size,
+            dim,
             qdata_dtype,
             scale_dtype,
         )
@@ -231,14 +289,24 @@ def _flex_quant_fake(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,
     cast_to_dtype_fn: Callable,
-    block_size: Tuple[int, int],
+    block_size,
+    dim,
     qdata_dtype: torch.dtype,
     scale_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """FakeTensor shape inference — output shapes derive from block_size."""
+    """FakeTensor shape inference — output shapes derive from (block_size, dim)."""
     M, K = x.shape
-    B1, B2 = block_size
-    n1, n2 = M // B1, K // B2
-    qdata = x.new_empty((M, K), dtype=qdata_dtype)
-    scale = x.new_empty((n1, n2), dtype=scale_dtype)
-    return qdata, scale
+    key = _tiling_key(block_size, dim)
+    if key == _TILING_128_128:
+        B1, B2 = block_size
+        n1, n2 = M // B1, K // B2
+        qdata = x.new_empty((M, K), dtype=qdata_dtype)
+        scale = x.new_empty((n1, n2), dtype=scale_dtype)
+        return qdata, scale
+    if key == _TILING_1_128_DIM_M:
+        bs = int(block_size)
+        n_blocks = M // bs
+        qdata = x.new_empty((K, M), dtype=qdata_dtype)
+        scale = x.new_empty((K, n_blocks), dtype=scale_dtype)
+        return qdata, scale
+    raise NotImplementedError(f"flex_quant: unsupported tiling (block_size={block_size!r}, dim={dim!r})")

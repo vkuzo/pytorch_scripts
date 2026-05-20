@@ -92,10 +92,12 @@ def flex_cast_quant_dense(
     if n_block_dims == 1 and block_size_t[0] > 0:
         # 1D blocked scaling
 
-        assert not use_hop_path, "use_hop_path only supports 128x128 deepseek for 2D blocks"
         block_size_int = block_size_t[0]
         if normalized_dim_t == (1,):
             # dim=-1: reduce across K; output qdata in (M, K), scale in (M, n_blocks)
+            assert not use_hop_path, (
+                "use_hop_path for 1D blocks is only supported for dim=-2"
+            )
             assert K % block_size_int == 0, (
                 f"input.shape[-1]={K} must be divisible by block_size={block_size_int}"
             )
@@ -127,6 +129,21 @@ def flex_cast_quant_dense(
                 f"input.shape[-2]={M} must be divisible by block_size={block_size_int}"
             )
             if (
+                use_hop_path
+                and block_size_int == 128
+                and qdata_dtype == torch.float8_e4m3fn
+                and scale_dtype == torch.float32
+            ):
+                qdata, scale = flex_quant(
+                    input,
+                    amax_to_scale_fn,
+                    cast_to_dtype_fn,
+                    block_size_int,
+                    -2,
+                    qdata_dtype,
+                    scale_dtype,
+                )
+            elif (
                 use_triton_kernel
                 and block_size_int == 128
                 and qdata_dtype == torch.float8_e4m3fn
@@ -140,6 +157,9 @@ def flex_cast_quant_dense(
             else:
                 assert not use_triton_kernel, (
                     "use_triton_kernel for 1D blocks dim=-2 only supports 1x128 deepseek"
+                )
+                assert not use_hop_path, (
+                    "use_hop_path for 1D blocks dim=-2 only supports 1x128 deepseek"
                 )
                 n_blocks = M // block_size_int
                 x_b = input.reshape(n_blocks, block_size_int, K)
@@ -172,6 +192,7 @@ def flex_cast_quant_dense(
                     amax_to_scale_fn,
                     cast_to_dtype_fn,
                     (B1, B2),
+                    (-2, -1),
                     qdata_dtype,
                     scale_dtype,
                 )
