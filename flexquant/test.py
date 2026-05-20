@@ -4,31 +4,32 @@ import torch.nn.functional as F
 from torch._inductor.utils import run_and_get_code
 from torch.testing import FileCheck
 
-from api import flex_cast_quant_dense
+from api import _HopMode, flex_cast_quant_dense
 from api_triton_for_debugging import flex_cast_quant_dense_triton
 from recipes import (
     Recipe,
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,
-    deepseek_fp8_1_128_dim_m_hop,
     deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_128_128,
-    deepseek_fp8_128_128_hop,
     deepseek_fp8_128_128_triton,
 )
 
-RECIPES = [
-    deepseek_fp8_1_128,
-    deepseek_fp8_1_128_dim_m,
-    deepseek_fp8_1_128_dim_m_triton,
-    deepseek_fp8_1_128_dim_m_hop,
-    deepseek_fp8_128_128,
-    deepseek_fp8_128_128_triton,
-    deepseek_fp8_128_128_hop,
+# (label, recipe, hop_mode). Recipes that support both HOP and non-HOP routes
+# are listed twice with the two modes; triton-only recipes carry NO_HOP since
+# the flag is unused for them.
+RECIPES: list[tuple[str, Recipe, _HopMode]] = [
+    ("deepseek_fp8_1_128", deepseek_fp8_1_128, _HopMode.NO_HOP),
+    ("deepseek_fp8_1_128_dim_m", deepseek_fp8_1_128_dim_m, _HopMode.NO_HOP),
+    ("deepseek_fp8_1_128_dim_m_hop", deepseek_fp8_1_128_dim_m, _HopMode.HOP),
+    ("deepseek_fp8_1_128_dim_m_triton", deepseek_fp8_1_128_dim_m_triton, _HopMode.NO_HOP),
+    ("deepseek_fp8_128_128", deepseek_fp8_128_128, _HopMode.NO_HOP),
+    ("deepseek_fp8_128_128_hop", deepseek_fp8_128_128, _HopMode.HOP),
+    ("deepseek_fp8_128_128_triton", deepseek_fp8_128_128_triton, _HopMode.NO_HOP),
 ]
 
 
-def _call(recipe: Recipe, x: torch.Tensor, fn=None):
+def _call(recipe: Recipe, hop_mode: _HopMode, x: torch.Tensor, fn=None):
     if recipe._use_triton_kernel:
         triton_fn = fn if fn is not None else flex_cast_quant_dense_triton
         return triton_fn(
@@ -49,16 +50,18 @@ def _call(recipe: Recipe, x: torch.Tensor, fn=None):
         scale_dtype=recipe.scale_dtype,
         amax_to_scale_fn=recipe.amax_to_scale_fn,
         cast_to_dtype_fn=recipe.cast_to_dtype_fn,
-        _use_hop_path=recipe._use_hop_path,
+        _hop_mode=hop_mode,
     )
 
 
-@pytest.mark.parametrize("recipe", RECIPES, ids=[r.name for r in RECIPES])
-def test_eager_vs_reference(recipe: Recipe):
+@pytest.mark.parametrize(
+    "label,recipe,hop_mode", RECIPES, ids=[label for label, _, _ in RECIPES]
+)
+def test_eager_vs_reference(label: str, recipe: Recipe, hop_mode: _HopMode):
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = _call(recipe, x)
+    qdata, scale = _call(recipe, hop_mode, x)
     qdata_ref, scale_ref = recipe._reference_fn(x)
 
     assert torch.equal(qdata.to(torch.float32), qdata_ref.to(torch.float32))
@@ -66,19 +69,19 @@ def test_eager_vs_reference(recipe: Recipe):
 
 
 @pytest.mark.parametrize(
-    "recipe",
-    [r for r in RECIPES if not r._use_triton_kernel],
-    ids=[r.name for r in RECIPES if not r._use_triton_kernel],
+    "label,recipe,hop_mode",
+    [(l, r, m) for l, r, m in RECIPES if not r._use_triton_kernel],
+    ids=[l for l, r, _ in RECIPES if not r._use_triton_kernel],
 )
-def test_eager_vs_compile(recipe: Recipe):
+def test_eager_vs_compile(label: str, recipe: Recipe, hop_mode: _HopMode):
     # Skipped for triton-backed recipes; they bypass torch.compile.
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    qdata_eager, scale_eager = _call(recipe, x)
+    qdata_eager, scale_eager = _call(recipe, hop_mode, x)
 
     compiled = torch.compile(flex_cast_quant_dense, fullgraph=True)
-    qdata_compiled, scale_compiled = _call(recipe, x, fn=compiled)
+    qdata_compiled, scale_compiled = _call(recipe, hop_mode, x, fn=compiled)
 
     # Inductor may reorder fp ops, causing tiny scale drift that flips a small
     # fraction of fp8 values by one quantization bin. Compare with tolerances

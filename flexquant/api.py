@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Callable, Tuple, Union
 
 import torch
@@ -6,6 +7,12 @@ import torch
 # and its Inductor lowering. Imported eagerly so the registrations are in
 # place before the user's first torch.compile call.
 from hop import flex_cast_quant_dense_with_hop
+
+
+class _HopMode(Enum):
+    AUTO = "auto"
+    HOP = "hop"
+    NO_HOP = "no_hop"
 
 
 def flex_cast_quant_dense(
@@ -17,11 +24,8 @@ def flex_cast_quant_dense(
     scale_dtype: torch.dtype,
     amax_to_scale_fn: Callable,
     cast_to_dtype_fn: Callable,
-    # if True, route through the FlexQuant HigherOrderOperator. Under
-    # torch.compile this lets Inductor codegen the user's PyTorch callbacks
-    # into a hand-written Triton template; in eager mode it falls back to the
-    # same body as the compile path.
-    _use_hop_path: bool = False,
+    # arguments below are for debugging only
+    _hop_mode: _HopMode = _HopMode.AUTO,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor with user-defined per-tile scaling.
 
@@ -79,9 +83,10 @@ def flex_cast_quant_dense(
 
         if normalized_dim_t == (1,):
             # dim=-1: reduce across K; output qdata in (M, K), scale in (M, n_blocks)
-            assert not _use_hop_path, (
-                "_use_hop_path for 1D blocks is only supported for dim=-2"
-            )
+
+            # compile is known fast, no hop defined
+            assert _hop_mode in (_HopMode.AUTO, _HopMode.NO_HOP), "unsupported"
+
             assert K % block_size_int == 0, (
                 f"input.shape[-1]={K} must be divisible by block_size={block_size_int}"
             )
@@ -95,10 +100,15 @@ def flex_cast_quant_dense(
 
         else:
             # dim=-2: reduce across M; output qdata/scale row-major in (K, M) layout
+
             assert normalized_dim_t == (0,), "unsupported"
             assert M % block_size_int == 0, (
                 f"input.shape[-2]={M} must be divisible by block_size={block_size_int}"
             )
+
+            # hop known fast, use it unless overridden
+            _use_hop_path = _hop_mode in (_HopMode.AUTO, _HopMode.HOP)
+
             if _use_hop_path:
                 assert (
                     block_size_int == 128 
@@ -133,6 +143,9 @@ def flex_cast_quant_dense(
             assert M % B1 == 0 and K % B2 == 0, (
                 f"input trailing dims {(M, K)} must be divisible by block_size={(B1, B2)}"
             )
+
+            # hop known fast, use it unless overridden
+            _use_hop_path = _hop_mode in (_HopMode.AUTO, _HopMode.HOP)
 
             if _use_hop_path:
                 assert (
