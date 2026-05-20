@@ -22,7 +22,12 @@ from torch._inductor.select_algorithm import (
     TritonTemplate,
 )
 
-from .hop import _TILING_128_128, _TILING_1_128_DIM_M, _tiling_key, flex_quant
+from .hop import (
+    _TILING_128_128,
+    _TILING_1_128_DIM_M,
+    _tiling_key,
+    flex_cast_quant_dense_with_hop,
+)
 
 
 _HERE = os.path.dirname(__file__)
@@ -182,7 +187,7 @@ def _lower_1_128_dim_m(x, amax_subgraph, cast_subgraph, block_size, qdata_dtype,
 # ---- Dispatcher -----------------------------------------------------------
 
 
-@register_lowering(flex_quant, type_promotion_kind=None)
+@register_lowering(flex_cast_quant_dense_with_hop, type_promotion_kind=None)
 def _flex_quant_lowering(
     x,
     amax_subgraph,

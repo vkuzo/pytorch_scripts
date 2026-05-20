@@ -53,7 +53,7 @@ class FlexQuantHOP(HigherOrderOperator):
         )
 
 
-flex_quant = FlexQuantHOP()
+flex_cast_quant_dense_with_hop = FlexQuantHOP()
 
 
 def _tiling_key(block_size, dim):
@@ -130,7 +130,7 @@ def _eager_body(
     raise NotImplementedError(f"flex_quant: unsupported tiling (block_size={block_size!r}, dim={dim!r})")
 
 
-@flex_quant.py_impl(DispatchKey.CompositeExplicitAutograd)
+@flex_cast_quant_dense_with_hop.py_impl(DispatchKey.CompositeExplicitAutograd)
 def _flex_quant_eager(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,
@@ -163,7 +163,7 @@ def _trace_flex_quant(
     """
     # Eager run on the (real or fake) inputs to get the example output for the
     # FX node's `meta`.
-    example_out = flex_quant(
+    example_out = flex_cast_quant_dense_with_hop(
         x, amax_to_scale_fn, cast_to_dtype_fn, block_size, dim, qdata_dtype, scale_dtype
     )
 
@@ -194,7 +194,7 @@ def _trace_flex_quant(
     )
     out_proxy = proxy_mode.tracer.create_proxy(
         "call_function",
-        flex_quant,
+        flex_cast_quant_dense_with_hop,
         proxy_args,
         {},
         name="flex_quant",
@@ -206,7 +206,7 @@ def _trace_flex_quant(
     )
 
 
-@flex_quant.py_impl(ProxyTorchDispatchMode)
+@flex_cast_quant_dense_with_hop.py_impl(ProxyTorchDispatchMode)
 def _flex_quant_proxy_torch_dispatch_mode(
     mode: ProxyTorchDispatchMode,
     x: torch.Tensor,
@@ -231,7 +231,7 @@ def _flex_quant_proxy_torch_dispatch_mode(
     )
 
 
-@flex_quant.py_impl(DispatchKey.Autograd)
+@flex_cast_quant_dense_with_hop.py_impl(DispatchKey.Autograd)
 def _flex_quant_autograd(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,
@@ -244,7 +244,7 @@ def _flex_quant_autograd(
     """Forward-only autograd dispatch — runs the eager body and returns its
     result. Backward is not implemented (matches our scope)."""
     with torch._C._AutoDispatchBelowAutograd():
-        return flex_quant(
+        return flex_cast_quant_dense_with_hop(
             x,
             amax_to_scale_fn,
             cast_to_dtype_fn,
@@ -255,7 +255,7 @@ def _flex_quant_autograd(
         )
 
 
-@flex_quant.py_functionalize_impl
+@flex_cast_quant_dense_with_hop.py_functionalize_impl
 def _flex_quant_functionalize(
     ctx,
     x: torch.Tensor,
@@ -272,7 +272,7 @@ def _flex_quant_functionalize(
     with ctx.redispatch_to_next():
         functional_amax = ctx.functionalize(amax_to_scale_fn)
         functional_cast = ctx.functionalize(cast_to_dtype_fn)
-        out = flex_quant(
+        out = flex_cast_quant_dense_with_hop(
             x_unwrapped,
             functional_amax,
             functional_cast,
@@ -284,7 +284,7 @@ def _flex_quant_functionalize(
     return ctx.wrap_tensors(out)
 
 
-@register_fake(flex_quant)
+@register_fake(flex_cast_quant_dense_with_hop)
 def _flex_quant_fake(
     x: torch.Tensor,
     amax_to_scale_fn: Callable,

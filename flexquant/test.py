@@ -29,7 +29,7 @@ RECIPES = [
 
 
 def _call(recipe: Recipe, x: torch.Tensor, fn=None):
-    if recipe.use_triton_kernel:
+    if recipe._use_triton_kernel:
         triton_fn = fn if fn is not None else flex_cast_quant_dense_triton
         return triton_fn(
             x,
@@ -37,8 +37,8 @@ def _call(recipe: Recipe, x: torch.Tensor, fn=None):
             dim=recipe.dim,
             qdata_dtype=recipe.qdata_dtype,
             scale_dtype=recipe.scale_dtype,
-            amax_to_scale_fn_triton=recipe.amax_to_scale_fn_triton,
-            cast_to_dtype_fn_triton=recipe.cast_to_dtype_fn_triton,
+            amax_to_scale_fn_triton=recipe._amax_to_scale_fn_triton,
+            cast_to_dtype_fn_triton=recipe._cast_to_dtype_fn_triton,
         )
     pt_fn = fn if fn is not None else flex_cast_quant_dense
     return pt_fn(
@@ -49,7 +49,7 @@ def _call(recipe: Recipe, x: torch.Tensor, fn=None):
         scale_dtype=recipe.scale_dtype,
         amax_to_scale_fn=recipe.amax_to_scale_fn,
         cast_to_dtype_fn=recipe.cast_to_dtype_fn,
-        use_hop_path=recipe.use_hop_path,
+        _use_hop_path=recipe._use_hop_path,
     )
 
 
@@ -59,7 +59,7 @@ def test_eager_vs_reference(recipe: Recipe):
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
     qdata, scale = _call(recipe, x)
-    qdata_ref, scale_ref = recipe.reference_fn(x)
+    qdata_ref, scale_ref = recipe._reference_fn(x)
 
     assert torch.equal(qdata.to(torch.float32), qdata_ref.to(torch.float32))
     assert torch.equal(scale, scale_ref)
@@ -67,8 +67,8 @@ def test_eager_vs_reference(recipe: Recipe):
 
 @pytest.mark.parametrize(
     "recipe",
-    [r for r in RECIPES if not r.use_triton_kernel],
-    ids=[r.name for r in RECIPES if not r.use_triton_kernel],
+    [r for r in RECIPES if not r._use_triton_kernel],
+    ids=[r.name for r in RECIPES if not r._use_triton_kernel],
 )
 def test_eager_vs_compile(recipe: Recipe):
     # Skipped for triton-backed recipes; they bypass torch.compile.
