@@ -5,7 +5,7 @@ import torch
 # Side-effect import: registers the FlexQuant HOP, its Dynamo variable,
 # and its Inductor lowering. Imported eagerly so the registrations are in
 # place before the user's first torch.compile call.
-from hop import flex_quant
+from hop import flex_cast_quant_dense_with_hop
 
 
 def flex_cast_quant_dense(
@@ -21,7 +21,7 @@ def flex_cast_quant_dense(
     # torch.compile this lets Inductor codegen the user's PyTorch callbacks
     # into a hand-written Triton template; in eager mode it falls back to the
     # same body as the compile path.
-    use_hop_path: bool = False,
+    _use_hop_path: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor with user-defined per-tile scaling.
 
@@ -76,10 +76,11 @@ def flex_cast_quant_dense(
         # 1D blocked scaling
 
         block_size_int = block_size_t[0]
+
         if normalized_dim_t == (1,):
             # dim=-1: reduce across K; output qdata in (M, K), scale in (M, n_blocks)
-            assert not use_hop_path, (
-                "use_hop_path for 1D blocks is only supported for dim=-2"
+            assert not _use_hop_path, (
+                "_use_hop_path for 1D blocks is only supported for dim=-2"
             )
             assert K % block_size_int == 0, (
                 f"input.shape[-1]={K} must be divisible by block_size={block_size_int}"
@@ -91,18 +92,20 @@ def flex_cast_quant_dense(
             qdata_b = cast_to_dtype_fn(x_b, scale_bc)
             qdata = qdata_b.reshape(M, K)
             scale = scale_bc.squeeze(-1)
-        elif normalized_dim_t == (0,):
+
+        else:
             # dim=-2: reduce across M; output qdata/scale row-major in (K, M) layout
+            assert normalized_dim_t == (0,), "unsupported"
             assert M % block_size_int == 0, (
                 f"input.shape[-2]={M} must be divisible by block_size={block_size_int}"
             )
-            if (
-                use_hop_path
-                and block_size_int == 128
-                and qdata_dtype == torch.float8_e4m3fn
-                and scale_dtype == torch.float32
-            ):
-                qdata, scale = flex_quant(
+            if _use_hop_path:
+                assert (
+                    block_size_int == 128 
+                    and qdata_dtype == torch.float8_e4m3fn 
+                    and scale_dtype == torch.float32
+                ), "unsupported"
+                qdata, scale = flex_cast_quant_dense_with_hop(
                     input,
                     amax_to_scale_fn,
                     cast_to_dtype_fn,
@@ -111,10 +114,8 @@ def flex_cast_quant_dense(
                     qdata_dtype,
                     scale_dtype,
                 )
+
             else:
-                assert not use_hop_path, (
-                    "use_hop_path for 1D blocks dim=-2 only supports 1x128 deepseek"
-                )
                 n_blocks = M // block_size_int
                 x_b = input.reshape(n_blocks, block_size_int, K)
                 amax = x_b.abs().amax(dim=-2, keepdim=True)  # (n_blocks, 1, K)
@@ -122,12 +123,9 @@ def flex_cast_quant_dense(
                 qdata_b = cast_to_dtype_fn(x_b, scale_bc)
                 qdata = qdata_b.reshape(M, K).transpose(-2, -1).contiguous()
                 scale = scale_bc.squeeze(-2).transpose(-2, -1).contiguous()
-        else:
-            raise AssertionError(f"unsupported dim={dim} for 1D blocks")
 
     elif n_block_dims == 2:
-        # 2D blocked scaling; tile is flattened to a single trailing dim so callbacks
-        # designed for 1D blocks work as-is.
+        # 2D blocked scaling
 
         if normalized_dim_t == (0, 1):
             B1, B2 = block_size_t
@@ -135,13 +133,14 @@ def flex_cast_quant_dense(
             assert M % B1 == 0 and K % B2 == 0, (
                 f"input trailing dims {(M, K)} must be divisible by block_size={(B1, B2)}"
             )
-            if (
-                use_hop_path
-                and (B1, B2) == (128, 128)
-                and qdata_dtype == torch.float8_e4m3fn
-                and scale_dtype == torch.float32
-            ):
-                qdata, scale = flex_quant(
+
+            if _use_hop_path:
+                assert (
+                    (B1, B2) == (128, 128)
+                    and qdata_dtype == torch.float8_e4m3fn
+                    and scale_dtype == torch.float32
+                ), "unsupported"
+                qdata, scale = flex_cast_quant_dense_with_hop(
                     input,
                     amax_to_scale_fn,
                     cast_to_dtype_fn,
@@ -150,10 +149,8 @@ def flex_cast_quant_dense(
                     qdata_dtype,
                     scale_dtype,
                 )
+
             else:
-                assert not use_hop_path, (
-                    "use_hop_path only supports 128x128 deepseek for 2D blocks"
-                )
                 n1, n2 = M // B1, K // B2
 
                 # (M, K) -> (n1, B1, n2, B2) -> (n1, n2, B1, B2) -> (n1, n2, B1*B2)

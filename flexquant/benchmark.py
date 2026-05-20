@@ -78,21 +78,21 @@ def _measure_cpu_time_ms(
     return total_cpu_us / n_active / 1e3
 
 
-def _bench_copy(
+def _bench_relu(
     M: int,
     K: int,
     trace_path: str | None = None,
 ) -> tuple[float, float, float, float]:
-    """Eager `dst.copy_(src)` baseline: a memory-bound op that moves the same
+    """Eager `torch.relu(x)` baseline: a memory-bound op that moves the same
     volume of bytes as the bfloat16 input (read once, written once)."""
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    dst = torch.empty_like(x)
 
     def run():
-        return dst.copy_(x)
+        return torch.relu(x)
 
-    bytes_per_iter = x.numel() * x.element_size() + dst.numel() * dst.element_size()
+    out = run()
+    bytes_per_iter = x.numel() * x.element_size() + out.numel() * out.element_size()
 
     for _ in range(2):
         run()
@@ -115,7 +115,7 @@ def _bench_one(
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
 
     # Triton-backed recipes skip torch.compile — they're already a kernel.
-    if recipe_obj.use_triton_kernel:
+    if recipe_obj._use_triton_kernel:
         triton_fn = flex_cast_quant_dense_triton
 
         def run():
@@ -125,8 +125,8 @@ def _bench_one(
                 dim=recipe_obj.dim,
                 qdata_dtype=recipe_obj.qdata_dtype,
                 scale_dtype=recipe_obj.scale_dtype,
-                amax_to_scale_fn_triton=recipe_obj.amax_to_scale_fn_triton,
-                cast_to_dtype_fn_triton=recipe_obj.cast_to_dtype_fn_triton,
+                amax_to_scale_fn_triton=recipe_obj._amax_to_scale_fn_triton,
+                cast_to_dtype_fn_triton=recipe_obj._cast_to_dtype_fn_triton,
             )
     else:
         pt_fn = torch.compile(flex_cast_quant_dense, fullgraph=True)
@@ -140,7 +140,7 @@ def _bench_one(
                 scale_dtype=recipe_obj.scale_dtype,
                 amax_to_scale_fn=recipe_obj.amax_to_scale_fn,
                 cast_to_dtype_fn=recipe_obj.cast_to_dtype_fn,
-                use_hop_path=recipe_obj.use_hop_path,
+                _use_hop_path=recipe_obj._use_hop_path,
             )
 
     qdata, scale = run()
@@ -179,17 +179,17 @@ def main(
 
     rows = []
 
-    # Baseline: eager `copy_` to anchor the bandwidth ceiling.
+    # Baseline: eager `relu` to anchor the bandwidth ceiling.
     if recipe_filter is None:
         baseline_trace = (
-            f"{profile_prefix}_copy__M{M}_K{K}.json"
+            f"{profile_prefix}_relu_M{M}_K{K}.json"
             if profile_prefix is not None
             else None
         )
-        gpu_time_ms, gpu_gbps, gpu_pct_peak, cpu_time_ms = _bench_copy(
+        gpu_time_ms, gpu_gbps, gpu_pct_peak, cpu_time_ms = _bench_relu(
             M, K, trace_path=baseline_trace
         )
-        rows.append(("copy_ (eager baseline)", gpu_time_ms, gpu_gbps, gpu_pct_peak, cpu_time_ms))
+        rows.append(("relu (eager baseline)", gpu_time_ms, gpu_gbps, gpu_pct_peak, cpu_time_ms))
 
     for name in names:
         trace_path = (
