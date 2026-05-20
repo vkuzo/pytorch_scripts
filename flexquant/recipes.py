@@ -1,9 +1,7 @@
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
-import triton
-import triton.language as tl
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 EPS = 1e-12
@@ -18,21 +16,9 @@ class Recipe:
     scale_dtype: torch.dtype
     amax_to_scale_fn: Callable
     cast_to_dtype_fn: Callable
-
-    # everything below this line is only for debugging and can
-    # be refactored away to other places as needed
-
+    # arguments below are for debugging only
     # Plain PyTorch reference implementation (including the tiling)
     _reference_fn: Callable
-
-    # Triton-flavored callbacks for the _use_triton_kernel path. Optional —
-    # only recipes with a corresponding template need to provide them.
-    _amax_to_scale_fn_triton: Optional[Callable] = None
-    _cast_to_dtype_fn_triton: Optional[Callable] = None
-
-    # When True, route this recipe through its hand-written Triton kernel
-    # rather than the compile-friendly reference path.
-    _use_triton_kernel: bool = False
 
 
 def _deepseek_fp8_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
@@ -48,20 +34,6 @@ def _deepseek_fp8_cast_to_dtype_fn(
     reciprocal = (1.0 / scale)
     y = tile * reciprocal
     return y.to(torch.float8_e4m3fn)
-
-
-@triton.jit
-def deepseek_fp8_amax_to_scale_fn_triton(amax):
-    EPS: tl.constexpr = 1e-12
-    FP8_MAX_C: tl.constexpr = 448.0
-    amax_fp32 = tl.maximum(amax.to(tl.float32), EPS)
-    return amax_fp32 / FP8_MAX_C
-
-
-@triton.jit
-def deepseek_fp8_cast_to_dtype_fn_triton(tile, scale):
-    y = tile * (1.0 / scale)
-    return y.to(tl.float8e4nv)
 
 
 def _deepseek_fp8_1_128_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -104,20 +76,6 @@ deepseek_fp8_1_128_dim_m = Recipe(
     _reference_fn=_deepseek_fp8_1_128_dim_m_reference,
 )
 
-deepseek_fp8_1_128_dim_m_triton = Recipe(
-    name="deepseek_fp8_1_128_dim_m_triton",
-    block_size=128,
-    dim=-2,
-    qdata_dtype=torch.float8_e4m3fn,
-    scale_dtype=torch.float32,
-    amax_to_scale_fn=_deepseek_fp8_amax_to_scale_fn,
-    cast_to_dtype_fn=_deepseek_fp8_cast_to_dtype_fn,
-    _reference_fn=_deepseek_fp8_1_128_dim_m_reference,
-    _amax_to_scale_fn_triton=deepseek_fp8_amax_to_scale_fn_triton,
-    _cast_to_dtype_fn_triton=deepseek_fp8_cast_to_dtype_fn_triton,
-    _use_triton_kernel=True,
-)
-
 def _deepseek_fp8_128_128_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     *lead, D1, D2 = x.shape
     n1, n2 = D1 // 128, D2 // 128
@@ -151,19 +109,5 @@ deepseek_fp8_128_128 = Recipe(
     amax_to_scale_fn=_deepseek_fp8_amax_to_scale_fn,
     cast_to_dtype_fn=_deepseek_fp8_cast_to_dtype_fn,
     _reference_fn=_deepseek_fp8_128_128_reference,
-)
-
-deepseek_fp8_128_128_triton = Recipe(
-    name="deepseek_fp8_128_128_triton",
-    block_size=(128, 128),
-    dim=(-2, -1),
-    qdata_dtype=torch.float8_e4m3fn,
-    scale_dtype=torch.float32,
-    amax_to_scale_fn=_deepseek_fp8_amax_to_scale_fn,
-    cast_to_dtype_fn=_deepseek_fp8_cast_to_dtype_fn,
-    _reference_fn=_deepseek_fp8_128_128_reference,
-    _amax_to_scale_fn_triton=deepseek_fp8_amax_to_scale_fn_triton,
-    _cast_to_dtype_fn_triton=deepseek_fp8_cast_to_dtype_fn_triton,
-    _use_triton_kernel=True,
 )
 

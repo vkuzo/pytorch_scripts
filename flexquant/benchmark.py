@@ -5,28 +5,31 @@ from torch._inductor.utils import do_bench_using_profiling
 
 from api import _HopMode, flex_cast_quant_dense
 from api_triton_for_debugging import flex_cast_quant_dense_triton
+from recipe_debug_triton import (
+    RecipeTriton,
+    deepseek_fp8_128_128_triton,
+    deepseek_fp8_1_128_dim_m_triton,
+)
 from recipes import (
     Recipe,
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,
-    deepseek_fp8_1_128_dim_m_triton,
     deepseek_fp8_128_128,
-    deepseek_fp8_128_128_triton,
 )
 
 B200_PEAK_BW_GBPS = 8000.0  # 8 TB/s
 
 # (label, recipe, hop_mode). Recipes that support both HOP and non-HOP routes
-# are listed twice with the two modes; triton-only recipes carry NO_HOP since
-# the flag is unused for them.
-RECIPES: list[tuple[str, Recipe, _HopMode]] = [
+# are listed twice with the two modes. Triton-only entries pair a RecipeTriton
+# with hop_mode=None and bypass torch.compile.
+RECIPES: list[tuple[str, Recipe | RecipeTriton, _HopMode | None]] = [
     ("deepseek_fp8_1_128", deepseek_fp8_1_128, _HopMode.NO_HOP),
     ("deepseek_fp8_1_128_dim_m", deepseek_fp8_1_128_dim_m, _HopMode.NO_HOP),
     ("deepseek_fp8_1_128_dim_m_hop", deepseek_fp8_1_128_dim_m, _HopMode.HOP),
-    ("deepseek_fp8_1_128_dim_m_triton", deepseek_fp8_1_128_dim_m_triton, _HopMode.NO_HOP),
+    ("deepseek_fp8_1_128_dim_m_triton", deepseek_fp8_1_128_dim_m_triton, None),
     ("deepseek_fp8_128_128", deepseek_fp8_128_128, _HopMode.NO_HOP),
     ("deepseek_fp8_128_128_hop", deepseek_fp8_128_128, _HopMode.HOP),
-    ("deepseek_fp8_128_128_triton", deepseek_fp8_128_128_triton, _HopMode.NO_HOP),
+    ("deepseek_fp8_128_128_triton", deepseek_fp8_128_128_triton, None),
 ]
 RECIPES_BY_LABEL = {label: (recipe, mode) for label, recipe, mode in RECIPES}
 
@@ -105,8 +108,8 @@ def _bench_relu(
 
 
 def _bench_one(
-    recipe_obj: Recipe,
-    hop_mode: _HopMode,
+    recipe_obj: Recipe | RecipeTriton,
+    hop_mode: _HopMode | None,
     M: int,
     K: int,
     trace_path: str | None = None,
@@ -115,7 +118,7 @@ def _bench_one(
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
 
     # Triton-backed recipes skip torch.compile — they're already a kernel.
-    if recipe_obj._use_triton_kernel:
+    if isinstance(recipe_obj, RecipeTriton):
         triton_fn = flex_cast_quant_dense_triton
 
         def run():
@@ -125,8 +128,8 @@ def _bench_one(
                 dim=recipe_obj.dim,
                 qdata_dtype=recipe_obj.qdata_dtype,
                 scale_dtype=recipe_obj.scale_dtype,
-                amax_to_scale_fn_triton=recipe_obj._amax_to_scale_fn_triton,
-                cast_to_dtype_fn_triton=recipe_obj._cast_to_dtype_fn_triton,
+                amax_to_scale_fn_triton=recipe_obj.amax_to_scale_fn,
+                cast_to_dtype_fn_triton=recipe_obj.cast_to_dtype_fn,
             )
     else:
         pt_fn = torch.compile(flex_cast_quant_dense, fullgraph=True)
