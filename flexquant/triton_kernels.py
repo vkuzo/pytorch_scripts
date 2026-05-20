@@ -127,94 +127,9 @@ def triton_fp8_blockwise_weight_quant_128_128(
 
 
 # ----------------------------------------------------------------------------
-# 1x128 act-quant kernels — adapted from ao kernels.py:481-569 (lhs) and
-# 668-768 (transposed_lhs). Recipe-specific numerics live in the callbacks.
+# 1x128 act-quant kernels — adapted from ao kernels.py 668-768. Recipe-specific
+# numerics live in the callbacks.
 # ----------------------------------------------------------------------------
-
-
-@triton.autotune(configs=quant_kernel_configs_with_groups, key=["K"])
-@triton.jit
-def triton_fp8_blockwise_act_quant_lhs_kernel(
-    x_ptr,
-    x_stride_dim_0,
-    x_stride_dim_1,
-    y_ptr,
-    y_stride_dim_0,
-    y_stride_dim_1,
-    s_ptr,
-    s_stride_dim_0,
-    s_stride_dim_1,
-    M,
-    K: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
-    amax_to_scale_fn: tl.constexpr,
-    cast_to_dtype_fn: tl.constexpr,
-):
-    pid_m = tl.program_id(axis=0)
-    pid_k = tl.program_id(axis=1)
-
-    # Load (NUM_GROUPS x BLOCK_SIZE) tile of x, row major.
-    m_offs = pid_m * NUM_GROUPS + tl.arange(0, NUM_GROUPS)
-    k_offs = pid_k * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x_offs = m_offs[:, None] * x_stride_dim_0 + k_offs[None, :] * x_stride_dim_1
-    x_mask = (m_offs[:, None] < M) & (k_offs[None, :] < K)
-    x = tl.load(x_ptr + x_offs, mask=x_mask, other=0.0)
-
-    # One scale per row in the tile, shape (NUM_GROUPS, 1).
-    amax = tl.max(tl.abs(x), axis=1)[:, None]
-    scale = amax_to_scale_fn(amax)
-    y = cast_to_dtype_fn(x, scale)
-
-    y_offs = m_offs[:, None] * y_stride_dim_0 + k_offs[None, :] * y_stride_dim_1
-    y_mask = (m_offs[:, None] < M) & (k_offs[None, :] < K)
-    tl.store(y_ptr + y_offs, y, mask=y_mask)
-
-    # Scales: shape (M, K // BLOCK_SIZE), row-major.
-    scale_offs = m_offs[:, None] * s_stride_dim_0 + pid_k * s_stride_dim_1
-    scale_mask = m_offs[:, None] < M
-    tl.store(s_ptr + scale_offs, scale, mask=scale_mask)
-
-
-def triton_fp8_blockwise_act_quant_lhs(
-    x: torch.Tensor,
-    amax_to_scale_fn: Callable,
-    cast_to_dtype_fn: Callable,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert x.dim() == 2, "Input tensor must have 2 dimensions"
-    block_size = 128
-    dtype = torch.float8_e4m3fn
-    M, K = x.size()
-    assert K % block_size == 0, (
-        f"K={K} must be divisible by block_size={block_size}"
-    )
-    y = torch.empty_like(x, dtype=dtype)  # row-major (M, K)
-    s = x.new_empty(M, K // block_size, dtype=torch.float32)  # row-major
-
-    def grid(meta):
-        return (
-            triton.cdiv(M, meta["NUM_GROUPS"]),
-            triton.cdiv(K, meta["BLOCK_SIZE"]),
-        )
-
-    triton_fp8_blockwise_act_quant_lhs_kernel[grid](
-        x,
-        x.stride(0),
-        x.stride(1),
-        y,
-        y.stride(0),
-        y.stride(1),
-        s,
-        s.stride(0),
-        s.stride(1),
-        M,
-        K=K,
-        BLOCK_SIZE=block_size,
-        amax_to_scale_fn=amax_to_scale_fn,
-        cast_to_dtype_fn=cast_to_dtype_fn,
-    )
-    return y, s
 
 
 @triton.autotune(configs=quant_kernel_configs_with_groups, key=["K"])
