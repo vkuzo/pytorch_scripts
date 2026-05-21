@@ -15,11 +15,11 @@ E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
 @dataclass(frozen=True)
 class Recipe:
     name: str
-    block_size: int | tuple[int, int]
-    dim: int | tuple[int, int]
+    block_size: int | tuple[int, int] | list
+    dim: int | tuple[int, int] | list
     qdata_dtype: torch.dtype
-    scale_dtype: torch.dtype
-    amax_to_scale_fn: Callable
+    scale_dtype: torch.dtype | list[torch.dtype]
+    amax_to_scale_fn: Callable | list[Callable]
     cast_to_dtype_fn: Callable
     # arguments below are for debugging only
     # Plain PyTorch reference implementation (including the tiling)
@@ -161,5 +161,68 @@ nvfp4_no_gs = Recipe(
     amax_to_scale_fn=_nvfp4_amax_to_scale_fn,
     cast_to_dtype_fn=_nvfp4_cast_to_dtype_fn,
     _reference_fn=_nvfp4_no_gs_reference,
+)
+
+
+# nvfp4 with two-level scaling: per-tensor fp32 outer scale + per-block e4m3
+# inner scale. Mirrors the `per_tensor_scale is not None` branch of
+# `nvfp4_quantize` in torchao, with the outer (per-tensor) scale computed by
+# the framework from the input's amax.
+
+def _nvfp4_outer_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
+    return amax.to(torch.float32) / (F8E4M3_MAX * F4_E2M1_MAX)
+
+
+def _nvfp4_inner_amax_to_scale_fn(
+    local_amax: torch.Tensor, outer_scale: torch.Tensor
+) -> torch.Tensor:
+    block_scale_fp32 = local_amax.to(torch.float32) / F4_E2M1_MAX
+    scaled = block_scale_fp32 / outer_scale
+    return torch.clamp(scaled, min=E4M3_EPS, max=F8E4M3_MAX).to(
+        torch.float8_e4m3fn
+    )
+
+
+def _nvfp4_with_gs_cast_to_dtype_fn(
+    tile: torch.Tensor,
+    inner_scale: torch.Tensor,
+    outer_scale: torch.Tensor,
+) -> torch.Tensor:
+    inner_fp32 = inner_scale.to(torch.float32)
+    reciprocal = (1.0 / outer_scale) / inner_fp32
+    data_scaled = tile.to(torch.float32) * reciprocal
+    data_scaled = torch.clamp(data_scaled, -F4_E2M1_MAX, F4_E2M1_MAX)
+    data_unpacked = f32_to_f4_unpacked(data_scaled)
+    return pack_uint4(data_unpacked).view(torch.float4_e2m1fn_x2)
+
+
+def _nvfp4_with_gs_reference(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    outer_amax = x.abs().to(torch.float32).amax()
+    outer_scale = _nvfp4_outer_amax_to_scale_fn(outer_amax)
+
+    *lead, last = x.shape
+    n_blocks = last // 16
+    x_b = x.reshape(*lead, n_blocks, 16)
+    local_amax = x_b.abs().amax(dim=-1, keepdim=True)
+    inner_scale = _nvfp4_inner_amax_to_scale_fn(local_amax, outer_scale)
+    qdata_b = _nvfp4_with_gs_cast_to_dtype_fn(x_b, inner_scale, outer_scale)
+    qdata = qdata_b.reshape(*lead, last // 2)
+    return qdata, [inner_scale.squeeze(-1), outer_scale]
+
+
+nvfp4_with_gs = Recipe(
+    name="nvfp4_with_gs",
+    block_size=[16, (-1, -1)],
+    dim=[-1, (-2, -1)],
+    qdata_dtype=torch.float4_e2m1fn_x2,
+    scale_dtype=[torch.float8_e4m3fn, torch.float32],
+    amax_to_scale_fn=[
+        _nvfp4_inner_amax_to_scale_fn,
+        _nvfp4_outer_amax_to_scale_fn,
+    ],
+    cast_to_dtype_fn=_nvfp4_with_gs_cast_to_dtype_fn,
+    _reference_fn=_nvfp4_with_gs_reference,
 )
 

@@ -17,6 +17,7 @@ from recipes import (
     deepseek_fp8_1_128_dim_m,
     deepseek_fp8_128_128,
     nvfp4_no_gs,
+    nvfp4_with_gs,
 )
 
 # (label, recipe, hop_mode). Recipes that support both HOP and non-HOP routes
@@ -28,6 +29,7 @@ RECIPES_PT: list[tuple[str, Recipe, _HopMode]] = [
     ("deepseek_fp8_128_128", deepseek_fp8_128_128, _HopMode.NO_HOP),
     ("deepseek_fp8_128_128_hop", deepseek_fp8_128_128, _HopMode.HOP),
     ("nvfp4_no_gs", nvfp4_no_gs, _HopMode.NO_HOP),
+    ("nvfp4_with_gs", nvfp4_with_gs, _HopMode.NO_HOP),
 ]
 RECIPES_TRITON: list[tuple[str, RecipeTriton]] = [
     ("deepseek_fp8_1_128_dim_m_triton", deepseek_fp8_1_128_dim_m_triton),
@@ -77,7 +79,14 @@ def test_pt_eager_vs_reference(label: str, recipe: Recipe, hop_mode: _HopMode):
         assert torch.equal(qdata.view(torch.uint8), qdata_ref.view(torch.uint8))
     else:
         assert torch.equal(qdata.to(torch.float32), qdata_ref.to(torch.float32))
-    assert torch.equal(scale, scale_ref)
+
+    # Two-level scaling returns a list [outer_scale, inner_scale].
+    if isinstance(scale, list):
+        assert isinstance(scale_ref, list) and len(scale) == len(scale_ref)
+        for s, s_ref in zip(scale, scale_ref):
+            assert torch.equal(s, s_ref)
+    else:
+        assert torch.equal(scale, scale_ref)
 
 
 @pytest.mark.parametrize(
@@ -111,12 +120,18 @@ def test_eager_vs_compile(label: str, recipe: Recipe, hop_mode: _HopMode):
     # that accept one-bin drift but not algorithmic divergence.
     # Cast scale to fp32 for comparison: assert_close with tolerances doesn't
     # support fp8 dtypes (e.g. nvfp4 uses e4m3 scale).
-    torch.testing.assert_close(
-        scale_eager.to(torch.float32),
-        scale_compiled.to(torch.float32),
-        rtol=1e-2,
-        atol=1e-6,
+    scales_eager = scale_eager if isinstance(scale_eager, list) else [scale_eager]
+    scales_compiled = (
+        scale_compiled if isinstance(scale_compiled, list) else [scale_compiled]
     )
+    assert len(scales_eager) == len(scales_compiled)
+    for s_eager, s_compiled in zip(scales_eager, scales_compiled):
+        torch.testing.assert_close(
+            s_eager.to(torch.float32),
+            s_compiled.to(torch.float32),
+            rtol=1e-2,
+            atol=1e-6,
+        )
     if qdata_eager.dtype == torch.float4_e2m1fn_x2:
         # `.to(torch.float32)` isn't implemented for float4_e2m1fn_x2; compare
         # packed bytes. Note this is stricter than per-element compare since

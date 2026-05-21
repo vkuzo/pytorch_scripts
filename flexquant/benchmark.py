@@ -15,6 +15,8 @@ from recipes import (
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,
     deepseek_fp8_128_128,
+    nvfp4_no_gs,
+    nvfp4_with_gs,
 )
 
 B200_PEAK_BW_GBPS = 8000.0  # 8 TB/s
@@ -30,12 +32,24 @@ RECIPES: list[tuple[str, Recipe | RecipeTriton, _HopMode | None]] = [
     ("deepseek_fp8_128_128", deepseek_fp8_128_128, _HopMode.NO_HOP),
     ("deepseek_fp8_128_128_hop", deepseek_fp8_128_128, _HopMode.HOP),
     ("deepseek_fp8_128_128_triton", deepseek_fp8_128_128_triton, None),
+    ("nvfp4_no_gs", nvfp4_no_gs, _HopMode.NO_HOP),
+    ("nvfp4_with_gs", nvfp4_with_gs, _HopMode.NO_HOP),
 ]
 RECIPES_BY_LABEL = {label: (recipe, mode) for label, recipe, mode in RECIPES}
 
 
-def _bytes_moved(x: torch.Tensor, qdata: torch.Tensor, scale: torch.Tensor) -> int:
-    return x.numel() * x.element_size() + qdata.numel() * qdata.element_size() + scale.numel() * scale.element_size()
+def _bytes_moved(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    scale: torch.Tensor | list[torch.Tensor],
+) -> int:
+    scales = scale if isinstance(scale, list) else [scale]
+    scale_bytes = sum(s.numel() * s.element_size() for s in scales)
+    return (
+        x.numel() * x.element_size()
+        + qdata.numel() * qdata.element_size()
+        + scale_bytes
+    )
 
 
 def _measure_cpu_time_ms(
