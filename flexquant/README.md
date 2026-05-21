@@ -53,6 +53,34 @@ w_q, w_scale = flex_cast_quant_dense_c(
     amax_to_scale_fn=amax_to_scale_fn,
     cast_to_dtype_fn=cast_to_dtype_fn,
 )
+
+# nvfp4 two-level scaling (per-tensor fp32 outer + per-block e4m3 inner).
+# List-typed args carry [inner, outer] in that order. The two amax_to_scale
+# callbacks have different signatures: inner takes (local_amax, outer_scale),
+# outer takes (amax,). The cast callback takes (tile, inner_scale, outer_scale).
+def nvfp4_inner_amax_to_scale_fn(local_amax, outer_scale):
+    block_scale_fp32 = local_amax.to(torch.float32) / F4_E2M1_MAX
+    scaled = block_scale_fp32 / outer_scale
+    return scaled.clamp(min=E4M3_EPS, max=F8E4M3_MAX).to(torch.float8_e4m3fn)
+
+def nvfp4_outer_amax_to_scale_fn(amax):
+    return amax.to(torch.float32) / (F8E4M3_MAX * F4_E2M1_MAX)
+
+def nvfp4_cast_to_dtype_fn(tile, inner_scale, outer_scale):
+    reciprocal = (1.0 / outer_scale) / inner_scale.to(torch.float32)
+    data = (tile.to(torch.float32) * reciprocal).clamp(-F4_E2M1_MAX, F4_E2M1_MAX)
+    return pack_uint4(f32_to_f4_unpacked(data)).view(torch.float4_e2m1fn_x2)
+
+# returns (qdata, [inner_scale, outer_scale])
+x_q_nvfp4, [x_inner_scale, x_outer_scale] = flex_cast_quant_dense_c(
+    x,
+    block_size=[16, (-1, -1)],
+    dim=[-1, (-2, -1)],
+    qdata_dtype=torch.float4_e2m1fn_x2,
+    scale_dtype=[torch.float8_e4m3fn, torch.float32],
+    amax_to_scale_fn=[nvfp4_inner_amax_to_scale_fn, nvfp4_outer_amax_to_scale_fn],
+    cast_to_dtype_fn=nvfp4_cast_to_dtype_fn,
+)
 ```
 
 ## Code structure
@@ -110,6 +138,8 @@ deepseek_fp8_1_128_dim_m_triton       0.1458     5579.9         69.7%       0.05
 deepseek_fp8_128_128                  0.2295     3508.6         43.9%       0.0927
 deepseek_fp8_128_128_hop              0.1297     6208.3         77.6%       0.0778
 deepseek_fp8_128_128_triton           0.1290     6244.4         78.1%       0.0544
+nvfp4_no_gs                           4.6065      149.3          1.9%       0.1279
+nvfp4_with_gs                         4.8210      142.7          1.8%       0.1587
 ```
 
 ## Alternatives
