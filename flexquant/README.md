@@ -10,8 +10,11 @@ tl;dr:
   a handwritten triton template
 
 Delta vs just using `torch.compile`:
-1. today, templates are faster than compile on anything except (1, B) casts across the K dim
-2. API is more constrained (some users might prefer that, some might not)
+* today, templates are faster than compile on anything except (1, B) casts across the K dim
+
+Delta vs using a handwritten kernel:
+* get a JIT kernel for free (for supported expressibility)
+* compile can fuse to prev_op (when not using a template)
 
 ## Example
 
@@ -97,15 +100,15 @@ hop/* - out of tree lowering to templates (100% clauded, didn't look much)
 ## Status
 
 * dense quant only for now (no MoE)
-* toy examples run on a B200 for deepseek 1x128 and 128x128 recipes, with inductor generating 1x128 kernels and faster HOPs for 128x1 and 128x128 kernels
+* toy examples run on a B200 for deepseek 1x128 and 128x128 recipes and nvfp4, with templates for 128x1 and 128x128 kernels and inductor for others
 * out-of-tree hop machinery works fine (although this is 100% clauded)
 * heuristic based dispatch to inductor or HOP based on the scaling grid works fine
+* outer scaling (currently only for per-tensor and for dim=-1)
 * API looks nice (I'd use it)
 
 ## Not implemented
 
 * MoE variants with offsets
-* hierarchical scaling (such as nvfp4)
 * zero_point
 * mx formats 
 * scale swizzling
