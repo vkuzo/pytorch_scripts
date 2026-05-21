@@ -35,7 +35,9 @@ def flex_cast_quant_dense(
     callbacks: how to turn a tile's amax into a scale, and how to cast a tile
     given its scale.
 
-    Tiles are defined by ``block_size`` and ``dim``. Supported shapes:
+    Tiles are defined by ``block_size`` and ``dim``. Supported shapes
+    (logical element counts; sub-byte qdata dtypes pack multiple values per
+    byte, see below):
 
     - **1D blocked**: ``block_size: int``, ``dim: int``
       - dim=-1: output qdata is `(M, K)`, scale is `(M, K // block_size)`
@@ -43,6 +45,13 @@ def flex_cast_quant_dense(
 
     - **2D blocked** ``block_size: tuple[int, int]``, ``dim=(-2, -1)``
       - qdata is `(M, K)`, scale is `(M // B1, K // B2)`.
+
+    Sub-byte qdata dtypes (currently ``torch.float4_e2m1fn_x2``) pack two
+    values per byte along the innermost dim, so the returned qdata's
+    ``shape[-1]`` is half the logical K. TODO(future): generalize this by
+    exposing a ``qdata_bits_per_element`` argument and computing
+    ``qdata_pack_factor = 8 // bits``. The current dtype-specific branch
+    only handles ``float4_e2m1fn_x2``.
 
     Args:
         input: 2D contiguous tensor.
@@ -72,6 +81,14 @@ def flex_cast_quant_dense(
     normalized_dim_t = tuple(d if d >= 0 else d + input.ndim for d in dim_t)
     M, K = input.shape
 
+    # Sub-byte qdata dtypes pack multiple values per byte and shrink the
+    # logical element count along the innermost dim of cast_to_dtype_fn's
+    # output.
+    if qdata_dtype == torch.float4_e2m1fn_x2:
+        qdata_pack_factor = 2  # 2 fp4 elements per byte
+    else:
+        qdata_pack_factor = 1
+
     # TODO(future):
     # * scale swizzling
     # * padding and other edge cases
@@ -95,7 +112,7 @@ def flex_cast_quant_dense(
             amax = x_b.abs().amax(dim=-1, keepdim=True)  # (M, n_blocks, 1)
             scale_bc = amax_to_scale_fn(amax)
             qdata_b = cast_to_dtype_fn(x_b, scale_bc)
-            qdata = qdata_b.reshape(M, K)
+            qdata = qdata_b.reshape(M, K // qdata_pack_factor)
             scale = scale_bc.squeeze(-1)
 
         else:
@@ -106,6 +123,14 @@ def flex_cast_quant_dense(
                 f"input.shape[-2]={M} must be divisible by block_size={block_size_int}"
             )
 
+            # Packing happens along the inner dim (K), and this path transposes
+            # to (K, M) layout, which would have to swap bytes whose two fp4
+            # halves are K-adjacent. Not supported yet.
+            # TODO(future PR): add support for this in the reference path.
+            assert qdata_pack_factor == 1, (
+                "sub-byte qdata dtypes are not supported on the dim=-2 path"
+            )
+
             # hop known fast, use it unless overridden
             _use_hop_path = _hop_mode in (_HopMode.AUTO, _HopMode.HOP)
 
@@ -114,6 +139,7 @@ def flex_cast_quant_dense(
                     block_size_int == 128 
                     and qdata_dtype == torch.float8_e4m3fn 
                     and scale_dtype == torch.float32
+                    and qdata_pack_factor == 1
                 ), "unsupported"
                 qdata, scale = flex_cast_quant_dense_with_hop(
                     input,
@@ -152,6 +178,7 @@ def flex_cast_quant_dense(
                     (B1, B2) == (128, 128)
                     and qdata_dtype == torch.float8_e4m3fn
                     and scale_dtype == torch.float32
+                    and qdata_pack_factor == 1
                 ), "unsupported"
                 qdata, scale = flex_cast_quant_dense_with_hop(
                     input,
@@ -177,10 +204,10 @@ def flex_cast_quant_dense(
                 scale_bc = amax_to_scale_fn(amax)
                 qdata_b = cast_to_dtype_fn(x_b, scale_bc)
                 qdata = (
-                    qdata_b.reshape(n1, n2, B1, B2)
+                    qdata_b.reshape(n1, n2, B1, B2 // qdata_pack_factor)
                     .transpose(-3, -2)
                     .contiguous()
-                    .reshape(M, K)
+                    .reshape(M, K // qdata_pack_factor)
                 )
                 scale = scale_bc.squeeze(-1)
 
