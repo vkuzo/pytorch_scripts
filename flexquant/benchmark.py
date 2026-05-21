@@ -16,6 +16,7 @@ from recipes import (
     deepseek_fp8_1_128_dim_m,
     deepseek_fp8_128_128,
     nvfp4_no_gs,
+    nvfp4_no_gs_lut,
     nvfp4_with_gs,
 )
 
@@ -33,6 +34,7 @@ RECIPES: list[tuple[str, Recipe | RecipeTriton, _HopMode | None]] = [
     ("deepseek_fp8_128_128_hop", deepseek_fp8_128_128, _HopMode.HOP),
     ("deepseek_fp8_128_128_triton", deepseek_fp8_128_128_triton, None),
     ("nvfp4_no_gs", nvfp4_no_gs, _HopMode.NO_HOP),
+    ("nvfp4_no_gs_lut", nvfp4_no_gs_lut, _HopMode.NO_HOP),
     ("nvfp4_with_gs", nvfp4_with_gs, _HopMode.NO_HOP),
 ]
 RECIPES_BY_LABEL = {label: (recipe, mode) for label, recipe, mode in RECIPES}

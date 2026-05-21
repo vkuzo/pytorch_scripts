@@ -299,3 +299,52 @@ def pack_uint4(uint8_data: Tensor) -> Tensor:
     assert shape[-1] % 2 == 0
     uint8_data = uint8_data.contiguous().view(-1)
     return (uint8_data[::2] | uint8_data[1::2] << 4).view(down_size(shape))
+
+
+# ---------------------------------------------------------------------------
+# LUT path for fp4 e2m1: a "code LUT" — `_FP4_E2M1_VALS[code]` is the float
+# value that the 4-bit code decodes to. Quantization is `searchsorted` on the
+# value-sorted bounds, then a permutation gather from sorted-position to bit
+# code. No round-to-nearest-even; ties go toward the lower-magnitude side
+# (`searchsorted` default).
+# ---------------------------------------------------------------------------
+
+# Indexed by bit code. Bit 3 = sign, bits 2:0 = magnitude index (sign-magnitude).
+_FP4_E2M1_VALS = torch.tensor(
+    [
+         0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ],
+    dtype=torch.float32,
+)
+
+# Sort values; the permutation indices ARE code_from_sorted (i-th smallest
+# value's bit code).
+_FP4_E2M1_SORTED_VALS, _FP4_E2M1_CODE_FROM_SORTED = _FP4_E2M1_VALS.sort()
+_FP4_E2M1_CODE_FROM_SORTED = _FP4_E2M1_CODE_FROM_SORTED.to(torch.uint8)
+
+# Midpoints between consecutive sorted values: 15 boundaries for 16 codes.
+_FP4_E2M1_BOUNDS = (
+    _FP4_E2M1_SORTED_VALS[:-1] + _FP4_E2M1_SORTED_VALS[1:]
+) / 2
+
+
+def f32_to_f4_unpacked_lut(x: Tensor) -> Tensor:
+    """
+    LUT-based variant of `f32_to_f4_unpacked`. Same input/output contract as
+    the bit-twiddle version, but does no round-to-nearest-even on ties.
+    """
+    assert x.dtype == torch.float
+    bounds = _FP4_E2M1_BOUNDS.to(x.device)
+    code_from_sorted = _FP4_E2M1_CODE_FROM_SORTED.to(x.device)
+    sorted_idx = torch.searchsorted(bounds, x.contiguous())
+    return code_from_sorted[sorted_idx]
+
+
+def f4_unpacked_to_f32_lut(x: Tensor) -> Tensor:
+    """
+    LUT-based dequantize; mirrors `f4_unpacked_to_f32`.
+    """
+    assert x.dtype == torch.uint8
+    vals = _FP4_E2M1_VALS.to(x.device)
+    return vals[x.long()]

@@ -3,7 +3,12 @@ from typing import Callable
 
 import torch
 
-from nvfp4_utils import F4_E2M1_MAX, f32_to_f4_unpacked, pack_uint4
+from nvfp4_utils import (
+    F4_E2M1_MAX,
+    f32_to_f4_unpacked,
+    f32_to_f4_unpacked_lut,
+    pack_uint4,
+)
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 EPS = 1e-12
@@ -161,6 +166,46 @@ nvfp4_no_gs = Recipe(
     amax_to_scale_fn=_nvfp4_amax_to_scale_fn,
     cast_to_dtype_fn=_nvfp4_cast_to_dtype_fn,
     _reference_fn=_nvfp4_no_gs_reference,
+)
+
+
+# Same format as `nvfp4_no_gs` but using the LUT-based fp32 -> fp4 cast
+# (`searchsorted` + permutation gather). No round-to-nearest-even — ties
+# round toward the lower-magnitude side. Output bytes can differ from
+# `nvfp4_no_gs` on tied inputs but the format and storage layout are
+# identical.
+
+def _nvfp4_lut_cast_to_dtype_fn(
+    tile: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    scale_fp32 = scale.to(torch.float32)
+    data_scaled = tile.to(torch.float32) * (1.0 / scale_fp32)
+    data_unpacked = f32_to_f4_unpacked_lut(data_scaled)
+    return pack_uint4(data_unpacked).view(torch.float4_e2m1fn_x2)
+
+
+def _nvfp4_no_gs_lut_reference(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    *lead, last = x.shape
+    n_blocks = last // 16
+    x_b = x.reshape(*lead, n_blocks, 16)
+    amax = x_b.abs().amax(dim=-1, keepdim=True)
+    scale_e4m3 = _nvfp4_amax_to_scale_fn(amax)
+    qdata_b = _nvfp4_lut_cast_to_dtype_fn(x_b, scale_e4m3)
+    qdata = qdata_b.reshape(*lead, last // 2)
+    return qdata, scale_e4m3.squeeze(-1)
+
+
+nvfp4_no_gs_lut = Recipe(
+    name="nvfp4_no_gs_lut",
+    block_size=16,
+    dim=-1,
+    qdata_dtype=torch.float4_e2m1fn_x2,
+    scale_dtype=torch.float8_e4m3fn,
+    amax_to_scale_fn=_nvfp4_amax_to_scale_fn,
+    cast_to_dtype_fn=_nvfp4_lut_cast_to_dtype_fn,
+    _reference_fn=_nvfp4_no_gs_lut_reference,
 )
 
 
