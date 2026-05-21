@@ -109,7 +109,7 @@ def test_eager_vs_compile(label: str, recipe: Recipe, hop_mode: _HopMode):
     assert bin_flip_frac < 0.05, f"too many bin flips: {bin_flip_frac}"
 
 
-def test_fuses_with_preceding_pointwise():
+def test_no_hop_fuses_with_preceding_pointwise():
     recipe = deepseek_fp8_1_128
 
     def fn(x):
@@ -134,3 +134,24 @@ def test_fuses_with_preceding_pointwise():
     # If relu fuses into the quant kernel, there is exactly one @triton.jit
     # kernel emitted. A second kernel would mean Inductor failed to fuse.
     FileCheck().check_count("@triton.jit", 1, exactly=True).run(triton_code)
+
+def test_hop_works_with_preceding_pointwise():
+    recipe = deepseek_fp8_128_128
+
+    def fn(x):
+        flex_cast_quant_dense_c = torch.compile(flex_cast_quant_dense)
+        return flex_cast_quant_dense_c(
+            F.relu(x),
+            block_size=recipe.block_size,
+            dim=recipe.dim,
+            qdata_dtype=recipe.qdata_dtype,
+            scale_dtype=recipe.scale_dtype,
+            amax_to_scale_fn=recipe.amax_to_scale_fn,
+            cast_to_dtype_fn=recipe.cast_to_dtype_fn,
+        )
+
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+
+    compiled = torch.compile(fn, fullgraph=True)
+    y = compiled(x)

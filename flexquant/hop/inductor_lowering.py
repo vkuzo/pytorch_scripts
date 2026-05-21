@@ -14,6 +14,7 @@ from torch._inductor.kernel.flex.common import (
     build_subgraph_buffer,
     create_placeholder,
     freeze_irnodes,
+    maybe_realize,
 )
 from torch._inductor.lowering import empty_strided, register_lowering
 from torch._inductor.select_algorithm import (
@@ -202,6 +203,11 @@ def _flex_quant_lowering(
         f"unsupported qdata_dtype: {qdata_dtype!r}"
     )
     assert scale_dtype == torch.float32, f"unsupported scale_dtype: {scale_dtype!r}"
+
+    # Realize x so it has concrete strides; otherwise an unrealized Pointwise
+    # (e.g. a fused preceding op like relu) has no stride info and every
+    # template choice gets filtered out.
+    (x,) = maybe_realize([x])
 
     key = _tiling_key(block_size, dim)
     if key == _TILING_128_128:
