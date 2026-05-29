@@ -117,32 +117,24 @@ def test_eager_vs_compile(label: str, recipe: Recipe, hop_mode: _HopMode):
     compiled = torch.compile(flex_cast_quant_dense, fullgraph=True)
     qdata_compiled, scale_compiled = _call_pt(recipe, hop_mode, x, fn=compiled)
 
-    # Inductor may reorder fp ops, causing tiny scale drift that flips a small
-    # fraction of fp8 values by one quantization bin. Compare with tolerances
-    # that accept one-bin drift but not algorithmic divergence.
-    # Cast scale to fp32 for comparison: assert_close with tolerances doesn't
-    # support fp8 dtypes (e.g. nvfp4 uses e4m3 scale).
+    if qdata_eager.dtype == torch.float4_e2m1fn_x2:
+        # `.to(torch.float32)` isn't implemented for float4_e2m1fn_x2; compare
+        # the underlying packed bytes instead.
+        assert torch.equal(
+            qdata_eager.view(torch.uint8), qdata_compiled.view(torch.uint8)
+        )
+    else:
+        assert torch.equal(
+            qdata_eager.to(torch.float32), qdata_compiled.to(torch.float32)
+        )
+
     scales_eager = scale_eager if isinstance(scale_eager, list) else [scale_eager]
     scales_compiled = (
         scale_compiled if isinstance(scale_compiled, list) else [scale_compiled]
     )
     assert len(scales_eager) == len(scales_compiled)
     for s_eager, s_compiled in zip(scales_eager, scales_compiled):
-        torch.testing.assert_close(
-            s_eager.to(torch.float32),
-            s_compiled.to(torch.float32),
-            rtol=1e-2,
-            atol=1e-6,
-        )
-    if qdata_eager.dtype == torch.float4_e2m1fn_x2:
-        # `.to(torch.float32)` isn't implemented for float4_e2m1fn_x2; compare
-        # packed bytes. Note this is stricter than per-element compare since
-        # one byte mismatch covers two fp4 elements.
-        diff = qdata_eager.view(torch.uint8) != qdata_compiled.view(torch.uint8)
-    else:
-        diff = qdata_eager.to(torch.float32) != qdata_compiled.to(torch.float32)
-    bin_flip_frac = diff.float().mean().item()
-    assert bin_flip_frac < 0.05, f"too many bin flips: {bin_flip_frac}"
+        assert torch.equal(s_eager, s_compiled)
 
 
 def test_no_hop_fuses_with_preceding_pointwise():
