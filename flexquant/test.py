@@ -39,6 +39,14 @@ RECIPES_TRITON: list[tuple[str, RecipeTriton]] = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _reset_dynamo():
+    # The Dynamo cache is keyed on flex_cast_quant_dense's code object, which
+    # is shared across every parametrized test in this file. Without a reset,
+    # cache entries from earlier tests accumulate and trip recompile_limit (8).
+    torch._dynamo.reset()
+
+
 def _call_pt(recipe: Recipe, hop_mode: _HopMode, x: torch.Tensor, fn=None):
     pt_fn = fn if fn is not None else flex_cast_quant_dense
     return pt_fn(
@@ -135,6 +143,44 @@ def test_eager_vs_compile(label: str, recipe: Recipe, hop_mode: _HopMode):
     assert len(scales_eager) == len(scales_compiled)
     for s_eager, s_compiled in zip(scales_eager, scales_compiled):
         assert torch.equal(s_eager, s_compiled)
+
+
+@pytest.mark.parametrize(
+    "label,recipe,hop_mode", RECIPES_PT, ids=[label for label, _, _ in RECIPES_PT]
+)
+def test_eager_vs_compile_cuda_graph(label: str, recipe: Recipe, hop_mode: _HopMode):
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+
+    qdata_eager, scale_eager = _call_pt(recipe, hop_mode, x)
+
+    compiled = torch.compile(
+        flex_cast_quant_dense, fullgraph=True, mode="reduce-overhead"
+    )
+    # cudagraph-trees needs a warmup invocation before the captured replay;
+    # the second call returns cudagraph-managed outputs.
+    _ = _call_pt(recipe, hop_mode, x, fn=compiled)
+    qdata_cg, scale_cg = _call_pt(recipe, hop_mode, x, fn=compiled)
+
+    # Outputs from cudagraph-trees are freed on the next captured replay;
+    # clone so later assertions are stable if someone extends the test.
+    qdata_cg = qdata_cg.clone()
+    scale_cg = (
+        [s.clone() for s in scale_cg]
+        if isinstance(scale_cg, list)
+        else scale_cg.clone()
+    )
+
+    if qdata_eager.dtype == torch.float4_e2m1fn_x2:
+        assert torch.equal(qdata_eager.view(torch.uint8), qdata_cg.view(torch.uint8))
+    else:
+        assert torch.equal(qdata_eager.to(torch.float32), qdata_cg.to(torch.float32))
+
+    scales_eager = scale_eager if isinstance(scale_eager, list) else [scale_eager]
+    scales_cg = scale_cg if isinstance(scale_cg, list) else [scale_cg]
+    assert len(scales_eager) == len(scales_cg)
+    for s_eager, s_cg in zip(scales_eager, scales_cg):
+        assert torch.equal(s_eager, s_cg)
 
 
 def test_no_hop_fuses_with_preceding_pointwise():
