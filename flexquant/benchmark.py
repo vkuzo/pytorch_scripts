@@ -17,6 +17,7 @@ from recipes import (
     deepseek_fp8_128_128,
     nvfp4_no_gs,
     nvfp4_no_gs_lut,
+    nvfp4_no_gs_swizzle,
     nvfp4_with_gs,
 )
 
@@ -35,6 +36,7 @@ RECIPES: list[tuple[str, Recipe | RecipeTriton, _HopMode | None]] = [
     ("deepseek_fp8_128_128_triton", deepseek_fp8_128_128_triton, None),
     ("nvfp4_no_gs", nvfp4_no_gs, _HopMode.NO_HOP),
     ("nvfp4_no_gs_lut", nvfp4_no_gs_lut, _HopMode.NO_HOP),
+    ("nvfp4_no_gs_swizzle", nvfp4_no_gs_swizzle, _HopMode.NO_HOP),
     ("nvfp4_with_gs", nvfp4_with_gs, _HopMode.NO_HOP),
 ]
 RECIPES_BY_LABEL = {label: (recipe, mode) for label, recipe, mode in RECIPES}
@@ -131,6 +133,7 @@ def _bench_one(
     trace_path: str | None = None,
 ) -> tuple[float, float, float, float]:
     torch.manual_seed(0)
+    torch._dynamo.reset()
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
 
     # Triton-backed recipes skip torch.compile — they're already a kernel.
@@ -159,6 +162,7 @@ def _bench_one(
                 scale_dtype=recipe_obj.scale_dtype,
                 amax_to_scale_fn=recipe_obj.amax_to_scale_fn,
                 cast_to_dtype_fn=recipe_obj.cast_to_dtype_fn,
+                scale_swizzle=recipe_obj.scale_swizzle,
                 _hop_mode=hop_mode,
             )
 

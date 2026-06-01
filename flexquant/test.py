@@ -18,6 +18,7 @@ from recipes import (
     deepseek_fp8_128_128,
     nvfp4_no_gs,
     nvfp4_no_gs_lut,
+    nvfp4_no_gs_swizzle,
     nvfp4_with_gs,
 )
 
@@ -31,6 +32,7 @@ RECIPES_PT: list[tuple[str, Recipe, _HopMode]] = [
     ("deepseek_fp8_128_128_hop", deepseek_fp8_128_128, _HopMode.HOP),
     ("nvfp4_no_gs", nvfp4_no_gs, _HopMode.NO_HOP),
     ("nvfp4_no_gs_lut", nvfp4_no_gs_lut, _HopMode.NO_HOP),
+    ("nvfp4_no_gs_swizzle", nvfp4_no_gs_swizzle, _HopMode.NO_HOP),
     ("nvfp4_with_gs", nvfp4_with_gs, _HopMode.NO_HOP),
 ]
 RECIPES_TRITON: list[tuple[str, RecipeTriton]] = [
@@ -57,6 +59,7 @@ def _call_pt(recipe: Recipe, hop_mode: _HopMode, x: torch.Tensor, fn=None):
         scale_dtype=recipe.scale_dtype,
         amax_to_scale_fn=recipe.amax_to_scale_fn,
         cast_to_dtype_fn=recipe.cast_to_dtype_fn,
+        scale_swizzle=recipe.scale_swizzle,
         _hop_mode=hop_mode,
     )
 

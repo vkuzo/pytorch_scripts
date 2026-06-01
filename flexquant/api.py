@@ -2,11 +2,13 @@ from enum import Enum
 from typing import Callable
 
 import torch
+from torch.nn.functional import SwizzleType
 
 # Side-effect import: registers the FlexQuant HOP, its Dynamo variable,
 # and its Inductor lowering. Imported eagerly so the registrations are in
 # place before the user's first torch.compile call.
 from hop import flex_cast_quant_dense_with_hop
+from swizzle import to_blocked_2d
 
 
 class _HopMode(Enum):
@@ -24,6 +26,7 @@ def flex_cast_quant_dense(
     scale_dtype: torch.dtype | list[torch.dtype],
     amax_to_scale_fn: Callable | list[Callable],
     cast_to_dtype_fn: Callable,
+    scale_swizzle: SwizzleType | None = None,
     # arguments below are for debugging only
     _hop_mode: _HopMode = _HopMode.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor | list[torch.Tensor]]:
@@ -90,6 +93,12 @@ def flex_cast_quant_dense(
         cast_to_dtype_fn: ``(tile, scale) -> qdata`` for single-level, or
             ``(tile, inner_scale, outer_scale) -> qdata`` for two-level.
             Must be a pure pointwise op.
+        scale_swizzle: optional scale layout transform applied to the returned
+            scale. ``None`` (default) returns the natural row-major scale.
+            ``SwizzleType.SWIZZLE_32_4_4`` returns the NVIDIA blocked layout
+            ``_scaled_mm`` consumes, as a 2D tensor of shape
+            ``(32 * ceil(M / 128), 16 * ceil(n_blocks / 4))``. Only supported
+            on the single-level 1D ``dim=-1`` path.
 
     Returns:
         ``(qdata, scale)`` for single-level. ``(qdata, [inner_scale,
@@ -139,6 +148,12 @@ def flex_cast_quant_dense(
         assert _hop_mode in (_HopMode.AUTO, _HopMode.NO_HOP), \
             "HOP path doesn't support two-level scaling"
 
+    if scale_swizzle is not None:
+        assert scale_swizzle == SwizzleType.SWIZZLE_32_4_4, \
+            f"unsupported scale_swizzle: {scale_swizzle}"
+        assert not _two_level, \
+            "scale_swizzle is not supported with two-level scaling"
+
     block_size_t = (block_size,) if isinstance(block_size, int) else tuple(block_size)
     dim_t = (dim,) if isinstance(dim, int) else tuple(dim)
     assert len(block_size_t) == len(dim_t)
@@ -184,11 +199,15 @@ def flex_cast_quant_dense(
                 scale_bc = amax_to_scale_fn(amax)
                 qdata_b = cast_to_dtype_fn(x_b, scale_bc)
             qdata = qdata_b.reshape(M, K // qdata_pack_factor)
-            scale = scale_bc.squeeze(-1)
+            scale = scale_bc.squeeze(-1)  # (M, n_blocks)
+            if scale_swizzle is not None:
+                scale = to_blocked_2d(scale)
 
         else:
             # dim=-2: reduce across M; output qdata/scale row-major in (K, M) layout
 
+            assert scale_swizzle is None, \
+                "scale_swizzle is only supported on the dim=-1 path"
             assert normalized_dim_t == (0,), "unsupported"
             assert M % block_size_int == 0, (
                 f"input.shape[-2]={M} must be divisible by block_size={block_size_int}"
@@ -235,6 +254,8 @@ def flex_cast_quant_dense(
         # 2D blocked scaling
 
         if normalized_dim_t == (0, 1):
+            assert scale_swizzle is None, \
+                "scale_swizzle is only supported on the dim=-1 path"
             B1, B2 = block_size_t
             assert B1 > 0 and B2 > 0
             assert M % B1 == 0 and K % B2 == 0, (
