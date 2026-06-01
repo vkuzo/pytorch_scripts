@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
+from torch.nn.functional import SwizzleType
 
 from nvfp4_utils import (
     F4_E2M1_MAX,
@@ -9,6 +10,7 @@ from nvfp4_utils import (
     f32_to_f4_unpacked_lut,
     pack_uint4,
 )
+from swizzle import to_blocked_2d
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 EPS = 1e-12
@@ -29,6 +31,7 @@ class Recipe:
     # arguments below are for debugging only
     # Plain PyTorch reference implementation (including the tiling)
     _reference_fn: Callable
+    scale_swizzle: SwizzleType | None = None
 
 
 def _deepseek_fp8_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
@@ -166,6 +169,36 @@ nvfp4_no_gs = Recipe(
     amax_to_scale_fn=_nvfp4_amax_to_scale_fn,
     cast_to_dtype_fn=_nvfp4_cast_to_dtype_fn,
     _reference_fn=_nvfp4_no_gs_reference,
+)
+
+
+# Same format as `nvfp4_no_gs`, but the block scale is returned in the NVIDIA
+# blocked (32x4x4 swizzle) layout that `_scaled_mm` consumes. Only the
+# reference differs from `nvfp4_no_gs` (it swizzles the scale via the same
+# `to_blocked_2d` helper the api path uses).
+def _nvfp4_no_gs_swizzle_reference(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    *lead, last = x.shape
+    n_blocks = last // 16
+    x_b = x.reshape(*lead, n_blocks, 16)
+    amax = x_b.abs().amax(dim=-1, keepdim=True)
+    scale_e4m3 = _nvfp4_amax_to_scale_fn(amax)
+    qdata_b = _nvfp4_cast_to_dtype_fn(x_b, scale_e4m3)
+    qdata = qdata_b.reshape(*lead, last // 2)
+    return qdata, to_blocked_2d(scale_e4m3.squeeze(-1))
+
+
+nvfp4_no_gs_swizzle = Recipe(
+    name="nvfp4_no_gs_swizzle",
+    block_size=16,
+    dim=-1,
+    qdata_dtype=torch.float4_e2m1fn_x2,
+    scale_dtype=torch.float8_e4m3fn,
+    amax_to_scale_fn=_nvfp4_amax_to_scale_fn,
+    cast_to_dtype_fn=_nvfp4_cast_to_dtype_fn,
+    _reference_fn=_nvfp4_no_gs_swizzle_reference,
+    scale_swizzle=SwizzleType.SWIZZLE_32_4_4,
 )
 
 
