@@ -374,6 +374,27 @@ mxfp8_floor = Recipe(
 )
 
 
+# Same format as `mxfp8_floor`, but reducing across M (dim=-2): output qdata
+# and scale in transposed (K, M) layout. Mirrors `deepseek_fp8_1_128_dim_m` --
+# the reference reuses the dim=-1 reference on the transposed input.
+def _mxfp8_floor_dim_m_reference(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _mxfp8_floor_reference(x.transpose(-2, -1).contiguous())
+
+
+mxfp8_floor_dim_m = Recipe(
+    name="mxfp8_floor_dim_m",
+    block_size=32,
+    dim=-2,
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float8_e8m0fnu,
+    amax_to_scale_fn=_mxfp8_floor_amax_to_scale_fn,
+    cast_to_dtype_fn=_mxfp8_floor_cast_to_dtype_fn,
+    _reference_fn=_mxfp8_floor_dim_m_reference,
+)
+
+
 # Same format as `mxfp8_floor`, but the e8m0 block scale is returned in the
 # NVIDIA blocked (32x4x4 swizzle) layout. Only the reference differs (it
 # swizzles the scale via the same `to_blocked_2d` helper the api path uses).
