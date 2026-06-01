@@ -15,6 +15,8 @@ from recipes import (
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,
     deepseek_fp8_128_128,
+    mxfp8_floor,
+    mxfp8_floor_swizzle,
     nvfp4_no_gs,
     nvfp4_no_gs_lut,
     nvfp4_no_gs_swizzle,
@@ -38,6 +40,8 @@ RECIPES: list[tuple[str, Recipe | RecipeTriton, _HopMode | None]] = [
     ("nvfp4_no_gs_lut", nvfp4_no_gs_lut, _HopMode.NO_HOP),
     ("nvfp4_no_gs_swizzle", nvfp4_no_gs_swizzle, _HopMode.NO_HOP),
     ("nvfp4_with_gs", nvfp4_with_gs, _HopMode.NO_HOP),
+    ("mxfp8_floor", mxfp8_floor, _HopMode.NO_HOP),
+    ("mxfp8_floor_swizzle", mxfp8_floor_swizzle, _HopMode.NO_HOP),
 ]
 RECIPES_BY_LABEL = {label: (recipe, mode) for label, recipe, mode in RECIPES}
 

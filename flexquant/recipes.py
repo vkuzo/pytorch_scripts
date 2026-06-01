@@ -18,6 +18,14 @@ EPS = 1e-12
 F8E4M3_MAX = FP8_MAX
 E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
 
+# mxfp8 (e8m0 power-of-two block scale) constants, from torchao mx_formats.
+E8M0_EXPONENT_BIAS = 127
+F32_EXP_BIAS = 127
+MBITS_F32 = 23
+F8E4M3_MAX_POW2 = 8
+F32_MIN_NORMAL = 2.0**-126
+E8M0_NAN = 255
+
 
 @dataclass(frozen=True)
 class Recipe:
@@ -302,5 +310,95 @@ nvfp4_with_gs = Recipe(
     ],
     cast_to_dtype_fn=_nvfp4_with_gs_cast_to_dtype_fn,
     _reference_fn=_nvfp4_with_gs_reference,
+)
+
+
+# mxfp8 with FLOOR scale rounding: per-block (32 elements) e8m0 power-of-two
+# scale + e4m3 data. Mirrors torchao `to_mx(..., ScaleCalculationMode.FLOOR)`
+# (`mx_formats/mx_tensor.py`), the OCP MX Spec 1.0 method
+# `X = 2^(floor(log2(max_abs)) - max_exp)`. Single-level, no packing.
+
+def _mxfp8_floor_amax_to_scale_fn(amax: torch.Tensor) -> torch.Tensor:
+    # amax: (M, nb, 1) -> e8m0 block scale via FLOOR rounding. The fp32
+    # exponent of amax is extracted by integer bit-ops (no log2), shifted by
+    # the e4m3 target power-of-two, clamped, biased, and stored as e8m0.
+    max_abs = amax.to(torch.float32)
+    max_abs_int32 = max_abs.view(torch.int32)
+    extracted_pow2 = ((max_abs_int32 >> MBITS_F32) & 0xFF) - F32_EXP_BIAS
+    scale_unbiased = extracted_pow2 - F8E4M3_MAX_POW2
+    scale_unbiased = torch.clamp(
+        scale_unbiased, -E8M0_EXPONENT_BIAS, E8M0_EXPONENT_BIAS + 1
+    )
+    scale_biased = (scale_unbiased + E8M0_EXPONENT_BIAS).to(torch.uint8)
+    scale_biased = torch.where(
+        torch.isnan(max_abs), torch.full_like(scale_biased, E8M0_NAN), scale_biased
+    )
+    return scale_biased.view(torch.float8_e8m0fnu)
+
+
+def _mxfp8_floor_cast_to_dtype_fn(
+    tile: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    # Reconstruct the fp32 power-of-two factor by shifting the e8m0 biased
+    # exponent byte back into the fp32 exponent field, then clamp away
+    # denormals (matches torchao's `clamp(min=F32_MIN_NORMAL)`).
+    biased_i32 = scale.view(torch.uint8).to(torch.int32)
+    scale_fp32 = (biased_i32 << MBITS_F32).view(torch.float32)
+    scale_fp32 = torch.clamp(scale_fp32, min=F32_MIN_NORMAL)
+    data = tile.to(torch.float32) / scale_fp32
+    return data.to(torch.float8_e4m3fn)
+
+
+def _mxfp8_floor_reference(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    *lead, last = x.shape
+    n_blocks = last // 32
+    x_b = x.reshape(*lead, n_blocks, 32)
+    amax = x_b.abs().amax(dim=-1, keepdim=True)
+    scale_e8m0 = _mxfp8_floor_amax_to_scale_fn(amax)
+    qdata_b = _mxfp8_floor_cast_to_dtype_fn(x_b, scale_e8m0)
+    qdata = qdata_b.reshape(*lead, last)
+    return qdata, scale_e8m0.squeeze(-1)
+
+
+mxfp8_floor = Recipe(
+    name="mxfp8_floor",
+    block_size=32,
+    dim=-1,
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float8_e8m0fnu,
+    amax_to_scale_fn=_mxfp8_floor_amax_to_scale_fn,
+    cast_to_dtype_fn=_mxfp8_floor_cast_to_dtype_fn,
+    _reference_fn=_mxfp8_floor_reference,
+)
+
+
+# Same format as `mxfp8_floor`, but the e8m0 block scale is returned in the
+# NVIDIA blocked (32x4x4 swizzle) layout. Only the reference differs (it
+# swizzles the scale via the same `to_blocked_2d` helper the api path uses).
+def _mxfp8_floor_swizzle_reference(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    *lead, last = x.shape
+    n_blocks = last // 32
+    x_b = x.reshape(*lead, n_blocks, 32)
+    amax = x_b.abs().amax(dim=-1, keepdim=True)
+    scale_e8m0 = _mxfp8_floor_amax_to_scale_fn(amax)
+    qdata_b = _mxfp8_floor_cast_to_dtype_fn(x_b, scale_e8m0)
+    qdata = qdata_b.reshape(*lead, last)
+    return qdata, to_blocked_2d(scale_e8m0.squeeze(-1))
+
+
+mxfp8_floor_swizzle = Recipe(
+    name="mxfp8_floor_swizzle",
+    block_size=32,
+    dim=-1,
+    qdata_dtype=torch.float8_e4m3fn,
+    scale_dtype=torch.float8_e8m0fnu,
+    amax_to_scale_fn=_mxfp8_floor_amax_to_scale_fn,
+    cast_to_dtype_fn=_mxfp8_floor_cast_to_dtype_fn,
+    _reference_fn=_mxfp8_floor_swizzle_reference,
+    scale_swizzle=SwizzleType.SWIZZLE_32_4_4,
 )
 
