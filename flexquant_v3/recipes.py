@@ -1,0 +1,449 @@
+"""Quant recipes for flex_cast_quant, bundled as `Recipe` dataclasses.
+
+Each recipe pairs a plain-PyTorch quant kernel `quant(x) -> (qdata, aux_out)` (v1
+`_reference_fn` style) with its `dequant(qdata, scale) -> fp32` inverse. The `RECIPES`
+table registers them (plus per-recipe test metadata) for the tests in test.py. Math
+mirrors flexquant v1 recipes.py.
+"""
+
+from dataclasses import dataclass
+from typing import Callable
+
+import torch
+
+from utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uint4
+
+
+@dataclass(frozen=True)
+class Recipe:
+    """A single-kernel quant recipe: the quant kernel and its dequant.
+
+    `quant(x) -> (qdata, aux_out)` is the `f` passed to `flex_cast_quant`; it is always
+    tile-invariant (the same computation applied independently to every tile) -- that is a
+    precondition of the API, so it isn't a per-recipe field. `dequant(qdata, scale) -> fp32`
+    inverts it (for SQNR checks). Single-kernel only for now: recipes that need a separate
+    kernel (e.g. tensorwise's global scale reduction) keep that step outside the Recipe.
+    """
+
+    quant: Callable
+    dequant: Callable
+
+
+# ---------------------------------------------------------------------------
+# The recipe: deepseek fp8 1x128, expressed as a tile-invariant `f`.
+#
+# Whole-tensor + block-aware form (v1 _reference_fn style). `flex_cast_quant` runs this
+# as a passthrough today; the reshape->amax->scale->cast is the same computation applied
+# independently to every 1x128 group, i.e. tile-invariant. Math mirrors v1
+# _deepseek_fp8_1_128_reference (recipes.py:60-70). Constants are inlined per recipe
+# (block size 128, eps 1e-12, fp8 e4m3 max 448.0) rather than shared as globals, since
+# other recipes with different constants will be added alongside this one.
+# ---------------------------------------------------------------------------
+def deepseek_1x128_f(x):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 128, 128)
+    amax = x_b.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12).to(torch.float32)
+    scale = (amax / fp8_max).to(torch.float32)  # forward scale
+    qdata = (x_b.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
+    return qdata.reshape(*lead, last), scale.squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# The recipe: deepseek fp8 128x128, expressed as a tile-invariant `f`.
+#
+# 2D block variant: amax over a full 128x128 tile, one scale per tile. Math mirrors v1
+# _deepseek_fp8_128_128_reference (recipes.py:100-121); the reshape/transpose gymnastics
+# gather each 128x128 tile into a contiguous group before reducing. Constants inlined
+# per recipe, as above.
+# ---------------------------------------------------------------------------
+def deepseek_128x128_f(x):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    *lead, d1, d2 = x.shape
+    n1, n2 = d1 // 128, d2 // 128
+    x_b = (
+        x.reshape(*lead, n1, 128, n2, 128)
+        .transpose(-3, -2)
+        .contiguous()
+        .reshape(*lead, n1, n2, 128 * 128)
+    )
+    amax = x_b.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12).to(torch.float32)
+    scale = (amax / fp8_max).to(torch.float32)  # forward scale
+    qdata_b = (x_b.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
+    qdata = (
+        qdata_b.reshape(*lead, n1, n2, 128, 128)
+        .transpose(-3, -2)
+        .contiguous()
+        .reshape(*lead, d1, d2)
+    )
+    return qdata, scale.squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# The recipe: mxfp8 with FLOOR rounding (1x32 blocks, e8m0 power-of-two scale).
+#
+# Tile-invariant like deepseek_1x128 (reduce over 32-element groups along N, no
+# transpose), but the scale is an e8m0 (float8_e8m0fnu) power-of-two rather than fp32.
+# Math mirrors v1 _mxfp8_floor_reference + its amax_to_scale/cast helpers
+# (recipes.py:321-362): the e8m0 scale is derived by extracting amax's fp32 exponent via
+# integer bit-ops (FLOOR, no log2), and the cast reconstructs the pow2 factor by shifting
+# the biased exponent back into the fp32 exponent field. Constants (block 32, e8m0/fp32
+# exponent bias 127, 23 fp32 mantissa bits, e4m3 max pow2 8) inlined per recipe.
+# ---------------------------------------------------------------------------
+def mxfp8_floor_f(x):
+    e8m0_exponent_bias = 127
+    f32_exp_bias = 127
+    mbits_f32 = 23
+    f8e4m3_max_pow2 = 8
+    f32_min_normal = 2.0**-126
+    e8m0_nan = 255
+
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 32, 32)
+    amax = x_b.abs().amax(dim=-1, keepdim=True)
+
+    # amax -> e8m0 block scale (FLOOR): extract fp32 exponent by integer bit-ops.
+    max_abs = amax.to(torch.float32)
+    max_abs_int32 = max_abs.view(torch.int32)
+    extracted_pow2 = ((max_abs_int32 >> mbits_f32) & 0xFF) - f32_exp_bias
+    scale_unbiased = extracted_pow2 - f8e4m3_max_pow2
+    scale_unbiased = torch.clamp(
+        scale_unbiased, -e8m0_exponent_bias, e8m0_exponent_bias + 1
+    )
+    scale_biased = (scale_unbiased + e8m0_exponent_bias).to(torch.uint8)
+    scale_biased = torch.where(
+        torch.isnan(max_abs), torch.full_like(scale_biased, e8m0_nan), scale_biased
+    )
+    scale_e8m0 = scale_biased.view(torch.float8_e8m0fnu)
+
+    # cast: reconstruct the fp32 pow2 factor from the e8m0 biased exponent, then divide.
+    biased_i32 = scale_e8m0.view(torch.uint8).to(torch.int32)
+    scale_fp32 = (biased_i32 << mbits_f32).view(torch.float32)
+    scale_fp32 = torch.clamp(scale_fp32, min=f32_min_normal)
+    qdata = (x_b.to(torch.float32) / scale_fp32).to(torch.float8_e4m3fn)
+
+    return qdata.reshape(*lead, last), scale_e8m0.squeeze(-1)
+
+
+def _to_blocked_2d(scale):
+    """Swizzle a row-major block-scale (H, W) into NVIDIA's 2D blocked layout.
+
+    Ported from flexquant v1 swizzle.py:11-46 (itself a port of torchao's `to_blocked`,
+    torchao/prototype/mx_formats/utils.py). Output is (32*ceil(H/128), 16*ceil(W/4));
+    `.flatten()` equals torchao's `to_blocked`.
+    """
+    def _ceil_div(a, b):
+        return (a + b - 1) // b
+
+    rows, cols = scale.shape
+    n_row_blocks = _ceil_div(rows, 128)
+    n_col_blocks = _ceil_div(cols, 4)
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * 4
+
+    padded = scale
+    if torch.compiler.is_compiling() or (rows, cols) != (padded_rows, padded_cols):
+        padded = torch.zeros(
+            (padded_rows, padded_cols), device=scale.device, dtype=scale.dtype
+        )
+        padded[:rows, :cols] = scale
+
+    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+    return rearranged.reshape(n_row_blocks * 32, n_col_blocks * 16)
+
+
+def _from_blocked_2d(blocked, rows, cols):
+    """Inverse of `_to_blocked_2d` for the exact case rows % 128 == 0, cols % 4 == 0."""
+    nrb, ncb = rows // 128, cols // 4
+    x = blocked.reshape(-1, 32, 16).reshape(-1, 32, 4, 4).transpose(1, 2)
+    x = x.reshape(nrb, ncb, 128, 4).permute(0, 2, 1, 3)
+    return x.reshape(rows, cols)
+
+
+# nvfp4 format constants (fp4 e2m1 max value + e4m3 scale range).
+F4_E2M1_MAX = 6.0
+F8E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
+
+
+# ---------------------------------------------------------------------------
+# The recipe: mxfp8 FLOOR with swizzled (NVIDIA 32x4x4 blocked) scale.
+#
+# Same quantization as mxfp8_floor_f, but the e8m0 scale is emitted in the blocked layout
+# `_scaled_mm` consumes (v1 mxfp8_floor_swizzle, recipes.py:401-423). The swizzle is a
+# LOCAL, tile-invariant transform when tiles are whole 128x128 hp units (= 128x4 e8m0
+# tiles): each 128x4 scale tile swizzles independently into a 32x16 block. Returning the
+# swizzled scale as a (1, N) ROW lets MANUAL_TILE's existing cat(dim=-1)/cat(dim=-2)
+# recompose it -- `.flatten()` walks the (row-block, col-block) buffer order. NOTE: only
+# valid for 128x128-aligned inputs; other tilings reorder the buffer.
+# ---------------------------------------------------------------------------
+def mxfp8_floor_swizzle_f(x):
+    qdata, scale_e8m0 = mxfp8_floor_f(x)
+    return qdata, _to_blocked_2d(scale_e8m0).reshape(1, -1)
+
+
+# ---------------------------------------------------------------------------
+# The recipe: deepseek fp8 1x128, reduced across M (128x1 blocks), transposed output.
+#
+# This is plain `deepseek_1x128_f` composed with `flex_cast_quant(_swap_input_axes=True)`:
+# the framework swaps the input axes on load (transpose-first), so `f` sees the (K, M)
+# orientation and reduces the correct axis, yielding (K, M) qdata and (K, M//128) scale --
+# equivalent to v1 _deepseek_fp8_1_128_dim_m_reference (recipes.py:84-86). Because the
+# transpose happens BEFORE tiling (swap-on-load), the per-tile work stays tile-invariant,
+# so this now runs under MANUAL_TILE too -- no dedicated transposing `f` needed.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# The recipe: float8 tensorwise (per-tensor) scaling.
+#
+# Unlike the block recipes, the scale is a single per-tensor value that needs a GLOBAL
+# reduction over the whole tensor -- that reduction is NOT tile-invariant, so it lives
+# OUTSIDE flex_cast_quant (`float8_tensorwise_scale`; the "call something else" kernel
+# from api.py's docstring). Given that precomputed scale, quantization is just dividing
+# every element by one fixed scalar -- identical across tiles, hence tile-invariant -- so
+# it runs INSIDE flex_cast_quant via an `f` that closes over the replicated scale.
+# ---------------------------------------------------------------------------
+def float8_tensorwise_scale(x):
+    """Per-tensor scale (global reduction; computed outside flex_cast_quant)."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    amax = x.abs().amax().clamp(min=1e-12).to(torch.float32)
+    return (amax / fp8_max).to(torch.float32)  # scalar forward scale
+
+
+def make_float8_tensorwise_f(scale):
+    """Tile-invariant `f` closing over the precomputed per-tensor `scale`."""
+
+    def f(x):
+        qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
+        return qdata, scale
+
+    return f
+
+
+# ---------------------------------------------------------------------------
+# The recipe: nvfp4 with global scale (two-level) + swizzled inner scale.
+#
+# Two-level scaling like v1 nvfp4_with_gs (recipes.py:255-320): a per-tensor fp32 OUTER
+# scale plus a per-16-element e4m3 INNER scale, with fp4-packed qdata. The outer scale is
+# a GLOBAL amax reduction -- not tile-invariant -- so (like tensorwise) it is computed
+# OUTSIDE flex_cast_quant (`nvfp4_gs_scale`) and bound into the recipe. The inner scale is
+# additionally swizzled into the NVIDIA blocked layout and returned as a (1, N) row, so
+# MANUAL_TILE's cat recomposition reproduces the full-tensor swizzle (cf. mxfp8 swizzle).
+# ---------------------------------------------------------------------------
+def nvfp4_gs_scale(x):
+    """Per-tensor fp32 outer scale (global reduction; computed outside flex_cast_quant)."""
+    outer_amax = x.abs().to(torch.float32).amax()
+    return outer_amax / (F8E4M3_MAX * F4_E2M1_MAX)
+
+
+def make_nvfp4_gs_swizzle_f(outer_scale):
+    """Tile-invariant `f` closing over the precomputed per-tensor `outer_scale`."""
+
+    def f(x):
+        *lead, last = x.shape
+        x_b = x.reshape(*lead, last // 16, 16)
+        local_amax = x_b.abs().amax(dim=-1, keepdim=True)
+        # inner e4m3 block scale, relative to the outer scale.
+        inner = torch.clamp(
+            (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_scale,
+            min=E4M3_EPS, max=F8E4M3_MAX,
+        ).to(torch.float8_e4m3fn)
+        # cast: divide by (outer * inner), clamp to fp4 range, pack two per byte.
+        reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
+        data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
+        qdata_b = pack_uint4(f32_to_f4_unpacked(data_scaled)).view(torch.float4_e2m1fn_x2)
+        qdata = qdata_b.reshape(*lead, last // 2)
+        inner_swizzled = _to_blocked_2d(inner.squeeze(-1)).reshape(1, -1)
+        return qdata, inner_swizzled
+
+    return f
+
+
+# ---------------------------------------------------------------------------
+# Dequant: recover fp32 from (qdata, scale) by broadcasting the scale back over qdata.
+# The swizzle recipe un-swizzles the scale first; the dim-M recipe reuses the plain 1x128
+# dequant and the test transposes the result back to (M, N).
+# ---------------------------------------------------------------------------
+def _e8m0_to_fp32(scale):
+    # inverse of mxfp8_floor_f's cast: e8m0 biased exponent -> fp32 pow2 factor.
+    biased_i32 = scale.contiguous().view(torch.uint8).to(torch.int32)
+    scale_fp32 = (biased_i32 << 23).view(torch.float32)
+    return torch.clamp(scale_fp32, min=2.0**-126)
+
+
+def deepseek_1x128_dq_f(q, scale):
+    M, N = q.shape
+    nb = N // 128
+    return (q.float().reshape(M, nb, 128) * scale.reshape(M, nb, 1)).reshape(M, N)
+
+
+def deepseek_128x128_dq_f(q, scale):
+    M, N = q.shape
+    n1, n2 = M // 128, N // 128
+    return (q.float().reshape(n1, 128, n2, 128) * scale.reshape(n1, 1, n2, 1)).reshape(M, N)
+
+
+def mxfp8_floor_dq_f(q, scale):
+    M, N = q.shape
+    nb = N // 32
+    s = _e8m0_to_fp32(scale).reshape(M, nb, 1)
+    return (q.float().reshape(M, nb, 32) * s).reshape(M, N)
+
+
+def dq_tensorwise(q, scale):
+    return q.float() * scale
+
+
+def mxfp8_floor_swizzle_dq_f(q, scale):
+    # un-swizzle the (1, N) scale back to (M, N//32) e8m0, then dequant as mxfp8.
+    M, N = q.shape
+    rows, cols = M, N // 32
+    nrb, ncb = (rows + 127) // 128, (cols + 3) // 4
+    scale_e8m0 = _from_blocked_2d(scale.reshape(nrb * 32, ncb * 16), rows, cols)
+    return mxfp8_floor_dq_f(q, scale_e8m0)
+
+
+def make_nvfp4_gs_swizzle_dq_f(outer_scale):
+    """Dequant closing over the per-tensor `outer_scale` (kept a 2-arg (qdata, scale) fn)."""
+
+    def dq(q, inner_swizzled):
+        # q: (M, N//2) packed fp4; N = 2 * packed cols.
+        M, half = q.shape
+        N = half * 2
+        cols = N // 16  # number of 16-blocks per row (== inner scale cols)
+        # unpack fp4 -> fp32 in (M, N).
+        unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, N)
+        # un-swizzle inner scale back to (M, cols) e4m3 -> fp32.
+        nrb, ncb = (M + 127) // 128, (cols + 3) // 4
+        inner = _from_blocked_2d(inner_swizzled.reshape(nrb * 32, ncb * 16), M, cols)
+        inner_fp32 = inner.to(torch.float32).reshape(M, cols, 1)
+        return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer_scale).reshape(M, N)
+
+    return dq
+
+
+DEEPSEEK_1X128 = Recipe(quant=deepseek_1x128_f, dequant=deepseek_1x128_dq_f)
+DEEPSEEK_128X128 = Recipe(quant=deepseek_128x128_f, dequant=deepseek_128x128_dq_f)
+# dim-M reuses deepseek_1x128_f entirely: the (K, M) orientation comes from swap_axes
+# below, and dequant is the plain 1x128 dequant (in (K, M) space). The test transposes
+# the dequant result back to (M, N) when swap_axes is set.
+DEEPSEEK_1X128_DIM_M = Recipe(quant=deepseek_1x128_f, dequant=deepseek_1x128_dq_f)
+MXFP8_FLOOR = Recipe(quant=mxfp8_floor_f, dequant=mxfp8_floor_dq_f)
+MXFP8_FLOOR_SWIZZLE = Recipe(quant=mxfp8_floor_swizzle_f, dequant=mxfp8_floor_swizzle_dq_f)
+
+
+def make_float8_tensorwise_recipe(scale):
+    """Recipe wrapping only the tensorwise cast kernel; the global scale is computed
+    outside (via float8_tensorwise_scale) and bound here."""
+    return Recipe(
+        quant=make_float8_tensorwise_f(scale),
+        dequant=dq_tensorwise,
+    )
+
+
+def make_nvfp4_gs_swizzle_recipe(outer_scale):
+    """Recipe wrapping the nvfp4 inner-scale cast + swizzle; the per-tensor outer scale is
+    computed outside (via nvfp4_gs_scale) and bound into both quant and dequant."""
+    return Recipe(
+        quant=make_nvfp4_gs_swizzle_f(outer_scale),
+        dequant=make_nvfp4_gs_swizzle_dq_f(outer_scale),
+    )
+
+
+# ---------------------------------------------------------------------------
+# A non-quant example: the 16x16 randomized Hadamard transform (RHT). bf16 in, bf16 out,
+# NO scale/aux -- `f` returns a 1-tuple `(out,)`. This is the building block for torchao's
+# RHT-fused nvfp4 kernels (moe_training/nvfp4_training). RHT = diag(sign) @ H, where H is
+# the 16x16 Sylvester-Walsh matrix / sqrt(16); mirrors torchao get_rht_matrix. RHT is
+# orthogonal (its inverse is its transpose) but, with a sign vector, not an involution.
+# ---------------------------------------------------------------------------
+# 16x16 Sylvester-Walsh Hadamard values (torchao hadamard_utils.py get_hadamard_matrix).
+_HADAMARD_16 = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1],
+    [1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1],
+    [1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1],
+    [1, 1, 1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1],
+    [1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1],
+    [1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1, 1, 1],
+    [1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, 1, -1],
+    [1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1],
+    [1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1],
+    [1, 1, -1, -1, 1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1],
+    [1, -1, -1, 1, 1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1],
+    [1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 1, 1, 1],
+    [1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1, 1, -1, 1, -1],
+    [1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1, 1, 1, -1, -1],
+    [1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1],
+]
+
+
+def _hadamard_16_matrix(device, dtype):
+    """16x16 Sylvester-Walsh Hadamard matrix scaled by 1/sqrt(16) (orthonormal)."""
+    return torch.tensor(_HADAMARD_16, dtype=dtype, device=device) / (16**0.5)
+
+
+def hadamard_rht_matrix(sign_vector, device, dtype):
+    """RHT = diag(sign) @ H (torchao get_rht_matrix). `sign_vector` is a length-16 tensor."""
+    H = _hadamard_16_matrix(device, dtype)
+    return torch.diag(sign_vector.to(device=device, dtype=dtype)) @ H
+
+
+def make_hadamard_rht_f(sign_vector):
+    """Factory: a tile-invariant `f` applying the 16x16 RHT along the last dim.
+
+    Builds the RHT matrix once (from `sign_vector`, a length-16 +/-1 tensor) and closes
+    over it, so `f` reuses the same matrix across every call/backend. Returns a 1-tuple
+    `(out,)` -- no scale/aux.
+    """
+    rht = hadamard_rht_matrix(sign_vector, sign_vector.device, torch.bfloat16)
+
+    def f(x):
+        *lead, last = x.shape
+        out = (x.reshape(*lead, last // 16, 16) @ rht).reshape(*lead, last)
+        return (out,)
+
+    return f
+
+
+# ---------------------------------------------------------------------------
+# A non-quant example: stochastic rounding (SR) fp32 -> bf16. bf16 shares fp32's 8-bit
+# exponent, so this is the simplest SR target -- no exponent rebias, no packing, no scale,
+# no subnormal edge case: just dither the 16 discarded mantissa bits, then truncate. `f`
+# returns a 1-tuple `(out,)`. Building block for the SR fp4 path (torchao _pack_fp4 +
+# cvt.rs) and mirrors rs_tutorial/rs.py, specialized fp32 -> bf16.
+#
+# SR is unbiased: a value between two bf16 grid points rounds up with probability
+# p_up = (x-lo)/(hi-lo). Adding a uniform 16-bit int to the fp32 bit pattern then
+# truncating carries into the kept bits with exactly that probability, so E[SR(x)] = x.
+# ---------------------------------------------------------------------------
+def make_sr_bf16_f(seed):
+    """Factory: `f` doing fp32 -> bf16 stochastic rounding, closing over `seed`.
+
+    Reseeds a torch.Generator from `seed` and draws one 16-bit dither per element in
+    row-major order -- a stand-in for a counter-based (Philox) RNG. Offsets are per-element
+    and TILE-LOCAL, so they repeat across tiles; tiling can therefore change the rounding
+    (accepted for now). Returns a 1-tuple `(out,)` -- no scale/aux.
+
+    TODO(future, must-have): key the RNG on the element's GLOBAL position in the parent tensor
+    (non-repeating offsets), to ensure the randomness is not correlated across tiles.
+    Note that the current implementation (below) is only for debugging and implementing
+    this TODO is a must-have for numerically sound results.
+    """
+
+    def f(x):
+        assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
+        gen = torch.Generator(device=x.device).manual_seed(seed)
+        rand16 = torch.randint(
+            0, 1 << 16, x.shape, generator=gen, dtype=torch.int32, device=x.device
+        )
+        # dither the 16 mantissa bits fp32->bf16 drops, then truncate them (mask off the
+        # low 16 bits). -65536 == 0xFFFF0000 as int32; .to(bfloat16) is exact since the
+        # low bits are already zero.
+        xi = x.contiguous().view(torch.int32) + rand16
+        xi = xi & -65536
+        return (xi.view(torch.float32).to(torch.bfloat16),)
+
+    return f
