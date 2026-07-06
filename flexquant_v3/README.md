@@ -73,6 +73,10 @@ This needs a better name, and we also would need support a third option for a si
 kernel to write out casts in both directions (dim0 and dim1).
 3. rowwise scaling is not currently in here. We could either leave it out of scope or
 add a concept of "tile that fully spans a dim".
+4. we need to design how to configure replicate vs broadcast aux inputs, as this 
+is not always recoverable from just `f`. For example, imagine a `[2, 2]` aux_input and a `[4, 4]`
+tensor. Both "replicate" and "scatter across tiles" behavior makes sense and is semantically
+different.
 
 ## Missing pieces
 
