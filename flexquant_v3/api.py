@@ -2,6 +2,7 @@ import enum
 from typing import Callable, Tuple
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 class FlexCastQuantBackend(enum.Enum):
@@ -92,64 +93,63 @@ def _manual_tile(
         assert tile_size_0 % _inner_tile_multiple_of[0] == 0
         assert tile_size_1 % _inner_tile_multiple_of[1] == 0
 
-    # manually tile the tensor
+    # Preallocate-then-scatter: infer each output's global shape/dtype by running `f` on a
+    # FakeTensor of the full input, preallocate the outputs, then write each tile's local
+    # output into its slice. This models a real backend (write into a buffer at computed
+    # offsets) rather than concatenating per-tile results.
+
+    # 1. infer output shapes/dtypes by running `f` on a full-shape fake input.
+    # allow_non_fake_inputs=True is needed for recipes that close over real cuda tensors
+    # (nvfp4 outer_scale, RHT matrix); meta inputs don't work (device mismatch / no RNG).
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        fake_in = torch.empty(input.shape, dtype=input.dtype, device=input.device)
+        fake_outs = f(fake_in)
+
+    # 2. preallocate the final outputs on the real device.
+    final_outs = [
+        torch.empty(fo.shape, dtype=fo.dtype, device=input.device) for fo in fake_outs
+    ]
+
+    # 3. per-output (dim0, dim1) divisors: the input->output tiling ratio, constant across
+    # tiles, so a tile at input offset (r, c) writes to output offset (r//div0, c//div1).
+    # Only dims 0,1 are tiled; trailing dims (e.g. the swizzle grid's 32,16) are copied whole.
+    divisors = []
+    for fo in fake_outs:
+        # scalar/replicated outputs (e.g. tensorwise per-tensor scale) are not supported
+        # under MANUAL_TILE: every output must be tiled along dims 0 and 1.
+        assert fo.ndim >= 2, (
+            f"MANUAL_TILE requires outputs tiled on dims 0,1, got shape {tuple(fo.shape)}"
+        )
+        d = []
+        for dim in range(2):
+            assert input.shape[dim] % fo.shape[dim] == 0
+            d.append(input.shape[dim] // fo.shape[dim])
+        divisors.append(d)
+
+    # 4. tile the input and scatter each tile's outputs into the preallocated buffers.
     t0_start = list(range(0, input.shape[0], tile_size_0))
     t1_start = list(range(0, input.shape[1], tile_size_1))
 
-    # [
-    #   [(o0_0_0, o0_0_1, ...), ...],
-    #   [(o1_0_0, o1_0_1, ...), ...],
-    # ]
-    outs_outer = []
-
-    for t0_start_idx in t0_start:
-
-        # [(o0_0_0, o0_0_1, ...), (o0_1_0, o0_1_1, ...), ...]
-        outs_inner = []
-
-        t0_end_idx = t0_start_idx + tile_size_0
-        for t1_start_idx in t1_start:
-            t1_end_idx = t1_start_idx + tile_size_1
-
-            input_tile = input[t0_start_idx:t0_end_idx, t1_start_idx:t1_end_idx]
+    for r in t0_start:
+        for c in t1_start:
+            input_tile = input[r : r + tile_size_0, c : c + tile_size_1]
             # TODO(future): properly broadcast aux_inputs, right now this
             # will silently fail as the captured aux inputs are always replicated
-
             outs = f(input_tile)
-            
-            # combine the outputs
-            outs_inner.append(outs)
 
-        outs_outer.append(outs_inner)
-
-    # stitch the output tensors to get final result
-    # TODO(future): handle `f` returning either tuple of multiple tensors
-    # or a single tensor
-    num_outs = len(outs_outer[0][0])
-    final_outs = []
-    for out_idx in range(num_outs):
-        
-        # first, extract 
-        # [
-        #   [o0_0_idx, o0_1_idx, ...], 
-        #   [o1_0_idx, o1_1_idx, ...],
-        # ]
-        extracted_out = [
-            [col[out_idx] for col in row]
-            for row in outs_outer
-        ]
-
-        # then, get
-        # [
-        #   tensor(*o0_0_idx...*o0_1_idx...], 
-        #   [o1_0_idx, o1_1_idx, ...],
-        # ]
-        extracted_out = [
-            torch.cat(row, dim=1) for row in extracted_out
-        ]
-
-        # then, get final tensor
-        extracted_out = torch.cat(extracted_out, dim=0)
-        final_outs.append(extracted_out)
+            for i, local in enumerate(outs):
+                div0, div1 = divisors[i]
+                # extent = this tile's own output shape, so ragged last tiles work.
+                dst = (
+                    slice(r // div0, r // div0 + local.shape[0]),
+                    slice(c // div1, c // div1 + local.shape[1]),
+                )  # trailing dims (e.g. 32,16) left fully selected
+                o = final_outs[i]
+                if o.dtype == torch.float4_e2m1fn_x2:
+                    # torch.cat/fill/copy aren't implemented for sub-byte float4; assign
+                    # through the uint8 view of both sides (1 byte/elem preserves the slice).
+                    o.view(torch.uint8)[dst] = local.view(torch.uint8)
+                else:
+                    o[dst] = local
 
     return tuple(final_outs)
