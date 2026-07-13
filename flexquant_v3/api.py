@@ -1,5 +1,5 @@
 import enum
-from typing import Callable
+from typing import Callable, Tuple
 
 import torch
 
@@ -22,6 +22,9 @@ def flex_cast_quant(
     # TODO(future): we also need a way for a single fused kernel to write
     # out dim0 and dim1 quant at the same time
     _swap_input_axes: bool = False,
+    # restrictions on tiling
+    _tile_multiple_of: Tuple[int, int] | None = None,
+    _inner_tile_multiple_of: Tuple[int, int] | None = None,
     # kwargs below are only for debugging
     _backend: FlexCastQuantBackend = FlexCastQuantBackend.REFERENCE,
 ) -> tuple[torch.Tensor, ...]:
@@ -44,9 +47,21 @@ def flex_cast_quant(
         input = input.t().contiguous()
 
     if _backend is FlexCastQuantBackend.REFERENCE:
+
+        # verify that tile constraints are respected, if specified
+        if _tile_multiple_of is not None:
+            M, K = input.shape
+            assert M % _tile_multiple_of[0] == 0
+            assert K % _tile_multiple_of[1] == 0
+
+        # _inner_tile_multiple_of is satisfied automatically as there is only
+        # one tile
+
         outs = f(input)
+
     elif _backend is FlexCastQuantBackend.MANUAL_TILE:
-        outs = _manual_tile(input, f)
+        outs = _manual_tile(input, f, _tile_multiple_of, _inner_tile_multiple_of)
+
     else:
         raise AssertionError(f"unknown {_backend=}")
 
@@ -56,6 +71,8 @@ def flex_cast_quant(
 def _manual_tile(
     input: torch.Tensor,
     f: Callable,
+    _tile_multiple_of: Tuple[int, int] | None = None,
+    _inner_tile_multiple_of: Tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Tile `input` into 4 quadrants, run `f` on each, and recompose (debug backend).
 
@@ -80,6 +97,25 @@ def _manual_tile(
     assert input.ndim == 2, f"MANUAL_TILE expects a 2D input, got {input.ndim}D"
     M, N = input.shape
     mid_m, mid_n = M // 2, N // 2
+
+    # TODO(future): make the tiling more generic
+
+    # verify tiling constraints are honored
+    if _tile_multiple_of is not None:
+        cases = [
+            (mid_m, mid_n),
+            (mid_m, N - mid_n),
+            (M - mid_m, mid_n),
+            (M - mid_m, N - mid_n),
+        ]
+        for dim0, dim1 in cases:
+            assert dim0 % _tile_multiple_of[0] == 0
+            assert dim1 % _tile_multiple_of[1] == 0
+
+    if _inner_tile_multiple_of is not None:
+        # only check the upper left quadrant
+        assert mid_m % _inner_tile_multiple_of[0] == 0
+        assert mid_n % _inner_tile_multiple_of[1] == 0
 
     ul = f(input[:mid_m, :mid_n])
     ur = f(input[:mid_m, mid_n:])

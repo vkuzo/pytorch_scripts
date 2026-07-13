@@ -7,7 +7,7 @@ mirrors flexquant v1 recipes.py.
 """
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Tuple
 
 import torch
 
@@ -27,6 +27,8 @@ class Recipe:
 
     quant: Callable
     dequant: Callable
+    _tile_multiple_of: Tuple[int, int] | None = None
+    _inner_tile_multiple_of: Tuple[int, int] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -340,14 +342,35 @@ def make_nvfp4_gs_swizzle_dq_f(outer_scale):
     return dq
 
 
-DEEPSEEK_1X128 = Recipe(quant=deepseek_1x128_f, dequant=deepseek_1x128_dq_f)
-DEEPSEEK_128X128 = Recipe(quant=deepseek_128x128_f, dequant=deepseek_128x128_dq_f)
+DEEPSEEK_1X128 = Recipe(
+    quant=deepseek_1x128_f, 
+    dequant=deepseek_1x128_dq_f,
+    _tile_multiple_of=(1, 128),
+)
+DEEPSEEK_128X128 = Recipe(
+    quant=deepseek_128x128_f, 
+    dequant=deepseek_128x128_dq_f,
+    _tile_multiple_of=(128, 128),
+)
 # dim-M reuses deepseek_1x128_f entirely: the (K, M) orientation comes from swap_axes
 # below, and dequant is the plain 1x128 dequant (in (K, M) space). The test transposes
 # the dequant result back to (M, N) when swap_axes is set.
-DEEPSEEK_1X128_DIM_M = Recipe(quant=deepseek_1x128_f, dequant=deepseek_1x128_dq_f)
-MXFP8_FLOOR = Recipe(quant=mxfp8_floor_f, dequant=mxfp8_floor_dq_f)
-MXFP8_FLOOR_SWIZZLE = Recipe(quant=mxfp8_floor_swizzle_f, dequant=mxfp8_floor_swizzle_dq_f)
+DEEPSEEK_1X128_DIM_M = Recipe(
+    quant=deepseek_1x128_f, 
+    dequant=deepseek_1x128_dq_f,
+    _tile_multiple_of=(1, 128),
+)
+MXFP8_FLOOR = Recipe(
+    quant=mxfp8_floor_f, 
+    dequant=mxfp8_floor_dq_f,
+    _tile_multiple_of=(1, 32),
+)
+MXFP8_FLOOR_SWIZZLE = Recipe(
+    quant=mxfp8_floor_swizzle_f, 
+    dequant=mxfp8_floor_swizzle_dq_f,
+    _tile_multiple_of=(1, 32),
+    _inner_tile_multiple_of=(128, 128),  # 128x128 to enforce that each scale swizzle does not cross tile boundaries
+)
 
 
 def make_float8_tensorwise_recipe(scale):
@@ -365,6 +388,8 @@ def make_nvfp4_gs_swizzle_recipe(outer_scale):
     return Recipe(
         quant=make_nvfp4_gs_swizzle_f(outer_scale),
         dequant=make_nvfp4_gs_swizzle_dq_f(outer_scale),
+        _tile_multiple_of=(1, 16),
+        _inner_tile_multiple_of=(128, 64),  # 128x64 to enforce that each scale swizzle does not cross tile boundaries
     )
 
 
