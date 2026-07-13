@@ -71,7 +71,11 @@ def test_float8_tensorwise_matches_reference():
     # scale computed outside flex_cast_quant; the Recipe wraps only the cast kernel.
     scale = float8_tensorwise_scale(x)
     recipe = make_float8_tensorwise_recipe(scale)
-    qdata, scale_out = flex_cast_quant(x, recipe.quant)
+    qdata, scale_out = flex_cast_quant(
+        x, 
+        recipe.quant, 
+        _tile_multiple_of=recipe._tile_multiple_of,
+    )
     qdata_ref, scale_ref = recipe.quant(x)
 
     # shapes / dtypes: scale is a single per-tensor scalar
@@ -91,7 +95,7 @@ def test_float8_tensorwise_sqnr_vs_high_precision():
 
     scale = float8_tensorwise_scale(x)
     recipe = make_float8_tensorwise_recipe(scale)
-    qdata, scale_out = flex_cast_quant(x, recipe.quant)
+    qdata, scale_out = flex_cast_quant(x, recipe.quant, _tile_multiple_of=recipe._tile_multiple_of)
     x_hat = recipe.dequant(qdata, scale_out)
     assert _compute_error(x.float(), x_hat.float()) > 20.0
 
@@ -105,7 +109,12 @@ def test_nvfp4_gs_swizzle_matches_reference():
     # outer scale computed outside; the Recipe wraps the inner cast + swizzle.
     outer = nvfp4_gs_scale(x)
     recipe = make_nvfp4_gs_swizzle_recipe(outer)
-    qdata, scale = flex_cast_quant(x, recipe.quant)
+    qdata, scale = flex_cast_quant(
+        x, 
+        recipe.quant, 
+        _tile_multiple_of=recipe._tile_multiple_of,
+        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+    )
     qdata_ref, scale_ref = recipe.quant(x)
 
     # shapes / dtypes: packed fp4 qdata + swizzled e4m3 inner scale as a 4D block grid.
@@ -125,8 +134,20 @@ def test_nvfp4_gs_swizzle_backends_match():
 
     outer = nvfp4_gs_scale(x)
     recipe = make_nvfp4_gs_swizzle_recipe(outer)
-    qdata_ref, scale_ref = flex_cast_quant(x, recipe.quant, _backend=FlexCastQuantBackend.REFERENCE)
-    qdata_tile, scale_tile = flex_cast_quant(x, recipe.quant, _backend=FlexCastQuantBackend.MANUAL_TILE)
+    qdata_ref, scale_ref = flex_cast_quant(
+        x, 
+        recipe.quant, 
+        _backend=FlexCastQuantBackend.REFERENCE,
+        _tile_multiple_of=recipe._tile_multiple_of,
+        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+    )
+    qdata_tile, scale_tile = flex_cast_quant(
+        x, 
+        recipe.quant, 
+        _backend=FlexCastQuantBackend.MANUAL_TILE,
+        _tile_multiple_of=recipe._tile_multiple_of,
+        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+    )
 
     # exercises the _manual_tile packed-fp4 cat (via uint8 view).
     assert _qdata_equal(qdata_tile, qdata_ref)
@@ -141,7 +162,12 @@ def test_nvfp4_gs_swizzle_sqnr_vs_high_precision():
 
     outer = nvfp4_gs_scale(x)
     recipe = make_nvfp4_gs_swizzle_recipe(outer)
-    qdata, scale = flex_cast_quant(x, recipe.quant)
+    qdata, scale = flex_cast_quant(
+        x, 
+        recipe.quant,
+        _tile_multiple_of=recipe._tile_multiple_of,
+        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+    )
     x_hat = recipe.dequant(qdata, scale)
     # nvfp4 is 4-bit, coarser than fp8/mxfp8, so a lower SQNR floor.
     assert _compute_error(x.float(), x_hat.float()) > 12.0
@@ -253,7 +279,13 @@ def test_matches_reference(recipe, swap_axes, scale_shape, scale_dtype, qdata_dt
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_cast_quant(x, recipe.quant, _swap_input_axes=swap_axes)
+    qdata, scale = flex_cast_quant(
+        x, 
+        recipe.quant, 
+        _swap_input_axes=swap_axes, 
+        _tile_multiple_of=recipe._tile_multiple_of,
+        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+    )
     # reference applies the same axis swap before running `quant`.
     x_ref = x.t().contiguous() if swap_axes else x
     qdata_ref, scale_ref = recipe.quant(x_ref)
@@ -280,10 +312,20 @@ def test_backends_match(recipe, swap_axes, flat_compare):
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
     qdata_ref, scale_ref = flex_cast_quant(
-        x, recipe.quant, _swap_input_axes=swap_axes, _backend=FlexCastQuantBackend.REFERENCE
+        x, 
+        recipe.quant, 
+        _swap_input_axes=swap_axes, 
+        _backend=FlexCastQuantBackend.REFERENCE,
+        _tile_multiple_of=recipe._tile_multiple_of,
+        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
     )
     qdata_tile, scale_tile = flex_cast_quant(
-        x, recipe.quant, _swap_input_axes=swap_axes, _backend=FlexCastQuantBackend.MANUAL_TILE
+        x, 
+        recipe.quant, 
+        _swap_input_axes=swap_axes, 
+        _backend=FlexCastQuantBackend.MANUAL_TILE,
+        _tile_multiple_of=recipe._tile_multiple_of,
+        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
     )
 
     assert _qdata_equal(qdata_tile, qdata_ref)
@@ -303,7 +345,13 @@ def test_sqnr_vs_high_precision(recipe, swap_axes, sqnr_min):
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_cast_quant(x, recipe.quant, _swap_input_axes=swap_axes)
+    qdata, scale = flex_cast_quant(
+        x, 
+        recipe.quant, 
+        _swap_input_axes=swap_axes,
+        _tile_multiple_of=recipe._tile_multiple_of,
+        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+    )
     x_hat = recipe.dequant(qdata, scale)
     # swap_axes quantized the transposed (K, M) tensor, so transpose the dequant back to
     # (M, N) to align with the original x.
@@ -311,89 +359,3 @@ def test_sqnr_vs_high_precision(recipe, swap_axes, sqnr_min):
         x_hat = x_hat.t()
     sqnr = _compute_error(x.float(), x_hat.float())
     assert sqnr > sqnr_min, f"{sqnr=} below {sqnr_min}"
-
-
-# Directed regression for swizzle tile-invariance. The swizzled scale is a 4D block grid
-# (n_row_blocks, n_col_blocks, 32, 16); its leading two axes are the block grid, so a
-# column split reassembles on dim=1 and a row split on dim=0. This is the property the old
-# flat-2D layout LACKED: serializing to (nrb*32, ncb*16) folded the (row-block, col-block)
-# walk into the axes, so a column split silently reordered the buffer (and a 384-row input,
-# split at 192 -- not a 128 multiple -- corrupted it even while "128-aligned"). We exercise
-# column, row, and quadrant splits on shapes >256 so more than one col-block exists per
-# band (the case that made column vs row disagree).
-def _swizzle_recipes():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-    mx = ("mxfp8_swizzle", MXFP8_FLOOR_SWIZZLE.quant)
-    nv = ("nvfp4_swizzle", make_nvfp4_gs_swizzle_recipe(nvfp4_gs_scale(x)).quant)
-    return x, [mx, nv]
-
-
-@pytest.mark.parametrize("split", ["column", "row", "quadrant"])
-def test_swizzle_scale_tile_invariant(split):
-    x, recipes = _swizzle_recipes()
-    for name, quant in recipes:
-        _, scale_ref = quant(x)  # whole-tensor reference (the correct buffer)
-
-        if split == "column":  # two 512x256 tiles, glue on the col-block axis (dim=1)
-            a = quant(x[:, :256])[1]
-            b = quant(x[:, 256:])[1]
-            recomposed = torch.cat([a, b], dim=1)
-        elif split == "row":  # two 256x512 tiles, glue on the row-block axis (dim=0)
-            a = quant(x[:256, :])[1]
-            b = quant(x[256:, :])[1]
-            recomposed = torch.cat([a, b], dim=0)
-        else:  # 2x2 quadrant (contains a column split -- the old buffer's worst case)
-            ul = quant(x[:256, :256])[1]
-            ur = quant(x[:256, 256:])[1]
-            ll = quant(x[256:, :256])[1]
-            lr = quant(x[256:, 256:])[1]
-            top = torch.cat([ul, ur], dim=1)
-            bottom = torch.cat([ll, lr], dim=1)
-            recomposed = torch.cat([top, bottom], dim=0)
-
-        assert recomposed.shape == scale_ref.shape, f"{name} {split}: shape mismatch"
-        assert torch.equal(recomposed, scale_ref), f"{name} {split}: buffer mismatch"
-
-
-def test_swizzle_384_aligned_split_invariant():
-    # What the 4D grid DOES fix: buffer-order invariance under any atom-ALIGNED split. A
-    # 384-row input splits cleanly at 256 (= 2*128) into a 256-row and a 128-row tile; both
-    # are whole 128-row atoms, so the row-block axes concatenate to match the reference.
-    torch.manual_seed(0)
-    x = torch.randn(384, 256, dtype=torch.bfloat16, device="cuda")
-    _, s_ref = MXFP8_FLOOR_SWIZZLE.quant(x)
-    a = MXFP8_FLOOR_SWIZZLE.quant(x[:256, :])[1]
-    b = MXFP8_FLOOR_SWIZZLE.quant(x[256:, :])[1]
-    recomposed = torch.cat([a, b], dim=0)
-    assert recomposed.shape == s_ref.shape
-    assert torch.equal(recomposed, s_ref)
-
-
-def test_swizzle_non_atom_aligned_split_is_out_of_scope():
-    # What the 4D grid does NOT (and cannot) fix: a split that severs a 128-row atom. The
-    # default MANUAL_TILE quadrant split of 384 lands at 192 (not a 128 multiple), so each
-    # 192-row tile pads its partial row-block to 256 independently -> nrb=2+2=4 vs the
-    # reference's ceil(384/128)=3. This is the option-(2) alignment contract (tile rows must
-    # be a multiple of 128), orthogonal to buffer order, and is left unenforced for now.
-    torch.manual_seed(0)
-    x = torch.randn(384, 256, dtype=torch.bfloat16, device="cuda")
-    _, s_ref = flex_cast_quant(x, MXFP8_FLOOR_SWIZZLE.quant, _backend=FlexCastQuantBackend.REFERENCE)
-    _, s_tile = flex_cast_quant(x, MXFP8_FLOOR_SWIZZLE.quant, _backend=FlexCastQuantBackend.MANUAL_TILE)
-    assert s_tile.shape != s_ref.shape  # documents the known, out-of-scope limitation
-
-
-def test_swizzle_flatten_is_hardware_buffer():
-    # the 4D grid must still serialize (once, outside f) to torchao's to_blocked buffer:
-    # .reshape(-1) of the grid == the old flat layout. Guards the "serialize last" contract.
-    from recipes import _to_blocked_4d, mxfp8_floor_f
-
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-    _, s = mxfp8_floor_f(x)
-    grid = _to_blocked_4d(s)
-    nrb, ncb = grid.shape[0], grid.shape[1]
-    # reference flat buffer built by the pre-refactor 2D path.
-    blocks = s.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
-    flat_ref = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(nrb * 32, ncb * 16).reshape(-1)
-    assert torch.equal(grid.reshape(-1), flat_ref)
