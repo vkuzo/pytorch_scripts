@@ -6,6 +6,7 @@ qdata (compared as fp32) and scale. Recipes live in recipes.py.
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from api import FlexCastQuantBackend, flex_cast_quant
 from recipes import (
@@ -359,3 +360,70 @@ def test_sqnr_vs_high_precision(recipe, swap_axes, sqnr_min):
         x_hat = x_hat.t()
     sqnr = _compute_error(x.float(), x_hat.float())
     assert sqnr > sqnr_min, f"{sqnr=} below {sqnr_min}"
+
+
+# input padding (`_pad_input_to_multiple_of`): a ragged input (e.g. LLM decode/prefill token
+# dim) is zero-padded up to a multiple so the tile-invariant recipe sees an aligned shape.
+# Outputs are returned at the PADDED shape (the swizzle scale grid is 128-row-atom-structured
+# and can't be sliced back to an arbitrary original M). Pad multiples are chosen to satisfy
+# each recipe's block/atom so the padded shape passes the existing constraint asserts.
+def _ceil_to(v, m):
+    return ((v + m - 1) // m) * m
+
+
+def test_pad_ref_shapes_swizzle():
+    # ragged 200x300 padded to (128,128)-multiple -> (256, 384); swizzle grid nrb=2, ncb=3.
+    torch.manual_seed(0)
+    x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
+    qdata, scale = flex_cast_quant(
+        x,
+        MXFP8_FLOOR_SWIZZLE.quant,
+        _pad_input_to_multiple_of=(128, 128),
+        _tile_multiple_of=MXFP8_FLOOR_SWIZZLE._tile_multiple_of,
+        _inner_tile_multiple_of=MXFP8_FLOOR_SWIZZLE._inner_tile_multiple_of,
+    )
+    assert qdata.shape == (256, 384)
+    assert scale.shape == (2, 3, 32, 16)
+
+
+@pytest.mark.parametrize(
+    "recipe, pad_to",
+    [
+        (MXFP8_FLOOR, (1, 32)),
+        (MXFP8_FLOOR_SWIZZLE, (128, 128)),
+        (DEEPSEEK_1X128, (1, 128)),
+    ],
+    ids=["mxfp8_floor", "mxfp8_floor_swizzle", "deepseek_1x128"],
+)
+def test_pad_backends_match(recipe, pad_to):
+    # padded ragged input: MANUAL_TILE must match REFERENCE bit-exact (padding happens before
+    # tiling in both paths, so the two backends see the identical padded tensor).
+    torch.manual_seed(0)
+    x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
+    kw = dict(
+        _pad_input_to_multiple_of=pad_to,
+        _tile_multiple_of=recipe._tile_multiple_of,
+        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+    )
+    qdata_ref, scale_ref = flex_cast_quant(x, recipe.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    qdata_tile, scale_tile = flex_cast_quant(x, recipe.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    assert _qdata_equal(qdata_tile, qdata_ref)
+    assert scale_tile.shape == scale_ref.shape
+    assert torch.equal(scale_tile, scale_ref)
+
+
+def test_pad_matches_manual_pad():
+    # padding inside the API == padding the input outside it, then running the recipe.
+    torch.manual_seed(0)
+    x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
+    qdata, scale = flex_cast_quant(
+        x,
+        MXFP8_FLOOR.quant,
+        _pad_input_to_multiple_of=(1, 32),
+        _tile_multiple_of=MXFP8_FLOOR._tile_multiple_of,
+    )
+    # manual pad: 200 stays (mult of 1), 300 -> 320 (mult of 32); high-edge zero pad.
+    x_padded = F.pad(x, (0, _ceil_to(300, 32) - 300, 0, 0))
+    qdata_ref, scale_ref = MXFP8_FLOOR.quant(x_padded)
+    assert _qdata_equal(qdata, qdata_ref)
+    assert torch.equal(scale, scale_ref)

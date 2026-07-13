@@ -5,7 +5,9 @@ mx_formats/kernels.py). fp4 packs two 4-bit values per byte, stored as
 torch.float4_e2m1fn_x2.
 """
 
+from typing import Tuple
 import torch
+import torch.nn.functional as F
 
 _EBITS_F32, _MBITS_F32 = 8, 23
 _F32_EXP_BIAS = (1 << (_EBITS_F32 - 1)) - 1
@@ -97,3 +99,23 @@ def unpack_uint4(uint8_data):
     first = (uint8_data & 0b1111).to(torch.uint8)
     second = (uint8_data >> 4).to(torch.uint8)
     return torch.stack([first, second], dim=-1).view(*shape[:-1], shape[-1] * 2)
+
+
+def _pad_to_multiple(input: torch.Tensor, pad_to: Tuple[int, int]) -> torch.Tensor:
+    """Round each dim of a 2D `input` UP to a multiple of `pad_to`, zero-padding the high edge.
+
+    Zero padding lands on the bottom/right, so a real reduction block extended with zeros keeps
+    its amax and padded quant matches unpadded (for the real region). A no-op if already aligned.
+    """
+    M, K = input.shape
+
+    def ceil_to(v, m):
+        return ((v + m - 1) // m) * m
+
+    M2, K2 = ceil_to(M, pad_to[0]), ceil_to(K, pad_to[1])
+    if (M2, K2) == (M, K):
+        return input
+    # F.pad arg order is (left, right, top, bottom); pad only the high edge.
+    return F.pad(input, (0, K2 - K, 0, M2 - M))
+
+
