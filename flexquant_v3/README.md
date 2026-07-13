@@ -5,8 +5,8 @@ A single API for one-kernel, tile-invariant tensor casts (quantization and frien
 ## The idea
 
 ```python
-# f can close over auxiliary inputs
-out, *aux = flex_cast_quant(input, f)
+# auxiliary inputs (a global scale, an RHT matrix) are passed explicitly, not closed over
+out, *aux = flex_cast_quant(input, f, aux_inputs=(outer_scale,), aux_kinds=(AuxKind.REPLICATE,))
 ```
 
 `f` is a **tile-invariant** function — the same per-tile computation applied independently
@@ -19,16 +19,18 @@ a quant recipe that requires multiple kernels (global outer scale, etc).
 `f` has the signature:
 
 ```python
-def f(tile: torch.Tensor) -> tuple[torch.Tensor, ...]:
+def f(tile: torch.Tensor, *aux_inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     # (out,)            -- a plain transform (e.g. Hadamard, stochastic rounding)
     # (out, scale)      -- a quant cast (e.g. deepseek fp8, mxfp8, nvfp4)
     ...
 ```
 
-It takes one tensor (a tile, or the whole input in the `REFERENCE` backend) and returns a
-tuple: the primary output first, then zero or more auxiliary outputs. To depend on values
-computed outside the kernel (a global scale, a sign vector, an RNG seed), build `f` from a
-factory that closes over them — e.g. `make_nvfp4_gs_swizzle_recipe(outer_scale)`.
+It takes the tile (or the whole input in the `REFERENCE` backend) followed by any auxiliary
+input tensors, and returns a tuple: the primary output first, then zero or more auxiliary
+outputs. Tensors computed outside the kernel (a global scale, an RHT matrix) are **lifted to
+explicit `aux_inputs`** rather than closed over, so the framework can present each one to every
+tile according to its `AuxKind` (see below). Non-tensor config (an RNG seed) can still be bound
+via a factory — e.g. `make_sr_bf16_f(seed)`.
 
 Requirements on all outputs of `f`: must be at least 2d, and the first two dimensions
 must directly correspond to the two input dimensions.
@@ -40,6 +42,8 @@ def flex_cast_quant(
     input: torch.Tensor,
     f: Callable,
     *,
+    aux_inputs: Tuple[torch.Tensor, ...] = (),
+    aux_kinds: Tuple[AuxKind, ...] | None = None,              # per-aux broadcast kind (None => REPLICATE)
     _global_input_transform: GlobalInputTransform = GlobalInputTransform.NONE,  # e.g. transpose on load
     _pad_input_to_multiple_of: Tuple[int, int] | None = None,  # zero-pad ragged dims up on load
     _tile_multiple_of: Tuple[int, int] | None = None,          # tile-size divisibility constraint
@@ -48,6 +52,12 @@ def flex_cast_quant(
 ) -> tuple[torch.Tensor, ...]:                               # (out, *aux) from `f`
     ...
 ```
+
+`aux_inputs` are tensors `f` needs beyond `input` (a global scale, an RHT matrix), passed
+positionally to `f` after `input`. `aux_kinds` tags each with an `AuxKind` saying how the
+framework presents it per tile: `REPLICATE` (hand the whole tensor to every tile — the only kind
+implemented so far), or `TILE`/`ROW`/`COL` (slice per tile — defined but not yet implemented).
+`aux_kinds=None` defaults every aux to `REPLICATE`.
 
 `_global_input_transform` selects a global, pre-tiling load transform (a `GlobalInputTransform`
 enum): `NONE` (default) or `SWAP_0_AND_1_AXES` (transpose the input on load, for dim-M recipes).
@@ -65,7 +75,7 @@ plain reference path.
 - **mxfp8 FLOOR** — 1x32 blocks, e8m0 power-of-two scale; plain and swizzled (NVIDIA
   32x4x4 blocked scale layout). The swizzled scale is emitted as a 4D block grid
   `(n_row_blocks, n_col_blocks, 32, 16)` (see below).
-- **float8 tensorwise** — global per-tensor scale computed outside, cast bound via factory.
+- **float8 tensorwise** — global per-tensor scale computed outside, passed as a REPLICATE aux input.
 - **nvfp4 with global scale** — two-level (per-tensor fp32 outer + per-16 e4m3 inner),
   fp4-packed, swizzled inner scale (same 4D block grid).
 - **randomized Hadamard (RHT)** — a non-quant transform (bf16 in, bf16 out, no scale).
@@ -79,36 +89,18 @@ usually created using a per-tensor seed + per-tile offset. We need to expose the
 stochastic rounding example punts this to a TODO: it is unbiased (E[SR(x)] ~= x), but the
 tile-local offset repeats per tile, so draws are correlated across tiles -- not
 statistically sound under tiling.
-2. for training, we often need to do "x.t().contiguous().quant_with_recipe(...)". This is not
-expressible as a tile invariant function of `x`, as `x.t().contiguous()` is a global transform.
-Therefore, we add a global input transformation option, the `_global_input_transform`
-(`GlobalInputTransform`) enum: `NONE` or `SWAP_0_AND_1_AXES`. The third option,
-`BOTH_NONE_AND_SWAP_0_AND_1_AXES` -- a single kernel writing casts in both directions (dim0 and
-dim1) -- is defined but not yet implemented (asserts out).
-3. rowwise scaling is not currently in here. We could either leave it out of scope or
-add a concept of "tile that fully spans a dim".
-4. we need to design how to configure replicate vs broadcast aux inputs, as this 
-is not always recoverable from just `f`. For example, imagine a `[2, 2]` aux_input and a `[4, 4]`
-tensor. Both "replicate" and "scatter across tiles" behavior makes sense and is semantically
-different.
-5. **swizzled scale layout (partially resolved).** The NVIDIA blocked scale layout is a
-global, grid-shape-dependent *serialization*: laying the 128x4-scale atoms out into the
-flat buffer `_scaled_mm` consumes bakes the (row-block, col-block) walk order into the
-result, so composing it inside a tile-invariant `f` breaks under a column split (and under
-any non-128-aligned tile split). Fix: `f` now emits the swizzle as a 4D block grid
-`(n_row_blocks, n_col_blocks, 32, 16)` -- the per-atom swizzle is local/tile-invariant and
-the two block axes stay separate, so MANUAL_TILE reassembles a column tile with `cat(dim=1)`
-and a row tile with `cat(dim=0)`, bit-exact. The grid `.reshape(-1)` still equals torchao's
-`to_blocked` buffer; that final serialization is a global step done ONCE outside `f`, after
-tiles are reassembled. STILL OPEN: tiles must be whole 128x4 atoms (rows a multiple of 128,
-cols a multiple of the block width) -- a non-atom-aligned split still pads partial blocks
-independently and diverges. That alignment contract is unenforced (see the two 384-row
-tests in test.py: aligned split is invariant, the default quadrant split at 192 is not).
 
 ## Missing pieces
 
-* a real backend, for not we just have reference backends.
-* proper testing (currently no edge cases are tested)
+* aux input broadcasting along rows, columns or tiles (currently only replicated)
+* GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES is not implemented yet
+* a real backend, for not we just have reference backends
+* proper testing (currently not many edge cases are tested)
+
+## Out of scope
+
+* dynamic rowwise scaling (this needs 1d tiles to efficiently implement, not worth
+  the complexity to start).
 
 ## Files
 

@@ -11,14 +11,14 @@ class FlexCastQuantBackend(enum.Enum):
     # for debugging, just runs the callback on the entire tensor
     REFERENCE = "reference"
     # for debugging, manually tiles and runs the callback on each
-    # Note: only works with aux_inputs which are replicated and not tiled
-    # TODO: design how tiling for aux_inputs works here
+    # Note: only supports AuxKind.REPLICATE aux_inputs so far (handed whole to every tile);
+    # TILE/ROW/COL slicing is defined in AuxKind but not yet implemented.
     MANUAL_TILE = "manual_tile"
     # TODO(future): actual backend
 
 
 class GlobalInputTransform(enum.Enum):
-    # no transform 
+    # no transform
     NONE = "none"
     # swap the axes before doing quantization
     SWAP_0_AND_1_AXES = "swap_0_and_1_axes"
@@ -26,10 +26,59 @@ class GlobalInputTransform(enum.Enum):
     BOTH_NONE_AND_SWAP_0_AND_1_AXES = "both_none_and_swap_0_and_1_axes"
 
 
+class AuxKind(enum.Enum):
+    """How a captured auxiliary input is presented to `f` per tile.
+
+    Aux tensors are lifted out of `f`'s closure into explicit `aux_inputs` (cf. flex_gemm's
+    epilogue arg kinds), and each carries a kind saying how the framework hands it to each tile.
+    Only REPLICATE is implemented so far; TILE/ROW/COL are defined but raise NotImplementedError.
+    """
+
+    # whole tensor handed to every tile (e.g. a per-tensor scale). The only kind implemented.
+    REPLICATE = "replicate"
+    # leading dims match the input (M, N) grid; slice the matching sub-tile per tile.
+    TILE = "tile"
+    # (1, N): broadcast down the row (M) tiles.
+    ROW = "row"
+    # (M, 1): broadcast across the col (N) tiles.
+    COL = "col"
+
+
+def _resolve_aux_kinds(
+    aux_inputs: Tuple[torch.Tensor, ...],
+    aux_kinds: Tuple["AuxKind", ...] | None,
+) -> Tuple["AuxKind", ...]:
+    """Validate `aux_kinds` against `aux_inputs`, defaulting to REPLICATE, and reject
+    kinds that are not yet implemented."""
+    if aux_kinds is None:
+        aux_kinds = (AuxKind.REPLICATE,) * len(aux_inputs)
+    assert len(aux_kinds) == len(aux_inputs), (
+        f"aux_kinds ({len(aux_kinds)}) must match aux_inputs ({len(aux_inputs)})"
+    )
+    for kind in aux_kinds:
+        if kind is not AuxKind.REPLICATE:
+            raise NotImplementedError(f"aux kind {kind} is not yet implemented")
+    return aux_kinds
+
+
+def _aux_for_tile(aux, kind):
+    """Present a single aux tensor to one tile according to its `kind`.
+
+    The single place per-tile aux slicing lives; today only REPLICATE (whole tensor to every
+    tile) is implemented. TILE/ROW/COL slicing will slot in here, and will need to account for
+    _global_input_transform=SWAP_0_AND_1_AXES (row<->col swap, cf. flex_gemm _SWAPPED_ARG_KIND).
+    """
+    if kind is AuxKind.REPLICATE:
+        return aux
+    raise NotImplementedError(f"aux kind {kind} is not yet implemented")
+
+
 def flex_cast_quant(
     input: torch.Tensor,
-    f: Callable,  # tile-invariant fn: input -> (out, *aux_out)
+    f: Callable,  # tile-invariant fn: (input, *aux_inputs) -> (out, *aux_out)
     *,
+    aux_inputs: Tuple[torch.Tensor, ...] = (),  # auxiliary inputs
+    aux_kinds: Tuple[AuxKind, ...] | None = None,  # for each aux input, specify how to broadcast it
     # these are needed for production quant, but final design TBD
     # TODO(future): we also need a way for a single fused kernel to write
     # out dim0 and dim1 quant at the same time
@@ -45,11 +94,14 @@ def flex_cast_quant(
     """Single-kernel quantization API.
 
     `f` must be *tile-invariant*: the same pointwise/blockwise computation applied
-    independently to every tile of `input`. It returns `(out, *aux_out)` -- one primary
-    output plus zero or more auxiliary outputs (e.g. a scale; a pure transform has none).
-    Recipes needing multiple kernels call this for one kernel and call something else for
-    the rest. This API is consumer-agnostic (no notion of weight/activation/KV/gradient) --
-    `f` owns all format knowledge.
+    independently to every tile of `input`. It has signature `(input, *aux_inputs) ->
+    (out, *aux_out)` -- one primary output plus zero or more auxiliary outputs (e.g. a scale;
+    a pure transform has none). Any tensors `f` needs beyond `input` (e.g. a per-tensor scale,
+    an RHT matrix) are passed explicitly via `aux_inputs` rather than captured in a closure, so
+    the framework can present each one per tile according to its `AuxKind`. Recipes needing
+    multiple kernels call this for one kernel and call something else for the rest. This API is
+    consumer-agnostic (no notion of weight/activation/KV/gradient) -- `f` owns all format
+    knowledge.
 
     TODO(future work): inspect `f` and lower to an efficient (Helion/Triton) kernel that
     exploits tile-invariance (cf. flexquant_v2 tile_map).
@@ -60,6 +112,8 @@ def flex_cast_quant(
     assert (
         _global_input_transform is not GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES
     ), "GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES is not yet implemented"
+
+    aux_kinds = _resolve_aux_kinds(aux_inputs, aux_kinds)
 
     if _global_input_transform is GlobalInputTransform.SWAP_0_AND_1_AXES:
         input = input.t().contiguous()
@@ -79,14 +133,17 @@ def flex_cast_quant(
         # _inner_tile_multiple_of is satisfied automatically as there is only
         # one tile
 
-        outs = f(input)
+        # one tile == whole tensor, so every aux is presented whole (REPLICATE).
+        outs = f(input, *aux_inputs)
 
     elif _backend is FlexCastQuantBackend.MANUAL_TILE:
         outs = _manual_tile(
-            input, 
-            f, 
+            input,
+            f,
+            aux_inputs,
+            aux_kinds,
             _pad_input_to_multiple_of,
-            _tile_multiple_of, 
+            _tile_multiple_of,
             _inner_tile_multiple_of,
         )
 
@@ -99,6 +156,8 @@ def flex_cast_quant(
 def _manual_tile(
     input: torch.Tensor,
     f: Callable,
+    aux_inputs: Tuple[torch.Tensor, ...] = (),
+    aux_kinds: Tuple[AuxKind, ...] = (),
     _pad_input_to_multiple_of: Tuple[int, int] | None = None,
     _tile_multiple_of: Tuple[int, int] | None = None,
     _inner_tile_multiple_of: Tuple[int, int] | None = None,
@@ -132,11 +191,12 @@ def _manual_tile(
     # offsets) rather than concatenating per-tile results.
 
     # 1. infer output shapes/dtypes by running `f` on a full-shape fake input.
-    # allow_non_fake_inputs=True is needed for recipes that close over real cuda tensors
-    # (nvfp4 outer_scale, RHT matrix); meta inputs don't work (device mismatch / no RNG).
+    # allow_non_fake_inputs=True is needed because aux_inputs are real cuda tensors (nvfp4
+    # outer_scale, RHT matrix); meta inputs don't work (device mismatch / no RNG). The probe is
+    # whole-tensor, so aux is presented whole (REPLICATE) here regardless of kind.
     with FakeTensorMode(allow_non_fake_inputs=True):
         fake_in = torch.empty(input.shape, dtype=input.dtype, device=input.device)
-        fake_outs = f(fake_in)
+        fake_outs = f(fake_in, *aux_inputs)
 
     # 2. preallocate the final outputs on the real device.
     final_outs = [
@@ -166,9 +226,12 @@ def _manual_tile(
     for r in t0_start:
         for c in t1_start:
             input_tile = input[r : r + tile_size_0, c : c + tile_size_1]
-            # TODO(future): properly broadcast aux_inputs, right now this
-            # will silently fail as the captured aux inputs are always replicated
-            outs = f(input_tile)
+            # present each aux to this tile per its kind (only REPLICATE implemented: the whole
+            # aux tensor is handed to every tile).
+            aux_tiles = [
+                _aux_for_tile(aux, kind) for aux, kind in zip(aux_inputs, aux_kinds)
+            ]
+            outs = f(input_tile, *aux_tiles)
 
             for i, local in enumerate(outs):
                 div0, div1 = divisors[i]
