@@ -125,12 +125,22 @@ def mxfp8_floor_f(x):
     return qdata.reshape(*lead, last), scale_e8m0.squeeze(-1)
 
 
-def _to_blocked_2d(scale):
-    """Swizzle a row-major block-scale (H, W) into NVIDIA's 2D blocked layout.
+def _to_blocked_4d(scale):
+    """Swizzle a row-major block-scale (H, W) into NVIDIA's blocked layout, kept as an
+    explicit 4D block grid `(n_row_blocks, n_col_blocks, 32, 16)`.
 
     Ported from flexquant v1 swizzle.py:11-46 (itself a port of torchao's `to_blocked`,
-    torchao/prototype/mx_formats/utils.py). Output is (32*ceil(H/128), 16*ceil(W/4));
-    `.flatten()` equals torchao's `to_blocked`.
+    torchao/prototype/mx_formats/utils.py), but the final `(n_row_blocks*32,
+    n_col_blocks*16)` reshape is NOT applied here. Serializing to that 2D buffer folds the
+    (row-block, col-block) walk order into the axes, which makes the result depend on the
+    GLOBAL grid shape -- a column split then reorders the buffer, so `f` composed with the
+    2D swizzle is not tile-invariant. Keeping the two block axes separate makes the swizzle
+    tile-invariant: a column tile concatenates on `dim=1` (n_col_blocks), a row tile on
+    `dim=0` (n_row_blocks), and `.reshape(-1)` still equals torchao's `to_blocked` buffer
+    (do that serialization once, outside `f`, after tiles are reassembled).
+
+    Each 128x4 scale block swizzles independently into a 32x16 block, so this is a LOCAL
+    (per-atom) transform: valid only when tiles are whole 128x4 scale atoms.
     """
     def _ceil_div(a, b):
         return (a + b - 1) // b
@@ -149,14 +159,19 @@ def _to_blocked_2d(scale):
         padded[:rows, :cols] = scale
 
     blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
-    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
-    return rearranged.reshape(n_row_blocks * 32, n_col_blocks * 16)
+    # (n_row_blocks, n_col_blocks, 128, 4) -> (n_row_blocks, n_col_blocks, 32, 16), keeping
+    # the two block axes intact (no reshape across them).
+    rearranged = blocks.reshape(n_row_blocks, n_col_blocks, 4, 32, 4).transpose(-3, -2)
+    return rearranged.reshape(n_row_blocks, n_col_blocks, 32, 16)
 
 
-def _from_blocked_2d(blocked, rows, cols):
-    """Inverse of `_to_blocked_2d` for the exact case rows % 128 == 0, cols % 4 == 0."""
+def _from_blocked_4d(blocked, rows, cols):
+    """Inverse of `_to_blocked_4d` for the exact case rows % 128 == 0, cols % 4 == 0.
+
+    `blocked` is the 4D block grid `(n_row_blocks, n_col_blocks, 32, 16)`.
+    """
     nrb, ncb = rows // 128, cols // 4
-    x = blocked.reshape(-1, 32, 16).reshape(-1, 32, 4, 4).transpose(1, 2)
+    x = blocked.reshape(nrb, ncb, 32, 4, 4).transpose(-3, -2)
     x = x.reshape(nrb, ncb, 128, 4).permute(0, 2, 1, 3)
     return x.reshape(rows, cols)
 
@@ -173,14 +188,16 @@ E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
 # Same quantization as mxfp8_floor_f, but the e8m0 scale is emitted in the blocked layout
 # `_scaled_mm` consumes (v1 mxfp8_floor_swizzle, recipes.py:401-423). The swizzle is a
 # LOCAL, tile-invariant transform when tiles are whole 128x128 hp units (= 128x4 e8m0
-# tiles): each 128x4 scale tile swizzles independently into a 32x16 block. Returning the
-# swizzled scale as a (1, N) ROW lets MANUAL_TILE's existing cat(dim=-1)/cat(dim=-2)
-# recompose it -- `.flatten()` walks the (row-block, col-block) buffer order. NOTE: only
-# valid for 128x128-aligned inputs; other tilings reorder the buffer.
+# tiles): each 128x4 scale tile swizzles independently into a 32x16 block. The scale is
+# returned as the 4D block grid `(n_row_blocks, n_col_blocks, 32, 16)` (see
+# `_to_blocked_4d`): keeping the block axes separate makes it tile-invariant under BOTH
+# row and column splits -- MANUAL_TILE reassembles a column tile with cat(dim=1) and a row
+# tile with cat(dim=0). The final serialization to the flat `_scaled_mm` buffer (a global,
+# grid-shape-dependent step) is `.reshape(-1)`, done once outside `f` after reassembly.
 # ---------------------------------------------------------------------------
 def mxfp8_floor_swizzle_f(x):
     qdata, scale_e8m0 = mxfp8_floor_f(x)
-    return qdata, _to_blocked_2d(scale_e8m0).reshape(1, -1)
+    return qdata, _to_blocked_4d(scale_e8m0)
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +246,9 @@ def make_float8_tensorwise_f(scale):
 # scale plus a per-16-element e4m3 INNER scale, with fp4-packed qdata. The outer scale is
 # a GLOBAL amax reduction -- not tile-invariant -- so (like tensorwise) it is computed
 # OUTSIDE flex_cast_quant (`nvfp4_gs_scale`) and bound into the recipe. The inner scale is
-# additionally swizzled into the NVIDIA blocked layout and returned as a (1, N) row, so
-# MANUAL_TILE's cat recomposition reproduces the full-tensor swizzle (cf. mxfp8 swizzle).
+# additionally swizzled into the NVIDIA blocked layout and returned as the 4D block grid
+# `(n_row_blocks, n_col_blocks, 32, 16)`, so MANUAL_TILE's cat recomposition reproduces the
+# full-tensor swizzle under both row and column splits (cf. mxfp8 swizzle).
 # ---------------------------------------------------------------------------
 def nvfp4_gs_scale(x):
     """Per-tensor fp32 outer scale (global reduction; computed outside flex_cast_quant)."""
@@ -255,7 +273,7 @@ def make_nvfp4_gs_swizzle_f(outer_scale):
         data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
         qdata_b = pack_uint4(f32_to_f4_unpacked(data_scaled)).view(torch.float4_e2m1fn_x2)
         qdata = qdata_b.reshape(*lead, last // 2)
-        inner_swizzled = _to_blocked_2d(inner.squeeze(-1)).reshape(1, -1)
+        inner_swizzled = _to_blocked_4d(inner.squeeze(-1))
         return qdata, inner_swizzled
 
     return f
@@ -297,11 +315,10 @@ def dq_tensorwise(q, scale):
 
 
 def mxfp8_floor_swizzle_dq_f(q, scale):
-    # un-swizzle the (1, N) scale back to (M, N//32) e8m0, then dequant as mxfp8.
+    # un-swizzle the 4D block grid back to (M, N//32) e8m0, then dequant as mxfp8.
     M, N = q.shape
     rows, cols = M, N // 32
-    nrb, ncb = (rows + 127) // 128, (cols + 3) // 4
-    scale_e8m0 = _from_blocked_2d(scale.reshape(nrb * 32, ncb * 16), rows, cols)
+    scale_e8m0 = _from_blocked_4d(scale, rows, cols)
     return mxfp8_floor_dq_f(q, scale_e8m0)
 
 
@@ -315,9 +332,8 @@ def make_nvfp4_gs_swizzle_dq_f(outer_scale):
         cols = N // 16  # number of 16-blocks per row (== inner scale cols)
         # unpack fp4 -> fp32 in (M, N).
         unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, N)
-        # un-swizzle inner scale back to (M, cols) e4m3 -> fp32.
-        nrb, ncb = (M + 127) // 128, (cols + 3) // 4
-        inner = _from_blocked_2d(inner_swizzled.reshape(nrb * 32, ncb * 16), M, cols)
+        # un-swizzle inner scale (4D block grid) back to (M, cols) e4m3 -> fp32.
+        inner = _from_blocked_4d(inner_swizzled, M, cols)
         inner_fp32 = inner.to(torch.float32).reshape(M, cols, 1)
         return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer_scale).reshape(M, N)
 

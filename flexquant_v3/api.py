@@ -66,9 +66,16 @@ def _manual_tile(
     that reduces over 1x128 blocks, M // 2 and N // 2 must be multiples of 128).
 
     Recomposing by 2x2 concat works uniformly for every output regardless of its grid:
-    an output that is coarser than `input` by a per-dim factor (e.g. a (M, N // 128)
-    scale) simply has its quadrants split at (M // 2, N // 2) // factor, so the same
-    concat reassembles it.
+    the input's row/col axes map to the output's LEADING two axes (dim 0 = rows, dim 1 =
+    cols), so we cat column-quadrants on dim 1 and row-quadrants on dim 0. This covers:
+      * qdata (M, N)            -- dims 0/1 are the (row, col) grid;
+      * a coarser scale (M, N // 128) -- same, just coarsened per dim;
+      * a swizzled scale as a 4D block grid (n_row_blocks, n_col_blocks, 32, 16) -- dims
+        0/1 are the (row-block, col-block) grid; the trailing (32, 16) intra-atom axes are
+        NOT split, which is exactly why the 4D form is tile-invariant (a flat 2D swizzle
+        would fold the block order into a single axis and break under a column split).
+    For a plain 2D output dim 0 == -2 and dim 1 == -1, so this matches the naive trailing-
+    axis concat; for the 4D grid it stays on the block axes.
     """
     assert input.ndim == 2, f"MANUAL_TILE expects a 2D input, got {input.ndim}D"
     M, N = input.shape
@@ -88,9 +95,10 @@ def _manual_tile(
         return torch.cat(tensors, dim)
 
     def _compose(i: int) -> torch.Tensor:
-        top = _cat([ul[i], ur[i]], dim=-1)
-        bottom = _cat([ll[i], lr[i]], dim=-1)
-        return _cat([top, bottom], dim=-2)
+        # cat on the LEADING axes: dim 1 = cols (ul|ur), dim 0 = rows (top/bottom).
+        top = _cat([ul[i], ur[i]], dim=1)
+        bottom = _cat([ll[i], lr[i]], dim=1)
+        return _cat([top, bottom], dim=0)
 
     # compose every output f produced (out + 0 or more aux), all in the same 2x2 grid.
     return tuple(_compose(i) for i in range(len(ul)))
