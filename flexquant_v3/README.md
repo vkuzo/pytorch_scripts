@@ -40,19 +40,28 @@ def flex_cast_quant(
     input: torch.Tensor,
     f: Callable,
     *,
-    _swap_input_axes: bool = False,                          # transpose input on load
+    _global_input_transform: GlobalInputTransform = GlobalInputTransform.NONE,  # e.g. transpose on load
+    _pad_input_to_multiple_of: Tuple[int, int] | None = None,  # zero-pad ragged dims up on load
+    _tile_multiple_of: Tuple[int, int] | None = None,          # tile-size divisibility constraint
+    _inner_tile_multiple_of: Tuple[int, int] | None = None,    # swizzle-atom constraint
     _backend: FlexCastQuantBackend = FlexCastQuantBackend.REFERENCE,
 ) -> tuple[torch.Tensor, ...]:                               # (out, *aux) from `f`
     ...
 ```
 
+`_global_input_transform` selects a global, pre-tiling load transform (a `GlobalInputTransform`
+enum): `NONE` (default) or `SWAP_0_AND_1_AXES` (transpose the input on load, for dim-M recipes).
+`BOTH_NONE_AND_SWAP_0_AND_1_AXES` is reserved for writing both dim0 and dim1 casts from one kernel
+and is not yet implemented.
+
 It applies `f` to `input` under the chosen backend and returns whatever tuple `f`
 produced. The `_`-prefixed args are for debugging/reference (backend selection, dim-M axis
-swap) and default to the plain reference path.
+swap via `_global_input_transform`, input padding, tiling constraints) and default to the
+plain reference path.
 
 ## Example recipes (see `recipes.py`)
 
-- **deepseek fp8** — 1x128, 128x128, and 1x128 dim-M (via `_swap_input_axes`).
+- **deepseek fp8** — 1x128, 128x128, and 1x128 dim-M (via `_global_input_transform=SWAP_0_AND_1_AXES`).
 - **mxfp8 FLOOR** — 1x32 blocks, e8m0 power-of-two scale; plain and swizzled (NVIDIA
   32x4x4 blocked scale layout). The swizzled scale is emitted as a 4D block grid
   `(n_row_blocks, n_col_blocks, 32, 16)` (see below).
@@ -72,9 +81,10 @@ tile-local offset repeats per tile, so draws are correlated across tiles -- not
 statistically sound under tiling.
 2. for training, we often need to do "x.t().contiguous().quant_with_recipe(...)". This is not
 expressible as a tile invariant function of `x`, as `x.t().contiguous()` is a global transform.
-Therefore, we add a global input transformation option, currently a bool named `_swap_input_axes`.
-This needs a better name, and we also would need support a third option for a single 
-kernel to write out casts in both directions (dim0 and dim1).
+Therefore, we add a global input transformation option, the `_global_input_transform`
+(`GlobalInputTransform`) enum: `NONE` or `SWAP_0_AND_1_AXES`. The third option,
+`BOTH_NONE_AND_SWAP_0_AND_1_AXES` -- a single kernel writing casts in both directions (dim0 and
+dim1) -- is defined but not yet implemented (asserts out).
 3. rowwise scaling is not currently in here. We could either leave it out of scope or
 add a concept of "tile that fully spans a dim".
 4. we need to design how to configure replicate vs broadcast aux inputs, as this 
@@ -112,9 +122,10 @@ tests in test.py: aligned split is invariant, the default quadrant split at 192 
 ## Backends
 
 - **`REFERENCE`** — runs `f` on the whole tensor. The correctness oracle.
-- **`MANUAL_TILE`** — splits the input into quadrants, runs `f` per tile, and recomposes.
-  For a tile-invariant `f` it must match `REFERENCE` bit-for-bit; it's how we *check*
-  tile-invariance. `_swap_input_axes=True` transposes the input on load (for dim-M recipes).
+- **`MANUAL_TILE`** — splits the input into 256x256 tiles, runs `f` per tile, and scatters
+  each tile's outputs into preallocated buffers. For a tile-invariant `f` it must match
+  `REFERENCE` bit-for-bit; it's how we *check* tile-invariance.
+  `_global_input_transform=SWAP_0_AND_1_AXES` transposes the input on load (for dim-M recipes).
 
 Both are debug/reference backends. `TODO`: lower `f` to a non-reference backend.
 
