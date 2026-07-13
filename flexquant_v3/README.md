@@ -30,6 +30,9 @@ tuple: the primary output first, then zero or more auxiliary outputs. To depend 
 computed outside the kernel (a global scale, a sign vector, an RNG seed), build `f` from a
 factory that closes over them — e.g. `make_nvfp4_gs_swizzle_recipe(outer_scale)`.
 
+Requirements on all outputs of `f`: must be at least 2d, and the first two dimensions
+must directly correspond to the two input dimensions.
+
 `flex_cast_quant` has the signature:
 
 ```python
@@ -51,10 +54,11 @@ swap) and default to the plain reference path.
 
 - **deepseek fp8** — 1x128, 128x128, and 1x128 dim-M (via `_swap_input_axes`).
 - **mxfp8 FLOOR** — 1x32 blocks, e8m0 power-of-two scale; plain and swizzled (NVIDIA
-  32x4x4 blocked scale layout).
+  32x4x4 blocked scale layout). The swizzled scale is emitted as a 4D block grid
+  `(n_row_blocks, n_col_blocks, 32, 16)` (see below).
 - **float8 tensorwise** — global per-tensor scale computed outside, cast bound via factory.
 - **nvfp4 with global scale** — two-level (per-tensor fp32 outer + per-16 e4m3 inner),
-  fp4-packed, swizzled inner scale.
+  fp4-packed, swizzled inner scale (same 4D block grid).
 - **randomized Hadamard (RHT)** — a non-quant transform (bf16 in, bf16 out, no scale).
 - **stochastic rounding fp32 -> bf16** — unbiased rounding; not tile-invariant by design.
 
@@ -77,6 +81,19 @@ add a concept of "tile that fully spans a dim".
 is not always recoverable from just `f`. For example, imagine a `[2, 2]` aux_input and a `[4, 4]`
 tensor. Both "replicate" and "scatter across tiles" behavior makes sense and is semantically
 different.
+5. **swizzled scale layout (partially resolved).** The NVIDIA blocked scale layout is a
+global, grid-shape-dependent *serialization*: laying the 128x4-scale atoms out into the
+flat buffer `_scaled_mm` consumes bakes the (row-block, col-block) walk order into the
+result, so composing it inside a tile-invariant `f` breaks under a column split (and under
+any non-128-aligned tile split). Fix: `f` now emits the swizzle as a 4D block grid
+`(n_row_blocks, n_col_blocks, 32, 16)` -- the per-atom swizzle is local/tile-invariant and
+the two block axes stay separate, so MANUAL_TILE reassembles a column tile with `cat(dim=1)`
+and a row tile with `cat(dim=0)`, bit-exact. The grid `.reshape(-1)` still equals torchao's
+`to_blocked` buffer; that final serialization is a global step done ONCE outside `f`, after
+tiles are reassembled. STILL OPEN: tiles must be whole 128x4 atoms (rows a multiple of 128,
+cols a multiple of the block width) -- a non-atom-aligned split still pads partial blocks
+independently and diverges. That alignment contract is unenforced (see the two 384-row
+tests in test.py: aligned split is invariant, the default quadrant split at 192 is not).
 
 ## Missing pieces
 
