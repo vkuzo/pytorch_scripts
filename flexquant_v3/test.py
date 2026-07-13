@@ -8,20 +8,22 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from api import FlexCastQuantBackend, GlobalInputTransform, flex_cast_quant
+from api import AuxKind, FlexCastQuantBackend, GlobalInputTransform, flex_cast_quant
 from recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
     DEEPSEEK_128X128,
+    FLOAT8_TENSORWISE,
     MXFP8_FLOOR,
     MXFP8_FLOOR_SWIZZLE,
+    NVFP4_GS_SWIZZLE,
+    float8_tensorwise_f,
     float8_tensorwise_scale,
+    hadamard_rht_f,
     hadamard_rht_matrix,
-    make_float8_tensorwise_recipe,
-    make_hadamard_rht_f,
-    make_nvfp4_gs_swizzle_recipe,
     make_sr_bf16_f,
     nvfp4_gs_scale,
+    nvfp4_gs_swizzle_f,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -69,15 +71,16 @@ def test_float8_tensorwise_matches_reference():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    # scale computed outside flex_cast_quant; the Recipe wraps only the cast kernel.
+    # scale computed outside flex_cast_quant, passed in as a REPLICATE aux input.
     scale = float8_tensorwise_scale(x)
-    recipe = make_float8_tensorwise_recipe(scale)
     qdata, scale_out = flex_cast_quant(
-        x, 
-        recipe.quant, 
-        _tile_multiple_of=recipe._tile_multiple_of,
+        x,
+        FLOAT8_TENSORWISE.quant,
+        aux_inputs=(scale,),
+        aux_kinds=(AuxKind.REPLICATE,),
+        _tile_multiple_of=FLOAT8_TENSORWISE._tile_multiple_of,
     )
-    qdata_ref, scale_ref = recipe.quant(x)
+    qdata_ref, scale_ref = float8_tensorwise_f(x, scale)
 
     # shapes / dtypes: scale is a single per-tensor scalar
     assert qdata.shape == (512, 512)
@@ -95,28 +98,30 @@ def test_float8_tensorwise_sqnr_vs_high_precision():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     scale = float8_tensorwise_scale(x)
-    recipe = make_float8_tensorwise_recipe(scale)
-    qdata, scale_out = flex_cast_quant(x, recipe.quant, _tile_multiple_of=recipe._tile_multiple_of)
-    x_hat = recipe.dequant(qdata, scale_out)
+    qdata, scale_out = flex_cast_quant(
+        x, FLOAT8_TENSORWISE.quant, aux_inputs=(scale,), aux_kinds=(AuxKind.REPLICATE,)
+    )
+    x_hat = FLOAT8_TENSORWISE.dequant(qdata, scale_out)
     assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 
-# nvfp4 with global scale is factory-bound (needs the runtime outer scale), so -- like
+# nvfp4 with global scale needs the runtime outer scale (a REPLICATE aux input), so -- like
 # tensorwise -- it lives in dedicated tests rather than the static RECIPES table.
 def test_nvfp4_gs_swizzle_matches_reference():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    # outer scale computed outside; the Recipe wraps the inner cast + swizzle.
+    # outer scale computed outside, passed in as a REPLICATE aux input.
     outer = nvfp4_gs_scale(x)
-    recipe = make_nvfp4_gs_swizzle_recipe(outer)
     qdata, scale = flex_cast_quant(
-        x, 
-        recipe.quant, 
-        _tile_multiple_of=recipe._tile_multiple_of,
-        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+        x,
+        NVFP4_GS_SWIZZLE.quant,
+        aux_inputs=(outer,),
+        aux_kinds=(AuxKind.REPLICATE,),
+        _tile_multiple_of=NVFP4_GS_SWIZZLE._tile_multiple_of,
+        _inner_tile_multiple_of=NVFP4_GS_SWIZZLE._inner_tile_multiple_of,
     )
-    qdata_ref, scale_ref = recipe.quant(x)
+    qdata_ref, scale_ref = nvfp4_gs_swizzle_f(x, outer)
 
     # shapes / dtypes: packed fp4 qdata + swizzled e4m3 inner scale as a 4D block grid.
     # inner scale is (256, 256//16) = (256, 16) -> nrb=2, ncb=4 -> (2, 4, 32, 16).
@@ -134,20 +139,17 @@ def test_nvfp4_gs_swizzle_backends_match():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     outer = nvfp4_gs_scale(x)
-    recipe = make_nvfp4_gs_swizzle_recipe(outer)
+    kw = dict(
+        aux_inputs=(outer,),
+        aux_kinds=(AuxKind.REPLICATE,),
+        _tile_multiple_of=NVFP4_GS_SWIZZLE._tile_multiple_of,
+        _inner_tile_multiple_of=NVFP4_GS_SWIZZLE._inner_tile_multiple_of,
+    )
     qdata_ref, scale_ref = flex_cast_quant(
-        x, 
-        recipe.quant, 
-        _backend=FlexCastQuantBackend.REFERENCE,
-        _tile_multiple_of=recipe._tile_multiple_of,
-        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+        x, NVFP4_GS_SWIZZLE.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw
     )
     qdata_tile, scale_tile = flex_cast_quant(
-        x, 
-        recipe.quant, 
-        _backend=FlexCastQuantBackend.MANUAL_TILE,
-        _tile_multiple_of=recipe._tile_multiple_of,
-        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+        x, NVFP4_GS_SWIZZLE.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw
     )
 
     # exercises the _manual_tile packed-fp4 cat (via uint8 view).
@@ -162,32 +164,37 @@ def test_nvfp4_gs_swizzle_sqnr_vs_high_precision():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     outer = nvfp4_gs_scale(x)
-    recipe = make_nvfp4_gs_swizzle_recipe(outer)
     qdata, scale = flex_cast_quant(
-        x, 
-        recipe.quant,
-        _tile_multiple_of=recipe._tile_multiple_of,
-        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+        x,
+        NVFP4_GS_SWIZZLE.quant,
+        aux_inputs=(outer,),
+        aux_kinds=(AuxKind.REPLICATE,),
+        _tile_multiple_of=NVFP4_GS_SWIZZLE._tile_multiple_of,
+        _inner_tile_multiple_of=NVFP4_GS_SWIZZLE._inner_tile_multiple_of,
     )
-    x_hat = recipe.dequant(qdata, scale)
+    x_hat = NVFP4_GS_SWIZZLE.dequant(qdata, scale, outer)
     # nvfp4 is 4-bit, coarser than fp8/mxfp8, so a lower SQNR floor.
     assert _compute_error(x.float(), x_hat.float()) > 12.0
 
 
 # randomized Hadamard transform (RHT): a non-quant example. `f` returns a 1-tuple `(out,)`
-# (no scale) and closes over a fixed sign vector so it's identical across backends.
+# (no scale) and takes the RHT matrix as a REPLICATE aux input, identical across backends.
 def _rht_sign_vector():
     torch.manual_seed(0)
     return torch.randint(0, 2, (16,), device="cuda") * 2 - 1  # length-16 +/-1
+
+
+def _rht_matrix():
+    return hadamard_rht_matrix(_rht_sign_vector(), "cuda", torch.bfloat16)
 
 
 def test_hadamard_rht_matches_reference():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    f = make_hadamard_rht_f(_rht_sign_vector())
-    (out,) = flex_cast_quant(x, f)
-    (out_ref,) = f(x)
+    rht = _rht_matrix()
+    (out,) = flex_cast_quant(x, hadamard_rht_f, aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
+    (out_ref,) = hadamard_rht_f(x, rht)
 
     assert out.shape == (512, 512)
     assert out.dtype == torch.bfloat16
@@ -200,9 +207,10 @@ def test_hadamard_rht_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    f = make_hadamard_rht_f(_rht_sign_vector())
-    (out_ref,) = flex_cast_quant(x, f, _backend=FlexCastQuantBackend.REFERENCE)
-    (out_tile,) = flex_cast_quant(x, f, _backend=FlexCastQuantBackend.MANUAL_TILE)
+    rht = _rht_matrix()
+    kw = dict(aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
+    (out_ref,) = flex_cast_quant(x, hadamard_rht_f, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    (out_tile,) = flex_cast_quant(x, hadamard_rht_f, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
 
     assert torch.equal(out_tile, out_ref)
 
@@ -212,11 +220,9 @@ def test_hadamard_rht_roundtrip_sqnr():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    signs = _rht_sign_vector()
-    f = make_hadamard_rht_f(signs)
-    (y,) = flex_cast_quant(x, f)
+    rht = _rht_matrix()
+    (y,) = flex_cast_quant(x, hadamard_rht_f, aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
 
-    rht = hadamard_rht_matrix(signs, x.device, x.dtype)
     M, N = x.shape
     x_rec = (y.reshape(M, N // 16, 16) @ rht.t()).reshape(M, N)
     assert _compute_error(x.float(), x_rec.float()) > 25.0
@@ -428,3 +434,13 @@ def test_pad_matches_manual_pad():
     qdata_ref, scale_ref = MXFP8_FLOOR.quant(x_padded)
     assert _qdata_equal(qdata, qdata_ref)
     assert torch.equal(scale, scale_ref)
+
+
+# aux inputs: only AuxKind.REPLICATE is implemented so far; other kinds must raise.
+@pytest.mark.parametrize("kind", [AuxKind.TILE, AuxKind.ROW, AuxKind.COL])
+def test_aux_unimplemented_kind_raises(kind):
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+    scale = float8_tensorwise_scale(x)
+    with pytest.raises(NotImplementedError):
+        flex_cast_quant(x, FLOAT8_TENSORWISE.quant, aux_inputs=(scale,), aux_kinds=(kind,))

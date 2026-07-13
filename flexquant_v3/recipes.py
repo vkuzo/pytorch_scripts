@@ -223,7 +223,8 @@ def mxfp8_floor_swizzle_f(x):
 # OUTSIDE flex_cast_quant (`float8_tensorwise_scale`; the "call something else" kernel
 # from api.py's docstring). Given that precomputed scale, quantization is just dividing
 # every element by one fixed scalar -- identical across tiles, hence tile-invariant -- so
-# it runs INSIDE flex_cast_quant via an `f` that closes over the replicated scale.
+# it runs INSIDE flex_cast_quant via an `f` that takes the scale as an explicit REPLICATE
+# aux input (handed whole to every tile).
 # ---------------------------------------------------------------------------
 def float8_tensorwise_scale(x):
     """Per-tensor scale (global reduction; computed outside flex_cast_quant)."""
@@ -232,14 +233,11 @@ def float8_tensorwise_scale(x):
     return (amax / fp8_max).to(torch.float32)  # scalar forward scale
 
 
-def make_float8_tensorwise_f(scale):
-    """Tile-invariant `f` closing over the precomputed per-tensor `scale`."""
-
-    def f(x):
-        qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
-        return qdata, scale
-
-    return f
+def float8_tensorwise_f(x, scale):
+    """Tile-invariant `f` taking the precomputed per-tensor `scale` as an explicit aux input
+    (REPLICATE: the same scalar scale is used for every tile)."""
+    qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
+    return qdata, scale
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +246,7 @@ def make_float8_tensorwise_f(scale):
 # Two-level scaling like v1 nvfp4_with_gs (recipes.py:255-320): a per-tensor fp32 OUTER
 # scale plus a per-16-element e4m3 INNER scale, with fp4-packed qdata. The outer scale is
 # a GLOBAL amax reduction -- not tile-invariant -- so (like tensorwise) it is computed
-# OUTSIDE flex_cast_quant (`nvfp4_gs_scale`) and bound into the recipe. The inner scale is
+# OUTSIDE flex_cast_quant (`nvfp4_gs_scale`) and passed in as a REPLICATE aux input. The inner scale is
 # additionally swizzled into the NVIDIA blocked layout and returned as the 4D block grid
 # `(n_row_blocks, n_col_blocks, 32, 16)`, so MANUAL_TILE's cat recomposition reproduces the
 # full-tensor swizzle under both row and column splits (cf. mxfp8 swizzle).
@@ -259,27 +257,24 @@ def nvfp4_gs_scale(x):
     return outer_amax / (F8E4M3_MAX * F4_E2M1_MAX)
 
 
-def make_nvfp4_gs_swizzle_f(outer_scale):
-    """Tile-invariant `f` closing over the precomputed per-tensor `outer_scale`."""
-
-    def f(x):
-        *lead, last = x.shape
-        x_b = x.reshape(*lead, last // 16, 16)
-        local_amax = x_b.abs().amax(dim=-1, keepdim=True)
-        # inner e4m3 block scale, relative to the outer scale.
-        inner = torch.clamp(
-            (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_scale,
-            min=E4M3_EPS, max=F8E4M3_MAX,
-        ).to(torch.float8_e4m3fn)
-        # cast: divide by (outer * inner), clamp to fp4 range, pack two per byte.
-        reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
-        data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
-        qdata_b = pack_uint4(f32_to_f4_unpacked(data_scaled)).view(torch.float4_e2m1fn_x2)
-        qdata = qdata_b.reshape(*lead, last // 2)
-        inner_swizzled = _to_blocked_4d(inner.squeeze(-1))
-        return qdata, inner_swizzled
-
-    return f
+def nvfp4_gs_swizzle_f(x, outer_scale):
+    """Tile-invariant `f` taking the precomputed per-tensor `outer_scale` as an explicit aux
+    input (REPLICATE: the same scalar outer scale is used for every tile)."""
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 16, 16)
+    local_amax = x_b.abs().amax(dim=-1, keepdim=True)
+    # inner e4m3 block scale, relative to the outer scale.
+    inner = torch.clamp(
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_scale,
+        min=E4M3_EPS, max=F8E4M3_MAX,
+    ).to(torch.float8_e4m3fn)
+    # cast: divide by (outer * inner), clamp to fp4 range, pack two per byte.
+    reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
+    data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
+    qdata_b = pack_uint4(f32_to_f4_unpacked(data_scaled)).view(torch.float4_e2m1fn_x2)
+    qdata = qdata_b.reshape(*lead, last // 2)
+    inner_swizzled = _to_blocked_4d(inner.squeeze(-1))
+    return qdata, inner_swizzled
 
 
 # ---------------------------------------------------------------------------
@@ -325,22 +320,19 @@ def mxfp8_floor_swizzle_dq_f(q, scale):
     return mxfp8_floor_dq_f(q, scale_e8m0)
 
 
-def make_nvfp4_gs_swizzle_dq_f(outer_scale):
-    """Dequant closing over the per-tensor `outer_scale` (kept a 2-arg (qdata, scale) fn)."""
-
-    def dq(q, inner_swizzled):
-        # q: (M, N//2) packed fp4; N = 2 * packed cols.
-        M, half = q.shape
-        N = half * 2
-        cols = N // 16  # number of 16-blocks per row (== inner scale cols)
-        # unpack fp4 -> fp32 in (M, N).
-        unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, N)
-        # un-swizzle inner scale (4D block grid) back to (M, cols) e4m3 -> fp32.
-        inner = _from_blocked_4d(inner_swizzled, M, cols)
-        inner_fp32 = inner.to(torch.float32).reshape(M, cols, 1)
-        return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer_scale).reshape(M, N)
-
-    return dq
+def nvfp4_gs_swizzle_dq_f(q, inner_swizzled, outer_scale):
+    """Dequant taking the per-tensor `outer_scale` as an explicit arg (symmetric with the
+    lifted quant `nvfp4_gs_swizzle_f`)."""
+    # q: (M, N//2) packed fp4; N = 2 * packed cols.
+    M, half = q.shape
+    N = half * 2
+    cols = N // 16  # number of 16-blocks per row (== inner scale cols)
+    # unpack fp4 -> fp32 in (M, N).
+    unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, N)
+    # un-swizzle inner scale (4D block grid) back to (M, cols) e4m3 -> fp32.
+    inner = _from_blocked_4d(inner_swizzled, M, cols)
+    inner_fp32 = inner.to(torch.float32).reshape(M, cols, 1)
+    return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer_scale).reshape(M, N)
 
 
 DEEPSEEK_1X128 = Recipe(
@@ -374,24 +366,22 @@ MXFP8_FLOOR_SWIZZLE = Recipe(
 )
 
 
-def make_float8_tensorwise_recipe(scale):
-    """Recipe wrapping only the tensorwise cast kernel; the global scale is computed
-    outside (via float8_tensorwise_scale) and bound here."""
-    return Recipe(
-        quant=make_float8_tensorwise_f(scale),
-        dequant=dq_tensorwise,
-    )
+# Tensorwise recipe: the per-tensor scale is computed outside (via float8_tensorwise_scale)
+# and passed to flex_cast_quant as an explicit aux input (AuxKind.REPLICATE), not bound here.
+FLOAT8_TENSORWISE = Recipe(
+    quant=float8_tensorwise_f,
+    dequant=dq_tensorwise,
+)
 
 
-def make_nvfp4_gs_swizzle_recipe(outer_scale):
-    """Recipe wrapping the nvfp4 inner-scale cast + swizzle; the per-tensor outer scale is
-    computed outside (via nvfp4_gs_scale) and bound into both quant and dequant."""
-    return Recipe(
-        quant=make_nvfp4_gs_swizzle_f(outer_scale),
-        dequant=make_nvfp4_gs_swizzle_dq_f(outer_scale),
-        _tile_multiple_of=(1, 16),
-        _inner_tile_multiple_of=(128, 64),  # 128x64 to enforce that each scale swizzle does not cross tile boundaries
-    )
+# nvfp4 recipe: the per-tensor outer scale is computed outside (via nvfp4_gs_scale) and passed
+# to flex_cast_quant / dequant as an explicit aux input (AuxKind.REPLICATE), not bound here.
+NVFP4_GS_SWIZZLE = Recipe(
+    quant=nvfp4_gs_swizzle_f,
+    dequant=nvfp4_gs_swizzle_dq_f,
+    _tile_multiple_of=(1, 16),
+    _inner_tile_multiple_of=(128, 64),  # 128x64 to enforce that each scale swizzle does not cross tile boundaries
+)
 
 
 # ---------------------------------------------------------------------------
@@ -433,21 +423,15 @@ def hadamard_rht_matrix(sign_vector, device, dtype):
     return torch.diag(sign_vector.to(device=device, dtype=dtype)) @ H
 
 
-def make_hadamard_rht_f(sign_vector):
-    """Factory: a tile-invariant `f` applying the 16x16 RHT along the last dim.
+def hadamard_rht_f(x, rht):
+    """Tile-invariant `f` applying the 16x16 RHT along the last dim.
 
-    Builds the RHT matrix once (from `sign_vector`, a length-16 +/-1 tensor) and closes
-    over it, so `f` reuses the same matrix across every call/backend. Returns a 1-tuple
-    `(out,)` -- no scale/aux.
+    `rht` is the RHT matrix (built via `hadamard_rht_matrix`), passed as an explicit aux input
+    (REPLICATE: the same matrix is used for every tile). Returns a 1-tuple `(out,)` -- no scale.
     """
-    rht = hadamard_rht_matrix(sign_vector, sign_vector.device, torch.bfloat16)
-
-    def f(x):
-        *lead, last = x.shape
-        out = (x.reshape(*lead, last // 16, 16) @ rht).reshape(*lead, last)
-        return (out,)
-
-    return f
+    *lead, last = x.shape
+    out = (x.reshape(*lead, last // 16, 16) @ rht).reshape(*lead, last)
+    return (out,)
 
 
 # ---------------------------------------------------------------------------
