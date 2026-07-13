@@ -74,67 +74,82 @@ def _manual_tile(
     _tile_multiple_of: Tuple[int, int] | None = None,
     _inner_tile_multiple_of: Tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Tile `input` into 4 quadrants, run `f` on each, and recompose (debug backend).
-
-    Splits the (M, N) input at (M // 2, N // 2) into upper-left, upper-right, lower-left,
-    lower-right, calls `f` per quadrant, then glues each output back with a 2x2 concat.
-    Because `f` is tile-invariant, this equals the REFERENCE result exactly -- provided
-    the split points land on tile boundaries so no tile is severed (e.g. for a recipe
-    that reduces over 1x128 blocks, M // 2 and N // 2 must be multiples of 128).
-
-    Recomposing by 2x2 concat works uniformly for every output regardless of its grid:
-    the input's row/col axes map to the output's LEADING two axes (dim 0 = rows, dim 1 =
-    cols), so we cat column-quadrants on dim 1 and row-quadrants on dim 0. This covers:
-      * qdata (M, N)            -- dims 0/1 are the (row, col) grid;
-      * a coarser scale (M, N // 128) -- same, just coarsened per dim;
-      * a swizzled scale as a 4D block grid (n_row_blocks, n_col_blocks, 32, 16) -- dims
-        0/1 are the (row-block, col-block) grid; the trailing (32, 16) intra-atom axes are
-        NOT split, which is exactly why the 4D form is tile-invariant (a flat 2D swizzle
-        would fold the block order into a single axis and break under a column split).
-    For a plain 2D output dim 0 == -2 and dim 1 == -1, so this matches the naive trailing-
-    axis concat; for the 4D grid it stays on the block axes.
+    """Tile `input` into 256x256 tiles, run `f` on each, and recompose (debug backend).
     """
     assert input.ndim == 2, f"MANUAL_TILE expects a 2D input, got {input.ndim}D"
-    M, N = input.shape
-    mid_m, mid_n = M // 2, N // 2
 
-    # TODO(future): make the tiling more generic
+    # choose tile size if not specified
+    # TODO(future): make this configurable
+    tile_size_0, tile_size_1 = 256, 256
 
     # verify tiling constraints are honored
     if _tile_multiple_of is not None:
-        cases = [
-            (mid_m, mid_n),
-            (mid_m, N - mid_n),
-            (M - mid_m, mid_n),
-            (M - mid_m, N - mid_n),
-        ]
-        for dim0, dim1 in cases:
-            assert dim0 % _tile_multiple_of[0] == 0
-            assert dim1 % _tile_multiple_of[1] == 0
-
+        assert tile_size_0 % _tile_multiple_of[0] == 0
+        assert tile_size_1 % _tile_multiple_of[1] == 0
+        assert input.shape[0] % _tile_multiple_of[0] == 0
+        assert input.shape[1] % _tile_multiple_of[1] == 0
     if _inner_tile_multiple_of is not None:
-        # only check the upper left quadrant
-        assert mid_m % _inner_tile_multiple_of[0] == 0
-        assert mid_n % _inner_tile_multiple_of[1] == 0
+        assert tile_size_0 % _inner_tile_multiple_of[0] == 0
+        assert tile_size_1 % _inner_tile_multiple_of[1] == 0
 
-    ul = f(input[:mid_m, :mid_n])
-    ur = f(input[:mid_m, mid_n:])
-    ll = f(input[mid_m:, :mid_n])
-    lr = f(input[mid_m:, mid_n:])
+    # manually tile the tensor
+    t0_start = list(range(0, input.shape[0], tile_size_0))
+    t1_start = list(range(0, input.shape[1], tile_size_1))
 
-    def _cat(tensors, dim):
-        # torch.cat is not implemented for sub-byte float4_e2m1fn_x2; cat via uint8 view.
-        if tensors[0].dtype == torch.float4_e2m1fn_x2:
-            return torch.cat([t.view(torch.uint8) for t in tensors], dim).view(
-                torch.float4_e2m1fn_x2
-            )
-        return torch.cat(tensors, dim)
+    # [
+    #   [(o0_0_0, o0_0_1, ...), ...],
+    #   [(o1_0_0, o1_0_1, ...), ...],
+    # ]
+    outs_outer = []
 
-    def _compose(i: int) -> torch.Tensor:
-        # cat on the LEADING axes: dim 1 = cols (ul|ur), dim 0 = rows (top/bottom).
-        top = _cat([ul[i], ur[i]], dim=1)
-        bottom = _cat([ll[i], lr[i]], dim=1)
-        return _cat([top, bottom], dim=0)
+    for t0_start_idx in t0_start:
 
-    # compose every output f produced (out + 0 or more aux), all in the same 2x2 grid.
-    return tuple(_compose(i) for i in range(len(ul)))
+        # [(o0_0_0, o0_0_1, ...), (o0_1_0, o0_1_1, ...), ...]
+        outs_inner = []
+
+        t0_end_idx = t0_start_idx + tile_size_0
+        for t1_start_idx in t1_start:
+            t1_end_idx = t1_start_idx + tile_size_1
+
+            input_tile = input[t0_start_idx:t0_end_idx, t1_start_idx:t1_end_idx]
+            # TODO(future): properly broadcast aux_inputs, right now this
+            # will silently fail as the captured aux inputs are always replicated
+
+            outs = f(input_tile)
+            
+            # combine the outputs
+            outs_inner.append(outs)
+
+        outs_outer.append(outs_inner)
+
+    # stitch the output tensors to get final result
+    # TODO(future): handle `f` returning either tuple of multiple tensors
+    # or a single tensor
+    num_outs = len(outs_outer[0][0])
+    final_outs = []
+    for out_idx in range(num_outs):
+        
+        # first, extract 
+        # [
+        #   [o0_0_idx, o0_1_idx, ...], 
+        #   [o1_0_idx, o1_1_idx, ...],
+        # ]
+        extracted_out = [
+            [col[out_idx] for col in row]
+            for row in outs_outer
+        ]
+
+        # then, get
+        # [
+        #   tensor(*o0_0_idx...*o0_1_idx...], 
+        #   [o1_0_idx, o1_1_idx, ...],
+        # ]
+        extracted_out = [
+            torch.cat(row, dim=1) for row in extracted_out
+        ]
+
+        # then, get final tensor
+        extracted_out = torch.cat(extracted_out, dim=0)
+        final_outs.append(extracted_out)
+
+    return tuple(final_outs)

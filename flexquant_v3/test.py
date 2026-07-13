@@ -41,11 +41,11 @@ pytestmark = pytest.mark.skipif(
 # sqnr_min: fp8 e4m3 recipes clear ~20 dB; the mxfp8 e8m0 pow2 scale is coarser (15 dB).
 # mxfp8_floor_swizzle scale: (256, 8) block scale -> nrb=2, ncb=2 -> (2, 2, 32, 16).
 RECIPES = [
-    ("deepseek_1x128", DEEPSEEK_1X128, False, (256, 256 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
-    ("deepseek_128x128", DEEPSEEK_128X128, False, (256 // 128, 256 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
-    ("deepseek_1x128_dim_m", DEEPSEEK_1X128_DIM_M, True, (256, 256 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
-    ("mxfp8_floor", MXFP8_FLOOR, False, (256, 256 // 32), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
-    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE, False, (2, 2, 32, 16), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
+    ("deepseek_1x128", DEEPSEEK_1X128, False, (512, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
+    ("deepseek_128x128", DEEPSEEK_128X128, False, (512 // 128, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
+    ("deepseek_1x128_dim_m", DEEPSEEK_1X128_DIM_M, True, (512, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
+    ("mxfp8_floor", MXFP8_FLOOR, False, (512, 512 // 32), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
+    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE, False, (4, 4, 32, 16), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
 ]
 
 
@@ -66,7 +66,7 @@ def _qdata_equal(a, b):
 
 def test_float8_tensorwise_matches_reference():
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     # scale computed outside flex_cast_quant; the Recipe wraps only the cast kernel.
     scale = float8_tensorwise_scale(x)
@@ -79,7 +79,7 @@ def test_float8_tensorwise_matches_reference():
     qdata_ref, scale_ref = recipe.quant(x)
 
     # shapes / dtypes: scale is a single per-tensor scalar
-    assert qdata.shape == (256, 256)
+    assert qdata.shape == (512, 512)
     assert qdata.dtype == torch.float8_e4m3fn
     assert scale_out.shape == ()
     assert scale_out.dtype == torch.float32
@@ -91,7 +91,7 @@ def test_float8_tensorwise_matches_reference():
 
 def test_float8_tensorwise_sqnr_vs_high_precision():
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     scale = float8_tensorwise_scale(x)
     recipe = make_float8_tensorwise_recipe(scale)
@@ -104,7 +104,7 @@ def test_float8_tensorwise_sqnr_vs_high_precision():
 # tensorwise -- it lives in dedicated tests rather than the static RECIPES table.
 def test_nvfp4_gs_swizzle_matches_reference():
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     # outer scale computed outside; the Recipe wraps the inner cast + swizzle.
     outer = nvfp4_gs_scale(x)
@@ -119,9 +119,9 @@ def test_nvfp4_gs_swizzle_matches_reference():
 
     # shapes / dtypes: packed fp4 qdata + swizzled e4m3 inner scale as a 4D block grid.
     # inner scale is (256, 256//16) = (256, 16) -> nrb=2, ncb=4 -> (2, 4, 32, 16).
-    assert qdata.shape == (256, 128)
+    assert qdata.shape == (512, 256)
     assert qdata.dtype == torch.float4_e2m1fn_x2
-    assert scale.shape == (2, 4, 32, 16)
+    assert scale.shape == (4, 8, 32, 16)
     assert scale.dtype == torch.float8_e4m3fn
 
     assert _qdata_equal(qdata, qdata_ref)
@@ -130,7 +130,7 @@ def test_nvfp4_gs_swizzle_matches_reference():
 
 def test_nvfp4_gs_swizzle_backends_match():
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     outer = nvfp4_gs_scale(x)
     recipe = make_nvfp4_gs_swizzle_recipe(outer)
@@ -158,7 +158,7 @@ def test_nvfp4_gs_swizzle_backends_match():
 
 def test_nvfp4_gs_swizzle_sqnr_vs_high_precision():
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     outer = nvfp4_gs_scale(x)
     recipe = make_nvfp4_gs_swizzle_recipe(outer)
@@ -182,13 +182,13 @@ def _rht_sign_vector():
 
 def test_hadamard_rht_matches_reference():
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     f = make_hadamard_rht_f(_rht_sign_vector())
     (out,) = flex_cast_quant(x, f)
     (out_ref,) = f(x)
 
-    assert out.shape == (256, 256)
+    assert out.shape == (512, 512)
     assert out.dtype == torch.bfloat16
     assert torch.equal(out, out_ref)
 
@@ -197,7 +197,7 @@ def test_hadamard_rht_backends_match():
     # single-output f: 256 // 2 == 128 is a multiple of 16, so quadrants don't sever a
     # 16-group -> tile invariant. Exercises the generalized single-output _manual_tile.
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     f = make_hadamard_rht_f(_rht_sign_vector())
     (out_ref,) = flex_cast_quant(x, f, _backend=FlexCastQuantBackend.REFERENCE)
@@ -209,7 +209,7 @@ def test_hadamard_rht_backends_match():
 def test_hadamard_rht_roundtrip_sqnr():
     # RHT is orthogonal, so its inverse is its transpose (NOT applying it twice).
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     signs = _rht_sign_vector()
     f = make_hadamard_rht_f(signs)
@@ -226,12 +226,12 @@ def test_hadamard_rht_roundtrip_sqnr():
 def test_sr_bf16_matches_reference():
     # determinism: same seed -> bit-exact; different seed -> differs.
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.float32, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.float32, device="cuda")
 
     (out,) = flex_cast_quant(x, make_sr_bf16_f(0))
     (out_ref,) = make_sr_bf16_f(0)(x)
 
-    assert out.shape == (256, 256)
+    assert out.shape == (512, 512)
     assert out.dtype == torch.bfloat16
     assert torch.equal(out, out_ref)
 
@@ -260,7 +260,7 @@ def test_sr_bf16_tiling_changes_rounding():
     # documents the accepted non-invariance: REFERENCE vs MANUAL_TILE differ bit-for-bit
     # (tile-local offsets repeat), yet both stay unbiased (mean ~= input).
     v = 1.0 + 0.003
-    x = torch.full((256, 256), v, dtype=torch.float32, device="cuda")
+    x = torch.full((512, 512), v, dtype=torch.float32, device="cuda")
 
     (out_ref,) = flex_cast_quant(x, make_sr_bf16_f(0), _backend=FlexCastQuantBackend.REFERENCE)
     (out_tile,) = flex_cast_quant(x, make_sr_bf16_f(0), _backend=FlexCastQuantBackend.MANUAL_TILE)
@@ -277,7 +277,7 @@ def test_sr_bf16_tiling_changes_rounding():
 )
 def test_matches_reference(recipe, swap_axes, scale_shape, scale_dtype, qdata_dtype):
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     qdata, scale = flex_cast_quant(
         x, 
@@ -309,7 +309,7 @@ def test_backends_match(recipe, swap_axes, flat_compare):
     # every recipe is tile-invariant, so the MANUAL_TILE backend must match REFERENCE
     # exactly. 256 // 2 == 128 keeps the quadrant split on a 128x128 tile boundary.
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     qdata_ref, scale_ref = flex_cast_quant(
         x, 
@@ -343,7 +343,7 @@ def test_backends_match(recipe, swap_axes, flat_compare):
 def test_sqnr_vs_high_precision(recipe, swap_axes, sqnr_min):
     # dequantizing (qdata, scale) should recover the input with high SQNR.
     torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     qdata, scale = flex_cast_quant(
         x, 
