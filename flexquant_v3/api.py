@@ -2,7 +2,9 @@ import enum
 from typing import Callable, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch._subclasses.fake_tensor import FakeTensorMode
+from utils import _pad_to_multiple
 
 
 class FlexCastQuantBackend(enum.Enum):
@@ -23,6 +25,8 @@ def flex_cast_quant(
     # TODO(future): we also need a way for a single fused kernel to write
     # out dim0 and dim1 quant at the same time
     _swap_input_axes: bool = False,
+    # input padding
+    _pad_input_to_multiple_of: Tuple[int, int] | None = None,
     # restrictions on tiling
     _tile_multiple_of: Tuple[int, int] | None = None,
     _inner_tile_multiple_of: Tuple[int, int] | None = None,
@@ -49,6 +53,10 @@ def flex_cast_quant(
 
     if _backend is FlexCastQuantBackend.REFERENCE:
 
+        # pad input (before the constraint asserts, so they validate the padded shape)
+        if _pad_input_to_multiple_of is not None:
+            input = _pad_to_multiple(input, _pad_input_to_multiple_of)
+
         # verify that tile constraints are respected, if specified
         if _tile_multiple_of is not None:
             M, K = input.shape
@@ -61,7 +69,13 @@ def flex_cast_quant(
         outs = f(input)
 
     elif _backend is FlexCastQuantBackend.MANUAL_TILE:
-        outs = _manual_tile(input, f, _tile_multiple_of, _inner_tile_multiple_of)
+        outs = _manual_tile(
+            input, 
+            f, 
+            _pad_input_to_multiple_of,
+            _tile_multiple_of, 
+            _inner_tile_multiple_of,
+        )
 
     else:
         raise AssertionError(f"unknown {_backend=}")
@@ -72,12 +86,18 @@ def flex_cast_quant(
 def _manual_tile(
     input: torch.Tensor,
     f: Callable,
+    _pad_input_to_multiple_of: Tuple[int, int] | None = None,
     _tile_multiple_of: Tuple[int, int] | None = None,
     _inner_tile_multiple_of: Tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Tile `input` into 256x256 tiles, run `f` on each, and recompose (debug backend).
     """
     assert input.ndim == 2, f"MANUAL_TILE expects a 2D input, got {input.ndim}D"
+
+    # pad input first, so the whole pipeline (constraint asserts, fake-probe output shapes,
+    # preallocation, tiling offsets) all key off the padded shape.
+    if _pad_input_to_multiple_of is not None:
+        input = _pad_to_multiple(input, _pad_input_to_multiple_of)
 
     # choose tile size if not specified
     # TODO(future): make this configurable
