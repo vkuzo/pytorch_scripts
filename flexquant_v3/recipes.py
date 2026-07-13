@@ -205,7 +205,8 @@ def mxfp8_floor_swizzle_f(x):
 # ---------------------------------------------------------------------------
 # The recipe: deepseek fp8 1x128, reduced across M (128x1 blocks), transposed output.
 #
-# This is plain `deepseek_1x128_f` composed with `flex_cast_quant(_swap_input_axes=True)`:
+# This is plain `deepseek_1x128_f` composed with
+# `flex_cast_quant(_global_input_transform=SWAP_0_AND_1_AXES)`:
 # the framework swaps the input axes on load (transpose-first), so `f` sees the (K, M)
 # orientation and reduces the correct axis, yielding (K, M) qdata and (K, M//128) scale --
 # equivalent to v1 _deepseek_fp8_1_128_dim_m_reference (recipes.py:84-86). Because the

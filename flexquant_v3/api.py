@@ -17,6 +17,15 @@ class FlexCastQuantBackend(enum.Enum):
     # TODO(future): actual backend
 
 
+class GlobalInputTransform(enum.Enum):
+    # no transform 
+    NONE = "none"
+    # swap the axes before doing quantization
+    SWAP_0_AND_1_AXES = "swap_0_and_1_axes"
+    # both none and swap_0_and_1_axes
+    BOTH_NONE_AND_SWAP_0_AND_1_AXES = "both_none_and_swap_0_and_1_axes"
+
+
 def flex_cast_quant(
     input: torch.Tensor,
     f: Callable,  # tile-invariant fn: input -> (out, *aux_out)
@@ -24,7 +33,7 @@ def flex_cast_quant(
     # these are needed for production quant, but final design TBD
     # TODO(future): we also need a way for a single fused kernel to write
     # out dim0 and dim1 quant at the same time
-    _swap_input_axes: bool = False,
+    _global_input_transform: GlobalInputTransform = GlobalInputTransform.NONE,
     # input padding
     _pad_input_to_multiple_of: Tuple[int, int] | None = None,
     # restrictions on tiling
@@ -48,7 +57,11 @@ def flex_cast_quant(
 
     assert len(input.shape) == 2, "only input of rank 2 is supported"
 
-    if _swap_input_axes:
+    assert (
+        _global_input_transform is not GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES
+    ), "GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES is not yet implemented"
+
+    if _global_input_transform is GlobalInputTransform.SWAP_0_AND_1_AXES:
         input = input.t().contiguous()
 
     if _backend is FlexCastQuantBackend.REFERENCE:
