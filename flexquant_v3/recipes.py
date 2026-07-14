@@ -28,8 +28,8 @@ class Recipe:
 
     quant: Callable
     dequant: Callable
-    _tile_multiple_of: Tuple[int, int] | None = None
-    _inner_tile_multiple_of: Tuple[int, int] | None = None
+    tile_multiple_of: Tuple[int, int] | None = None
+    full_tile_multiple_of: Tuple[int, int] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +207,7 @@ def mxfp8_floor_swizzle_f(x, **kwargs):
 # The recipe: deepseek fp8 1x128, reduced across M (128x1 blocks), transposed output.
 #
 # This is plain `deepseek_1x128_f` composed with
-# `flex_cast_quant(_global_input_transform=SWAP_0_AND_1_AXES)`:
+# `flex_cast_quant(global_input_transform=SWAP_0_AND_1_AXES)`:
 # the framework swaps the input axes on load (transpose-first), so `f` sees the (K, M)
 # orientation and reduces the correct axis, yielding (K, M) qdata and (K, M//128) scale --
 # equivalent to v1 _deepseek_fp8_1_128_dim_m_reference (recipes.py:84-86). Because the
@@ -414,12 +414,12 @@ def mxfp8_bias_f(x, bias, **kwargs):
 DEEPSEEK_1X128 = Recipe(
     quant=deepseek_1x128_f,
     dequant=deepseek_1x128_dq_f,
-    _tile_multiple_of=(1, 128),
+    tile_multiple_of=(1, 128),
 )
 DEEPSEEK_128X128 = Recipe(
     quant=deepseek_128x128_f, 
     dequant=deepseek_128x128_dq_f,
-    _tile_multiple_of=(128, 128),
+    tile_multiple_of=(128, 128),
 )
 # dim-M reuses deepseek_1x128_f entirely: the (K, M) orientation comes from swap_axes
 # below, and dequant is the plain 1x128 dequant (in (K, M) space). The test transposes
@@ -427,18 +427,18 @@ DEEPSEEK_128X128 = Recipe(
 DEEPSEEK_1X128_DIM_M = Recipe(
     quant=deepseek_1x128_f, 
     dequant=deepseek_1x128_dq_f,
-    _tile_multiple_of=(1, 128),
+    tile_multiple_of=(1, 128),
 )
 MXFP8_FLOOR = Recipe(
     quant=mxfp8_floor_f, 
     dequant=mxfp8_floor_dq_f,
-    _tile_multiple_of=(1, 32),
+    tile_multiple_of=(1, 32),
 )
 MXFP8_FLOOR_SWIZZLE = Recipe(
     quant=mxfp8_floor_swizzle_f, 
     dequant=mxfp8_floor_swizzle_dq_f,
-    _tile_multiple_of=(1, 32),
-    _inner_tile_multiple_of=(128, 128),  # 128x128 to enforce that each scale swizzle does not cross tile boundaries
+    tile_multiple_of=(1, 32),
+    full_tile_multiple_of=(128, 128),  # 128x128 to enforce that each scale swizzle does not cross tile boundaries
 )
 
 
@@ -455,8 +455,8 @@ FLOAT8_TENSORWISE = Recipe(
 NVFP4_GS_SWIZZLE = Recipe(
     quant=nvfp4_gs_swizzle_f,
     dequant=nvfp4_gs_swizzle_dq_f,
-    _tile_multiple_of=(1, 16),
-    _inner_tile_multiple_of=(128, 64),  # 128x64 to enforce that each scale swizzle does not cross tile boundaries
+    tile_multiple_of=(1, 16),
+    full_tile_multiple_of=(128, 64),  # 128x64 to enforce that each scale swizzle does not cross tile boundaries
 )
 
 
@@ -466,8 +466,8 @@ NVFP4_GS_SWIZZLE = Recipe(
 NVFP4_BLOCKED_OUTER = Recipe(
     quant=nvfp4_blocked_outer_f,
     dequant=nvfp4_blocked_outer_dq_f,
-    _tile_multiple_of=(1, 16),
-    _inner_tile_multiple_of=(128, 64),
+    tile_multiple_of=(1, 16),
+    full_tile_multiple_of=(128, 64),
 )
 
 
@@ -476,7 +476,7 @@ NVFP4_BLOCKED_OUTER = Recipe(
 MXFP8_BIAS = Recipe(
     quant=mxfp8_bias_f,
     dequant=mxfp8_floor_dq_f,
-    _tile_multiple_of=(1, 32),
+    tile_multiple_of=(1, 32),
 )
 
 
