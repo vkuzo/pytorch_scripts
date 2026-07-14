@@ -69,7 +69,7 @@ def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
     TILE slices the matching sub-region (the aux's leading two dims map to the input (M, N) grid
     at a per-dim ratio inferred from the shapes). ROW/COL are not implemented yet.
 
-    TODO(future): TILE + _global_input_transform=SWAP_0_AND_1_AXES needs the aux transposed on
+    TODO(future): TILE + global_input_transform=SWAP_0_AND_1_AXES needs the aux transposed on
     load / row<->col swap (cf. flex_gemm _SWAPPED_ARG_KIND); not handled yet.
     """
     if kind is AuxKind.REPLICATE:
@@ -101,12 +101,12 @@ def flex_cast_quant(
     # these are needed for production quant, but final design TBD
     # TODO(future): we also need a way for a single fused kernel to write
     # out dim0 and dim1 quant at the same time
-    _global_input_transform: GlobalInputTransform = GlobalInputTransform.NONE,
+    global_input_transform: GlobalInputTransform = GlobalInputTransform.NONE,
     # input padding
-    _pad_input_to_multiple_of: Tuple[int, int] | None = None,
+    pad_input_to_multiple_of: Tuple[int, int] | None = None,
     # restrictions on tiling
-    _tile_multiple_of: Tuple[int, int] | None = None,
-    _inner_tile_multiple_of: Tuple[int, int] | None = None,
+    tile_multiple_of: Tuple[int, int] | None = None,
+    full_tile_multiple_of: Tuple[int, int] | None = None,
     # kwargs below are only for debugging
     _backend: FlexCastQuantBackend = FlexCastQuantBackend.REFERENCE,
 ) -> tuple[torch.Tensor, ...]:
@@ -133,27 +133,27 @@ def flex_cast_quant(
     assert len(input.shape) == 2, "only input of rank 2 is supported"
 
     assert (
-        _global_input_transform is not GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES
+        global_input_transform is not GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES
     ), "GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES is not yet implemented"
 
     aux_kinds = _resolve_aux_kinds(aux_inputs, aux_kinds)
 
-    if _global_input_transform is GlobalInputTransform.SWAP_0_AND_1_AXES:
+    if global_input_transform is GlobalInputTransform.SWAP_0_AND_1_AXES:
         input = input.t().contiguous()
 
     if _backend is FlexCastQuantBackend.REFERENCE:
 
         # pad input (before the constraint asserts, so they validate the padded shape)
-        if _pad_input_to_multiple_of is not None:
-            input = _pad_to_multiple(input, _pad_input_to_multiple_of)
+        if pad_input_to_multiple_of is not None:
+            input = _pad_to_multiple(input, pad_input_to_multiple_of)
 
         # verify that tile constraints are respected, if specified
-        if _tile_multiple_of is not None:
+        if tile_multiple_of is not None:
             M, K = input.shape
-            assert M % _tile_multiple_of[0] == 0
-            assert K % _tile_multiple_of[1] == 0
+            assert M % tile_multiple_of[0] == 0
+            assert K % tile_multiple_of[1] == 0
 
-        # _inner_tile_multiple_of is satisfied automatically as there is only
+        # full_tile_multiple_of is satisfied automatically as there is only
         # one tile
 
         # one tile == whole tensor, so every aux is presented whole (REPLICATE) and the tile
@@ -166,9 +166,9 @@ def flex_cast_quant(
             f,
             aux_inputs,
             aux_kinds,
-            _pad_input_to_multiple_of,
-            _tile_multiple_of,
-            _inner_tile_multiple_of,
+            pad_input_to_multiple_of,
+            tile_multiple_of,
+            full_tile_multiple_of,
         )
 
     else:
@@ -182,9 +182,9 @@ def _manual_tile(
     f: Callable,
     aux_inputs: Tuple[torch.Tensor, ...] = (),
     aux_kinds: Tuple[AuxKind, ...] = (),
-    _pad_input_to_multiple_of: Tuple[int, int] | None = None,
-    _tile_multiple_of: Tuple[int, int] | None = None,
-    _inner_tile_multiple_of: Tuple[int, int] | None = None,
+    pad_input_to_multiple_of: Tuple[int, int] | None = None,
+    tile_multiple_of: Tuple[int, int] | None = None,
+    full_tile_multiple_of: Tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Tile `input` into 256x256 tiles, run `f` on each, and recompose (debug backend).
     """
@@ -192,22 +192,22 @@ def _manual_tile(
 
     # pad input first, so the whole pipeline (constraint asserts, fake-probe output shapes,
     # preallocation, tiling offsets) all key off the padded shape.
-    if _pad_input_to_multiple_of is not None:
-        input = _pad_to_multiple(input, _pad_input_to_multiple_of)
+    if pad_input_to_multiple_of is not None:
+        input = _pad_to_multiple(input, pad_input_to_multiple_of)
 
     # choose tile size if not specified
     # TODO(future): make this configurable
     tile_size_0, tile_size_1 = 256, 256
 
     # verify tiling constraints are honored
-    if _tile_multiple_of is not None:
-        assert tile_size_0 % _tile_multiple_of[0] == 0
-        assert tile_size_1 % _tile_multiple_of[1] == 0
-        assert input.shape[0] % _tile_multiple_of[0] == 0
-        assert input.shape[1] % _tile_multiple_of[1] == 0
-    if _inner_tile_multiple_of is not None:
-        assert tile_size_0 % _inner_tile_multiple_of[0] == 0
-        assert tile_size_1 % _inner_tile_multiple_of[1] == 0
+    if tile_multiple_of is not None:
+        assert tile_size_0 % tile_multiple_of[0] == 0
+        assert tile_size_1 % tile_multiple_of[1] == 0
+        assert input.shape[0] % tile_multiple_of[0] == 0
+        assert input.shape[1] % tile_multiple_of[1] == 0
+    if full_tile_multiple_of is not None:
+        assert tile_size_0 % full_tile_multiple_of[0] == 0
+        assert tile_size_1 % full_tile_multiple_of[1] == 0
 
     # Preallocate-then-scatter: infer each output's global shape/dtype by running `f` on a
     # FakeTensor of the full input, preallocate the outputs, then write each tile's local

@@ -44,10 +44,10 @@ def flex_cast_quant(
     *,
     aux_inputs: Tuple[torch.Tensor, ...] = (),
     aux_kinds: Tuple[AuxKind, ...] | None = None,              # per-aux broadcast kind (None => REPLICATE)
-    _global_input_transform: GlobalInputTransform = GlobalInputTransform.NONE,  # e.g. transpose on load
-    _pad_input_to_multiple_of: Tuple[int, int] | None = None,  # zero-pad ragged dims up on load
-    _tile_multiple_of: Tuple[int, int] | None = None,          # tile-size divisibility constraint
-    _inner_tile_multiple_of: Tuple[int, int] | None = None,    # swizzle-atom constraint
+    global_input_transform: GlobalInputTransform = GlobalInputTransform.NONE,  # e.g. transpose on load
+    pad_input_to_multiple_of: Tuple[int, int] | None = None,  # zero-pad ragged dims up on load
+    tile_multiple_of: Tuple[int, int] | None = None,          # tile-size divisibility constraint
+    full_tile_multiple_of: Tuple[int, int] | None = None,    # swizzle-atom constraint
     _backend: FlexCastQuantBackend = FlexCastQuantBackend.REFERENCE,
 ) -> tuple[torch.Tensor, ...]:                               # (out, *aux) from `f`
     ...
@@ -62,19 +62,19 @@ block-broadcasts it — divisor 1 = a per-element bias, divisor 128 = a 128x128-
 tiles must align to the aux block). `ROW`/`COL` are defined but not yet implemented.
 `aux_kinds=None` defaults every aux to `REPLICATE`.
 
-`_global_input_transform` selects a global, pre-tiling load transform (a `GlobalInputTransform`
+`global_input_transform` selects a global, pre-tiling load transform (a `GlobalInputTransform`
 enum): `NONE` (default) or `SWAP_0_AND_1_AXES` (transpose the input on load, for dim-M recipes).
 `BOTH_NONE_AND_SWAP_0_AND_1_AXES` is reserved for writing both dim0 and dim1 casts from one kernel
 and is not yet implemented.
 
 It applies `f` to `input` under the chosen backend and returns whatever tuple `f`
 produced. The `_`-prefixed args are for debugging/reference (backend selection, dim-M axis
-swap via `_global_input_transform`, input padding, tiling constraints) and default to the
+swap via `global_input_transform`, input padding, tiling constraints) and default to the
 plain reference path.
 
 ## Example recipes (see `recipes.py`)
 
-- **deepseek fp8** — 1x128, 128x128, and 1x128 dim-M (via `_global_input_transform=SWAP_0_AND_1_AXES`).
+- **deepseek fp8** — 1x128, 128x128, and 1x128 dim-M (via `global_input_transform=SWAP_0_AND_1_AXES`).
 - **mxfp8 FLOOR** — 1x32 blocks, e8m0 power-of-two scale; plain and swizzled (NVIDIA
   32x4x4 blocked scale layout). The swizzled scale is emitted as a 4D block grid
   `(n_row_blocks, n_col_blocks, 32, 16)` (see below).
@@ -123,7 +123,7 @@ via `**kwargs`.
 - **`MANUAL_TILE`** — splits the input into 256x256 tiles, runs `f` per tile, and scatters
   each tile's outputs into preallocated buffers. For a tile-invariant `f` it must match
   `REFERENCE` bit-for-bit; it's how we *check* tile-invariance.
-  `_global_input_transform=SWAP_0_AND_1_AXES` transposes the input on load (for dim-M recipes).
+  `global_input_transform=SWAP_0_AND_1_AXES` transposes the input on load (for dim-M recipes).
 
 Both are debug/reference backends. `TODO`: lower `f` to a non-reference backend.
 

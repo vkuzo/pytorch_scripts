@@ -39,7 +39,7 @@ pytestmark = pytest.mark.skipif(
 
 
 # (recipe_name, recipe, transform, scale shape+dtype, qdata_dtype, flat_compare, sqnr_min).
-# transform: the _global_input_transform enum. SWAP_0_AND_1_AXES (transpose-on-load) is how the
+# transform: the global_input_transform enum. SWAP_0_AND_1_AXES (transpose-on-load) is how the
 # dim-M recipe is expressed (plain deepseek_1x128_f on the swapped input) so `quant` sees the
 # (K, M) orientation. Because the swap happens BEFORE tiling, dim-M stays tile-invariant and
 # runs under MANUAL_TILE like the rest.
@@ -85,7 +85,7 @@ def test_float8_tensorwise_matches_reference():
         FLOAT8_TENSORWISE.quant,
         aux_inputs=(scale,),
         aux_kinds=(AuxKind.REPLICATE,),
-        _tile_multiple_of=FLOAT8_TENSORWISE._tile_multiple_of,
+        tile_multiple_of=FLOAT8_TENSORWISE.tile_multiple_of,
     )
     qdata_ref, scale_ref = float8_tensorwise_f(x, scale)
 
@@ -125,8 +125,8 @@ def test_nvfp4_gs_swizzle_matches_reference():
         NVFP4_GS_SWIZZLE.quant,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.REPLICATE,),
-        _tile_multiple_of=NVFP4_GS_SWIZZLE._tile_multiple_of,
-        _inner_tile_multiple_of=NVFP4_GS_SWIZZLE._inner_tile_multiple_of,
+        tile_multiple_of=NVFP4_GS_SWIZZLE.tile_multiple_of,
+        full_tile_multiple_of=NVFP4_GS_SWIZZLE.full_tile_multiple_of,
     )
     qdata_ref, scale_ref = nvfp4_gs_swizzle_f(x, outer)
 
@@ -149,8 +149,8 @@ def test_nvfp4_gs_swizzle_backends_match():
     kw = dict(
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.REPLICATE,),
-        _tile_multiple_of=NVFP4_GS_SWIZZLE._tile_multiple_of,
-        _inner_tile_multiple_of=NVFP4_GS_SWIZZLE._inner_tile_multiple_of,
+        tile_multiple_of=NVFP4_GS_SWIZZLE.tile_multiple_of,
+        full_tile_multiple_of=NVFP4_GS_SWIZZLE.full_tile_multiple_of,
     )
     qdata_ref, scale_ref = flex_cast_quant(
         x, NVFP4_GS_SWIZZLE.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw
@@ -176,8 +176,8 @@ def test_nvfp4_gs_swizzle_sqnr_vs_high_precision():
         NVFP4_GS_SWIZZLE.quant,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.REPLICATE,),
-        _tile_multiple_of=NVFP4_GS_SWIZZLE._tile_multiple_of,
-        _inner_tile_multiple_of=NVFP4_GS_SWIZZLE._inner_tile_multiple_of,
+        tile_multiple_of=NVFP4_GS_SWIZZLE.tile_multiple_of,
+        full_tile_multiple_of=NVFP4_GS_SWIZZLE.full_tile_multiple_of,
     )
     x_hat = NVFP4_GS_SWIZZLE.dequant(qdata, scale, outer)
     # nvfp4 is 4-bit, coarser than fp8/mxfp8, so a lower SQNR floor.
@@ -316,9 +316,9 @@ def test_matches_reference(recipe, transform, scale_shape, scale_dtype, qdata_dt
     qdata, scale = flex_cast_quant(
         x,
         recipe.quant,
-        _global_input_transform=transform,
-        _tile_multiple_of=recipe._tile_multiple_of,
-        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+        global_input_transform=transform,
+        tile_multiple_of=recipe.tile_multiple_of,
+        full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
     # reference applies the same axis swap before running `quant`.
     swap = transform is GlobalInputTransform.SWAP_0_AND_1_AXES
@@ -349,18 +349,18 @@ def test_backends_match(recipe, transform, flat_compare):
     qdata_ref, scale_ref = flex_cast_quant(
         x,
         recipe.quant,
-        _global_input_transform=transform,
+        global_input_transform=transform,
         _backend=FlexCastQuantBackend.REFERENCE,
-        _tile_multiple_of=recipe._tile_multiple_of,
-        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+        tile_multiple_of=recipe.tile_multiple_of,
+        full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
     qdata_tile, scale_tile = flex_cast_quant(
         x,
         recipe.quant,
-        _global_input_transform=transform,
+        global_input_transform=transform,
         _backend=FlexCastQuantBackend.MANUAL_TILE,
-        _tile_multiple_of=recipe._tile_multiple_of,
-        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+        tile_multiple_of=recipe.tile_multiple_of,
+        full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
 
     assert _qdata_equal(qdata_tile, qdata_ref)
@@ -383,9 +383,9 @@ def test_sqnr_vs_high_precision(recipe, transform, sqnr_min):
     qdata, scale = flex_cast_quant(
         x,
         recipe.quant,
-        _global_input_transform=transform,
-        _tile_multiple_of=recipe._tile_multiple_of,
-        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+        global_input_transform=transform,
+        tile_multiple_of=recipe.tile_multiple_of,
+        full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
     x_hat = recipe.dequant(qdata, scale)
     # a swap quantized the transposed (K, M) tensor, so transpose the dequant back to
@@ -396,7 +396,7 @@ def test_sqnr_vs_high_precision(recipe, transform, sqnr_min):
     assert sqnr > sqnr_min, f"{sqnr=} below {sqnr_min}"
 
 
-# input padding (`_pad_input_to_multiple_of`): a ragged input (e.g. LLM decode/prefill token
+# input padding (`pad_input_to_multiple_of`): a ragged input (e.g. LLM decode/prefill token
 # dim) is zero-padded up to a multiple so the tile-invariant recipe sees an aligned shape.
 # Outputs are returned at the PADDED shape (the swizzle scale grid is 128-row-atom-structured
 # and can't be sliced back to an arbitrary original M). Pad multiples are chosen to satisfy
@@ -412,9 +412,9 @@ def test_pad_ref_shapes_swizzle():
     qdata, scale = flex_cast_quant(
         x,
         MXFP8_FLOOR_SWIZZLE.quant,
-        _pad_input_to_multiple_of=(128, 128),
-        _tile_multiple_of=MXFP8_FLOOR_SWIZZLE._tile_multiple_of,
-        _inner_tile_multiple_of=MXFP8_FLOOR_SWIZZLE._inner_tile_multiple_of,
+        pad_input_to_multiple_of=(128, 128),
+        tile_multiple_of=MXFP8_FLOOR_SWIZZLE.tile_multiple_of,
+        full_tile_multiple_of=MXFP8_FLOOR_SWIZZLE.full_tile_multiple_of,
     )
     assert qdata.shape == (256, 384)
     assert scale.shape == (2, 3, 32, 16)
@@ -435,9 +435,9 @@ def test_pad_backends_match(recipe, pad_to):
     torch.manual_seed(0)
     x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
     kw = dict(
-        _pad_input_to_multiple_of=pad_to,
-        _tile_multiple_of=recipe._tile_multiple_of,
-        _inner_tile_multiple_of=recipe._inner_tile_multiple_of,
+        pad_input_to_multiple_of=pad_to,
+        tile_multiple_of=recipe.tile_multiple_of,
+        full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
     qdata_ref, scale_ref = flex_cast_quant(x, recipe.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
     qdata_tile, scale_tile = flex_cast_quant(x, recipe.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
@@ -453,8 +453,8 @@ def test_pad_matches_manual_pad():
     qdata, scale = flex_cast_quant(
         x,
         MXFP8_FLOOR.quant,
-        _pad_input_to_multiple_of=(1, 32),
-        _tile_multiple_of=MXFP8_FLOOR._tile_multiple_of,
+        pad_input_to_multiple_of=(1, 32),
+        tile_multiple_of=MXFP8_FLOOR.tile_multiple_of,
     )
     # manual pad: 200 stays (mult of 1), 300 -> 320 (mult of 32); high-edge zero pad.
     x_padded = F.pad(x, (0, _ceil_to(300, 32) - 300, 0, 0))
@@ -486,8 +486,8 @@ def test_nvfp4_blocked_outer_matches_reference():
         NVFP4_BLOCKED_OUTER.quant,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.TILE,),
-        _tile_multiple_of=NVFP4_BLOCKED_OUTER._tile_multiple_of,
-        _inner_tile_multiple_of=NVFP4_BLOCKED_OUTER._inner_tile_multiple_of,
+        tile_multiple_of=NVFP4_BLOCKED_OUTER.tile_multiple_of,
+        full_tile_multiple_of=NVFP4_BLOCKED_OUTER.full_tile_multiple_of,
     )
     qdata_ref, scale_ref = nvfp4_blocked_outer_f(x, outer)
 
@@ -507,8 +507,8 @@ def test_nvfp4_blocked_outer_backends_match():
     kw = dict(
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.TILE,),
-        _tile_multiple_of=NVFP4_BLOCKED_OUTER._tile_multiple_of,
-        _inner_tile_multiple_of=NVFP4_BLOCKED_OUTER._inner_tile_multiple_of,
+        tile_multiple_of=NVFP4_BLOCKED_OUTER.tile_multiple_of,
+        full_tile_multiple_of=NVFP4_BLOCKED_OUTER.full_tile_multiple_of,
     )
     qdata_ref, scale_ref = flex_cast_quant(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
     qdata_tile, scale_tile = flex_cast_quant(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
@@ -528,8 +528,8 @@ def test_nvfp4_blocked_outer_sqnr_vs_high_precision():
         NVFP4_BLOCKED_OUTER.quant,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.TILE,),
-        _tile_multiple_of=NVFP4_BLOCKED_OUTER._tile_multiple_of,
-        _inner_tile_multiple_of=NVFP4_BLOCKED_OUTER._inner_tile_multiple_of,
+        tile_multiple_of=NVFP4_BLOCKED_OUTER.tile_multiple_of,
+        full_tile_multiple_of=NVFP4_BLOCKED_OUTER.full_tile_multiple_of,
     )
     x_hat = NVFP4_BLOCKED_OUTER.dequant(qdata, scale, outer)
     assert _compute_error(x.float(), x_hat.float()) > 12.0
@@ -541,7 +541,7 @@ def test_mxfp8_bias_backends_match():
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    kw = dict(aux_inputs=(bias,), aux_kinds=(AuxKind.TILE,), _tile_multiple_of=MXFP8_BIAS._tile_multiple_of)
+    kw = dict(aux_inputs=(bias,), aux_kinds=(AuxKind.TILE,), tile_multiple_of=MXFP8_BIAS.tile_multiple_of)
     qdata_ref, scale_ref = flex_cast_quant(x, MXFP8_BIAS.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
     qdata_tile, scale_tile = flex_cast_quant(x, MXFP8_BIAS.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
 
