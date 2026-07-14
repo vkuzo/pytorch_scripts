@@ -240,12 +240,6 @@ def _manual_tile(
                     slice(r // div0, r // div0 + local.shape[0]),
                     slice(c // div1, c // div1 + local.shape[1]),
                 )  # trailing dims (e.g. 32,16) left fully selected
-                o = final_outs[i]
-                if o.dtype == torch.float4_e2m1fn_x2:
-                    # torch.cat/fill/copy aren't implemented for sub-byte float4; assign
-                    # through the uint8 view of both sides (1 byte/elem preserves the slice).
-                    o.view(torch.uint8)[dst] = local.view(torch.uint8)
-                else:
-                    o[dst] = local
+                final_outs[i][dst] = local
 
     return tuple(final_outs)
