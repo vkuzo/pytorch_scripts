@@ -206,14 +206,32 @@ def mxfp8_floor_swizzle_f(x, **kwargs):
 # ---------------------------------------------------------------------------
 # The recipe: deepseek fp8 1x128, reduced across M (128x1 blocks), transposed output.
 #
-# This is plain `deepseek_1x128_f` composed with
-# `flex_cast_quant(global_input_transform=SWAP_0_AND_1_AXES)`:
-# the framework swaps the input axes on load (transpose-first), so `f` sees the (K, M)
-# orientation and reduces the correct axis, yielding (K, M) qdata and (K, M//128) scale --
-# equivalent to v1 _deepseek_fp8_1_128_dim_m_reference (recipes.py:84-86). Because the
-# transpose happens BEFORE tiling (swap-on-load), the per-tile work stays tile-invariant,
-# so this now runs under MANUAL_TILE too -- no dedicated transposing `f` needed.
+# Orientation is expressed as `f` (within-tile transpose) + OutputKind.SWAP_TILE_INDEX (grid
+# transpose), since `full_transpose = grid_transpose o within_tile_transpose`. `f` reduces over
+# dim0 (128x1 row blocks) directly and writes its tile outputs transposed; the framework's
+# tile-index swap places each tile at grid [n,m]. Together they yield (K, M) qdata and
+# (K, M//128) scale -- equivalent to v1 _deepseek_fp8_1_128_dim_m_reference. Both parts are
+# tile-invariant (the per-tile reduce+transpose needs no global info; the grid swap is the
+# framework's job), so it runs bit-exactly under both REFERENCE and MANUAL_TILE. The caller
+# passes output_kinds=(SWAP_TILE_INDEX, SWAP_TILE_INDEX) for the (qdata, scale) outputs.
 # ---------------------------------------------------------------------------
+def deepseek_1x128_dim_m_f(x, **kwargs):
+    """dim-M deepseek: reduce over dim0 (128x1 blocks along rows), then write the tile's outputs
+    TRANSPOSED locally. Pair with OutputKind.SWAP_TILE_INDEX on both outputs so the framework
+    places each transposed tile at the swapped grid position -> the full (K, M) layout.
+
+    Inlined from deepseek_1x128_f but reducing the other axis: reshape rows into 128-blocks and
+    amax over dim1 (the 128 within-block dim), giving a (M//128, N) scale; transpose both outputs
+    to (N, M) / (N, M//128) so a tile computed at grid [m, n] carries (bn, bm)-shaped data.
+    """
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    M, N = x.shape
+    x_b = x.reshape(M // 128, 128, N)
+    amax = x_b.abs().amax(dim=1, keepdim=True).clamp(min=1e-12).to(torch.float32)
+    scale = (amax / fp8_max).to(torch.float32)  # forward scale, (M//128, 1, N)
+    qdata = (x_b.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn).reshape(M, N)
+    # write outputs transposed locally; the framework's SWAP_TILE_INDEX handles the grid swap.
+    return qdata.t().contiguous(), scale.squeeze(1).t().contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -421,13 +439,15 @@ DEEPSEEK_128X128 = Recipe(
     dequant=deepseek_128x128_dq_f,
     tile_multiple_of=(128, 128),
 )
-# dim-M reuses deepseek_1x128_f entirely: the (K, M) orientation comes from swap_axes
-# below, and dequant is the plain 1x128 dequant (in (K, M) space). The test transposes
-# the dequant result back to (M, N) when swap_axes is set.
+# dim-M: `f` transposes the tile + reduces last dim; caller pairs it with
+# output_kinds=SWAP_TILE_INDEX for the grid transpose. dequant is the plain 1x128 dequant (it
+# works in the (K, M) transposed frame); the test transposes the dequant result back to (M, N).
+# tile_multiple_of=(128, 1): after the within-tile transpose the reduced (last) dim is the tile's
+# original ROWS, so rows must be a 128-multiple.
 DEEPSEEK_1X128_DIM_M = Recipe(
-    quant=deepseek_1x128_f, 
+    quant=deepseek_1x128_dim_m_f,
     dequant=deepseek_1x128_dq_f,
-    tile_multiple_of=(1, 128),
+    tile_multiple_of=(128, 1),
 )
 MXFP8_FLOOR = Recipe(
     quant=mxfp8_floor_f, 
