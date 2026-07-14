@@ -336,8 +336,83 @@ def nvfp4_gs_swizzle_dq_f(q, inner_swizzled, outer_scale):
     return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer_scale).reshape(M, N)
 
 
+# ---------------------------------------------------------------------------
+# The recipe: nvfp4 with a 128x128-BLOCKED outer scale (instead of a global scalar).
+#
+# Same two-level nvfp4 as nvfp4_gs_swizzle_f, but the outer scale is one value per 128x128
+# block -- shape (M//128, N//128) -- computed outside and passed as an AuxKind.TILE aux. The
+# framework hands `f` the sub-block of the outer scale covering the current tile; `f`
+# block-broadcasts it to per-element (option-4 pattern: expand+reshape, no materialized (M,N)
+# scale). Because 128 is a multiple of the 16-element inner block, the outer is constant within
+# each 16-group, so one representative per 16-group aligns with the inner scale.
+# ---------------------------------------------------------------------------
+def nvfp4_blocked_outer_scale(x, blk=128):
+    """Per-128x128-block fp32 outer scale (block reduction; computed outside flex_cast_quant).
+    Returns shape (M//blk, N//blk)."""
+    Mb, Nb = x.shape[0] // blk, x.shape[1] // blk
+    block_amax = x.abs().to(torch.float32).reshape(Mb, blk, Nb, blk).amax(dim=(1, 3))
+    return block_amax / (F8E4M3_MAX * F4_E2M1_MAX)  # (Mb, Nb)
+
+
+def nvfp4_blocked_outer_f(x, outer_blocked):
+    """Tile-invariant `f`: nvfp4 cast with a 128x128-blocked outer scale (AuxKind.TILE).
+
+    Instead of expanding the outer scale to per-element, reshape `x` so the outer block grid is
+    explicit -- (Mb, rows_per_block, Nb, n16_per_block, 16) -- and let `outer_blocked` broadcast
+    against it via size-1 axes. Each outer element then maps directly to its block slice of the
+    input; the full (M, N) outer scale is never materialized.
+    """
+    M, N = x.shape
+    Mb, Nb = outer_blocked.shape
+    rpb, cpb = M // Mb, N // Nb          # rows / cols per outer block (e.g. 128, 128)
+    n16 = cpb // 16                      # inner 16-groups per outer block along N
+    # block-grid view: last dim is the 16-element inner block.
+    x_b = x.reshape(Mb, rpb, Nb, n16, 16)
+    outer_b = outer_blocked[:, None, :, None, None]     # (Mb, 1, Nb, 1, 1), broadcasts
+    local_amax = x_b.abs().amax(dim=-1, keepdim=True)   # (Mb, rpb, Nb, n16, 1)
+    inner = torch.clamp(
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_b,
+        min=E4M3_EPS, max=F8E4M3_MAX,
+    ).to(torch.float8_e4m3fn)
+    reciprocal = (1.0 / outer_b) / inner.to(torch.float32)
+    data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
+    qdata = pack_uint4(f32_to_f4_unpacked(data_scaled)).view(torch.float4_e2m1fn_x2).reshape(M, N // 2)
+    # inner scale back to (M, N//16) row-major, then swizzle.
+    inner_swizzled = _to_blocked_4d(inner.squeeze(-1).reshape(M, N // 16))
+    return qdata, inner_swizzled
+
+
+def nvfp4_blocked_outer_dq_f(q, inner_swizzled, outer_blocked):
+    """Dequant for nvfp4_blocked_outer_f. Reshapes onto the outer block grid so `outer_blocked`
+    broadcasts via size-1 axes (no materialized (M, N) outer scale), mirroring the quant."""
+    M, half = q.shape
+    N = half * 2
+    Mb, Nb = outer_blocked.shape
+    rpb, cpb = M // Mb, N // Nb
+    n16 = cpb // 16
+    unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, N)
+    inner = _from_blocked_4d(inner_swizzled, M, N // 16)
+    # block-grid view: (Mb, rpb, Nb, n16, 16); outer broadcasts on the block axes.
+    data = unpacked.reshape(Mb, rpb, Nb, n16, 16)
+    inner_b = inner.to(torch.float32).reshape(Mb, rpb, Nb, n16, 1)
+    outer_b = outer_blocked[:, None, :, None, None]
+    return (data * inner_b * outer_b).reshape(M, N)
+
+
+# ---------------------------------------------------------------------------
+# The recipe: mxfp8 FLOOR with an elementwise bias added before quant.
+#
+# `bias` is the same shape as the input -> AuxKind.TILE with divisor (1, 1): the framework
+# partitions it exactly like the input (one bias element per input element). `f` just adds it
+# and runs the existing mxfp8 cast; dequant is the plain mxfp8 dequant (the bias is folded in).
+# ---------------------------------------------------------------------------
+def mxfp8_bias_f(x, bias):
+    """Tile-invariant `f`: add an elementwise `bias` (AuxKind.TILE, per-element) then mxfp8."""
+    return mxfp8_floor_f(x + bias.to(x.dtype))
+
+
 DEEPSEEK_1X128 = Recipe(
-    quant=deepseek_1x128_f, 
+    quant=deepseek_1x128_f,
     dequant=deepseek_1x128_dq_f,
     _tile_multiple_of=(1, 128),
 )
@@ -382,6 +457,26 @@ NVFP4_GS_SWIZZLE = Recipe(
     dequant=nvfp4_gs_swizzle_dq_f,
     _tile_multiple_of=(1, 16),
     _inner_tile_multiple_of=(128, 64),  # 128x64 to enforce that each scale swizzle does not cross tile boundaries
+)
+
+
+# nvfp4 with a 128x128-blocked outer scale (computed via nvfp4_blocked_outer_scale) passed as an
+# AuxKind.TILE aux. Same swizzle-atom constraints as NVFP4_GS_SWIZZLE; the 128x128 outer block is
+# coarser than the (128, 64) atom so it adds no new alignment constraint at 128-aligned tiles.
+NVFP4_BLOCKED_OUTER = Recipe(
+    quant=nvfp4_blocked_outer_f,
+    dequant=nvfp4_blocked_outer_dq_f,
+    _tile_multiple_of=(1, 16),
+    _inner_tile_multiple_of=(128, 64),
+)
+
+
+# mxfp8 FLOOR with an elementwise bias (same shape as input) added before quant, passed as an
+# AuxKind.TILE aux with divisor (1, 1). Dequant is the plain mxfp8 dequant.
+MXFP8_BIAS = Recipe(
+    quant=mxfp8_bias_f,
+    dequant=mxfp8_floor_dq_f,
+    _tile_multiple_of=(1, 32),
 )
 
 

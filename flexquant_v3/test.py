@@ -15,13 +15,18 @@ from recipes import (
     DEEPSEEK_1X128_DIM_M,
     DEEPSEEK_128X128,
     FLOAT8_TENSORWISE,
+    MXFP8_BIAS,
     MXFP8_FLOOR,
     MXFP8_FLOOR_SWIZZLE,
+    NVFP4_BLOCKED_OUTER,
     NVFP4_GS_SWIZZLE,
     float8_tensorwise_f,
     float8_tensorwise_scale,
     hadamard_rht_f,
     hadamard_rht_matrix,
+    mxfp8_bias_f,
+    nvfp4_blocked_outer_f,
+    nvfp4_blocked_outer_scale,
     nvfp4_gs_scale,
     nvfp4_gs_swizzle_f,
     sr_bf16_f,
@@ -442,11 +447,91 @@ def test_pad_matches_manual_pad():
     assert torch.equal(scale, scale_ref)
 
 
-# aux inputs: only AuxKind.REPLICATE is implemented so far; other kinds must raise.
-@pytest.mark.parametrize("kind", [AuxKind.TILE, AuxKind.ROW, AuxKind.COL])
+# aux inputs: REPLICATE and TILE are implemented; ROW/COL must still raise.
+@pytest.mark.parametrize("kind", [AuxKind.ROW, AuxKind.COL])
 def test_aux_unimplemented_kind_raises(kind):
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
     scale = float8_tensorwise_scale(x)
     with pytest.raises(NotImplementedError):
         flex_cast_quant(x, FLOAT8_TENSORWISE.quant, aux_inputs=(scale,), aux_kinds=(kind,))
+
+
+# AuxKind.TILE: nvfp4 with a 128x128-blocked outer scale. The framework slices the outer scale
+# (2, 2) to the sub-block covering each tile; `f` block-broadcasts it. Divisor = 256//2 = 128.
+def test_nvfp4_blocked_outer_matches_reference():
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+
+    outer = nvfp4_blocked_outer_scale(x)  # (2, 2)
+    assert outer.shape == (2, 2)
+    qdata, scale = flex_cast_quant(
+        x,
+        NVFP4_BLOCKED_OUTER.quant,
+        aux_inputs=(outer,),
+        aux_kinds=(AuxKind.TILE,),
+        _tile_multiple_of=NVFP4_BLOCKED_OUTER._tile_multiple_of,
+        _inner_tile_multiple_of=NVFP4_BLOCKED_OUTER._inner_tile_multiple_of,
+    )
+    qdata_ref, scale_ref = nvfp4_blocked_outer_f(x, outer)
+
+    assert qdata.shape == (256, 128)
+    assert qdata.dtype == torch.float4_e2m1fn_x2
+    assert scale.shape == (2, 4, 32, 16)
+    assert _qdata_equal(qdata, qdata_ref)
+    assert torch.equal(scale, scale_ref)
+
+
+def test_nvfp4_blocked_outer_backends_match():
+    # the real proof TILE slicing + f's block-broadcast compose: REFERENCE == MANUAL_TILE.
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+
+    outer = nvfp4_blocked_outer_scale(x)
+    kw = dict(
+        aux_inputs=(outer,),
+        aux_kinds=(AuxKind.TILE,),
+        _tile_multiple_of=NVFP4_BLOCKED_OUTER._tile_multiple_of,
+        _inner_tile_multiple_of=NVFP4_BLOCKED_OUTER._inner_tile_multiple_of,
+    )
+    qdata_ref, scale_ref = flex_cast_quant(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    qdata_tile, scale_tile = flex_cast_quant(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+
+    assert _qdata_equal(qdata_tile, qdata_ref)
+    assert scale_tile.shape == scale_ref.shape
+    assert torch.equal(scale_tile, scale_ref)
+
+
+def test_nvfp4_blocked_outer_sqnr_vs_high_precision():
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+
+    outer = nvfp4_blocked_outer_scale(x)
+    qdata, scale = flex_cast_quant(
+        x,
+        NVFP4_BLOCKED_OUTER.quant,
+        aux_inputs=(outer,),
+        aux_kinds=(AuxKind.TILE,),
+        _tile_multiple_of=NVFP4_BLOCKED_OUTER._tile_multiple_of,
+        _inner_tile_multiple_of=NVFP4_BLOCKED_OUTER._inner_tile_multiple_of,
+    )
+    x_hat = NVFP4_BLOCKED_OUTER.dequant(qdata, scale, outer)
+    assert _compute_error(x.float(), x_hat.float()) > 12.0
+
+
+# AuxKind.TILE with divisor (1, 1): an elementwise bias (same shape as input) added before mxfp8.
+def test_mxfp8_bias_backends_match():
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+
+    kw = dict(aux_inputs=(bias,), aux_kinds=(AuxKind.TILE,), _tile_multiple_of=MXFP8_BIAS._tile_multiple_of)
+    qdata_ref, scale_ref = flex_cast_quant(x, MXFP8_BIAS.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    qdata_tile, scale_tile = flex_cast_quant(x, MXFP8_BIAS.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+
+    # matches a direct (whole-tensor) bias-add + quant, and REFERENCE == MANUAL_TILE.
+    qdata_direct, scale_direct = mxfp8_bias_f(x, bias)
+    assert _qdata_equal(qdata_ref, qdata_direct)
+    assert torch.equal(scale_ref, scale_direct)
+    assert _qdata_equal(qdata_tile, qdata_ref)
+    assert torch.equal(scale_tile, scale_ref)
