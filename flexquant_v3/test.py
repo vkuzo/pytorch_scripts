@@ -6,6 +6,7 @@ qdata (compared as fp32) and scale. Recipes live in recipes.py.
 
 import pytest
 import torch
+import torch.func._random as prng
 import torch.nn.functional as F
 
 from api import AuxKind, FlexCastQuantBackend, GlobalInputTransform, flex_cast_quant
@@ -21,9 +22,9 @@ from recipes import (
     float8_tensorwise_scale,
     hadamard_rht_f,
     hadamard_rht_matrix,
-    make_sr_bf16_f,
     nvfp4_gs_scale,
     nvfp4_gs_swizzle_f,
+    sr_bf16_f,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -230,19 +231,21 @@ def test_hadamard_rht_roundtrip_sqnr():
 
 # stochastic rounding fp32 -> bf16: non-quant, single-output `(out,)`, and by design NOT
 # tile-invariant (tile-local RNG offsets repeat across tiles, so tiling changes rounding).
+# The PRNG key is a tensor passed as a REPLICATE aux input (built via prng.key(seed)).
 def test_sr_bf16_matches_reference():
-    # determinism: same seed -> bit-exact; different seed -> differs.
+    # determinism: same key -> bit-exact; different key -> differs.
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.float32, device="cuda")
 
-    (out,) = flex_cast_quant(x, make_sr_bf16_f(0))
-    (out_ref,) = make_sr_bf16_f(0)(x)
+    key0 = prng.key(0, device="cuda")
+    (out,) = flex_cast_quant(x, sr_bf16_f, aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
+    (out_ref,) = sr_bf16_f(x, key0)
 
     assert out.shape == (512, 512)
     assert out.dtype == torch.bfloat16
     assert torch.equal(out, out_ref)
 
-    (out_other,) = make_sr_bf16_f(1)(x)
+    (out_other,) = sr_bf16_f(x, prng.key(1, device="cuda"))
     assert not torch.equal(out, out_other)
 
 
@@ -253,7 +256,8 @@ def test_sr_bf16_unbiased():
     v = 1.0 + 0.003
     x = torch.full((1024, 1024), v, dtype=torch.float32, device="cuda")
 
-    (out,) = flex_cast_quant(x, make_sr_bf16_f(0))
+    key0 = prng.key(0, device="cuda")
+    (out,) = flex_cast_quant(x, sr_bf16_f, aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
 
     lo = torch.tensor(v, dtype=torch.bfloat16).float().item()  # RTN neighbor (round down)
     hi = torch.tensor(v + 2**-7, dtype=torch.bfloat16).float().item()
@@ -269,8 +273,10 @@ def test_sr_bf16_tiling_changes_rounding():
     v = 1.0 + 0.003
     x = torch.full((512, 512), v, dtype=torch.float32, device="cuda")
 
-    (out_ref,) = flex_cast_quant(x, make_sr_bf16_f(0), _backend=FlexCastQuantBackend.REFERENCE)
-    (out_tile,) = flex_cast_quant(x, make_sr_bf16_f(0), _backend=FlexCastQuantBackend.MANUAL_TILE)
+    key0 = prng.key(0, device="cuda")
+    kw = dict(aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
+    (out_ref,) = flex_cast_quant(x, sr_bf16_f, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    (out_tile,) = flex_cast_quant(x, sr_bf16_f, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
 
     assert not torch.equal(out_ref, out_tile)
     assert abs(out_ref.float().mean().item() - v) < 2e-3

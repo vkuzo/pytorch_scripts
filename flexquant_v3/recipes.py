@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Callable, Tuple
 
 import torch
+import torch.func._random as prng
 
 from utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uint4
 
@@ -445,31 +446,29 @@ def hadamard_rht_f(x, rht):
 # p_up = (x-lo)/(hi-lo). Adding a uniform 16-bit int to the fp32 bit pattern then
 # truncating carries into the kept bits with exactly that probability, so E[SR(x)] = x.
 # ---------------------------------------------------------------------------
-def make_sr_bf16_f(seed):
-    """Factory: `f` doing fp32 -> bf16 stochastic rounding, closing over `seed`.
+def sr_bf16_f(x, key):
+    """Tile-invariant `f` doing fp32 -> bf16 stochastic rounding.
 
-    Reseeds a torch.Generator from `seed` and draws one 16-bit dither per element in
-    row-major order -- a stand-in for a counter-based (Philox) RNG. Offsets are per-element
+    `key` is a torch.func._random (stateless counter-based Philox) PRNG key, passed as an
+    explicit aux input (AuxKind.REPLICATE: the same key is handed to every tile) rather than
+    built from a closed-over seed. One uniform is drawn per element. Offsets are per-element
     and TILE-LOCAL, so they repeat across tiles; tiling can therefore change the rounding
     (accepted for now). Returns a 1-tuple `(out,)` -- no scale/aux.
 
     TODO(future, must-have): key the RNG on the element's GLOBAL position in the parent tensor
-    (non-repeating offsets), to ensure the randomness is not correlated across tiles.
-    Note that the current implementation (below) is only for debugging and implementing
+    (non-repeating offsets) via prng.fold_in, to ensure the randomness is not correlated across
+    tiles. Note that the current implementation (below) is only for debugging and implementing
     this TODO is a must-have for numerically sound results.
     """
-
-    def f(x):
-        assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
-        gen = torch.Generator(device=x.device).manual_seed(seed)
-        rand16 = torch.randint(
-            0, 1 << 16, x.shape, generator=gen, dtype=torch.int32, device=x.device
-        )
-        # dither the 16 mantissa bits fp32->bf16 drops, then truncate them (mask off the
-        # low 16 bits). -65536 == 0xFFFF0000 as int32; .to(bfloat16) is exact since the
-        # low bits are already zero.
-        xi = x.contiguous().view(torch.int32) + rand16
-        xi = xi & -65536
-        return (xi.view(torch.float32).to(torch.bfloat16),)
-
-    return f
+    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
+    # uniform [0, 1) per element from the Philox key, scaled to a uniform 16-bit dither.
+    # TODO(future): expose random integer generation directly in PyTorch
+    # instead of having to do a multiply here
+    u = prng.uniform(key, tuple(x.shape))
+    rand16 = (u * (1 << 16)).to(torch.int32)  # uniform int in [0, 2**16)
+    # dither the 16 mantissa bits fp32->bf16 drops, then truncate them (mask off the
+    # low 16 bits). -65536 == 0xFFFF0000 as int32; .to(bfloat16) is exact since the
+    # low bits are already zero.
+    xi = x.contiguous().view(torch.int32) + rand16
+    xi = xi & -65536
+    return (xi.view(torch.float32).to(torch.bfloat16),)

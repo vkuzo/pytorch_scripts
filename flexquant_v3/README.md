@@ -27,10 +27,10 @@ def f(tile: torch.Tensor, *aux_inputs: torch.Tensor) -> tuple[torch.Tensor, ...]
 
 It takes the tile (or the whole input in the `REFERENCE` backend) followed by any auxiliary
 input tensors, and returns a tuple: the primary output first, then zero or more auxiliary
-outputs. Tensors computed outside the kernel (a global scale, an RHT matrix) are **lifted to
-explicit `aux_inputs`** rather than closed over, so the framework can present each one to every
-tile according to its `AuxKind` (see below). Non-tensor config (an RNG seed) can still be bound
-via a factory — e.g. `make_sr_bf16_f(seed)`.
+outputs. Tensors computed outside the kernel (a global scale, an RHT matrix, a PRNG key) are
+**lifted to explicit `aux_inputs`** rather than closed over, so the framework can present each
+one to every tile according to its `AuxKind` (see below). E.g. stochastic rounding takes a
+`torch.func._random` key (`prng.key(seed)`) as a REPLICATE aux input.
 
 Requirements on all outputs of `f`: must be at least 2d, and the first two dimensions
 must directly correspond to the two input dimensions.
