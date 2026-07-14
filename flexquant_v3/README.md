@@ -53,10 +53,13 @@ def flex_cast_quant(
     ...
 ```
 
-`aux_inputs` are tensors `f` needs beyond `input` (a global scale, an RHT matrix), passed
-positionally to `f` after `input`. `aux_kinds` tags each with an `AuxKind` saying how the
-framework presents it per tile: `REPLICATE` (hand the whole tensor to every tile — the only kind
-implemented so far), or `TILE`/`ROW`/`COL` (slice per tile — defined but not yet implemented).
+`aux_inputs` are tensors `f` needs beyond `input` (a global scale, an RHT matrix, a
+128x128-blocked scale, a per-element bias), passed positionally to `f` after `input`. `aux_kinds`
+tags each with an `AuxKind` saying how the framework presents it per tile: `REPLICATE` (hand the
+whole tensor to every tile), or `TILE` (the aux's leading two dims map to the input (M, N) grid at
+a ratio inferred from the shapes; the framework slices the matching sub-region per tile and `f`
+block-broadcasts it — divisor 1 = a per-element bias, divisor 128 = a 128x128-blocked scale;
+tiles must align to the aux block). `ROW`/`COL` are defined but not yet implemented.
 `aux_kinds=None` defaults every aux to `REPLICATE`.
 
 `_global_input_transform` selects a global, pre-tiling load transform (a `GlobalInputTransform`
@@ -92,7 +95,8 @@ statistically sound under tiling.
 
 ## Missing pieces
 
-* aux input broadcasting along rows, columns or tiles (currently only replicated)
+* aux input broadcasting along rows or columns (AuxKind.ROW/COL; REPLICATE and TILE are done)
+* AuxKind.TILE combined with GlobalInputTransform.SWAP_0_AND_1_AXES (row<->col swap of the aux)
 * GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES is not implemented yet
 * a real backend, for not we just have reference backends
 * proper testing (currently not many edge cases are tested)

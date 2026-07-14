@@ -11,8 +11,8 @@ class FlexCastQuantBackend(enum.Enum):
     # for debugging, just runs the callback on the entire tensor
     REFERENCE = "reference"
     # for debugging, manually tiles and runs the callback on each
-    # Note: only supports AuxKind.REPLICATE aux_inputs so far (handed whole to every tile);
-    # TILE/ROW/COL slicing is defined in AuxKind but not yet implemented.
+    # Note: supports AuxKind.REPLICATE (whole aux to every tile) and AuxKind.TILE (per-tile
+    # sub-region); ROW/COL are defined in AuxKind but not yet implemented.
     MANUAL_TILE = "manual_tile"
     # TODO(future): actual backend
 
@@ -31,12 +31,13 @@ class AuxKind(enum.Enum):
 
     Aux tensors are lifted out of `f`'s closure into explicit `aux_inputs` (cf. flex_gemm's
     epilogue arg kinds), and each carries a kind saying how the framework hands it to each tile.
-    Only REPLICATE is implemented so far; TILE/ROW/COL are defined but raise NotImplementedError.
+    REPLICATE and TILE are implemented; ROW/COL are defined but raise NotImplementedError.
     """
 
-    # whole tensor handed to every tile (e.g. a per-tensor scale). The only kind implemented.
+    # whole tensor handed to every tile (e.g. a per-tensor scale).
     REPLICATE = "replicate"
-    # leading dims match the input (M, N) grid; slice the matching sub-tile per tile.
+    # leading dims match the input (M, N) grid; slice the matching sub-tile per tile
+    # (e.g. a 128x128-blocked scale, or a same-shape bias). `f` block-broadcasts it.
     TILE = "tile"
     # (1, N): broadcast down the row (M) tiles.
     ROW = "row"
@@ -56,20 +57,38 @@ def _resolve_aux_kinds(
         f"aux_kinds ({len(aux_kinds)}) must match aux_inputs ({len(aux_inputs)})"
     )
     for kind in aux_kinds:
-        if kind is not AuxKind.REPLICATE:
+        if kind not in (AuxKind.REPLICATE, AuxKind.TILE):
             raise NotImplementedError(f"aux kind {kind} is not yet implemented")
     return aux_kinds
 
 
-def _aux_for_tile(aux, kind):
+def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
     """Present a single aux tensor to one tile according to its `kind`.
 
-    The single place per-tile aux slicing lives; today only REPLICATE (whole tensor to every
-    tile) is implemented. TILE/ROW/COL slicing will slot in here, and will need to account for
-    _global_input_transform=SWAP_0_AND_1_AXES (row<->col swap, cf. flex_gemm _SWAPPED_ARG_KIND).
+    The single place per-tile aux slicing lives. REPLICATE hands the whole aux to every tile;
+    TILE slices the matching sub-region (the aux's leading two dims map to the input (M, N) grid
+    at a per-dim ratio inferred from the shapes). ROW/COL are not implemented yet.
+
+    TODO(future): TILE + _global_input_transform=SWAP_0_AND_1_AXES needs the aux transposed on
+    load / row<->col swap (cf. flex_gemm _SWAPPED_ARG_KIND); not handled yet.
     """
     if kind is AuxKind.REPLICATE:
         return aux
+    if kind is AuxKind.TILE:
+        bm, bn = tile_shape
+        assert input_shape[0] % aux.shape[0] == 0 and input_shape[1] % aux.shape[1] == 0, (
+            f"TILE aux dims {tuple(aux.shape[:2])} must evenly divide input dims "
+            f"{tuple(input_shape)}"
+        )
+        # input-elements-per-aux-element per dim (e.g. 1 for a same-shape bias, 128 for a
+        # 128x128-blocked scale). The tile at input offset (r, c) reads the sub-region
+        # aux[r//div0 : (r+bm)//div0, ...]; `f` block-broadcasts it back over the data.
+        div0 = input_shape[0] // aux.shape[0]
+        div1 = input_shape[1] // aux.shape[1]
+        assert r % div0 == 0 and bm % div0 == 0 and c % div1 == 0 and bn % div1 == 0, (
+            f"tile ({r}:{r+bm}, {c}:{c+bn}) must align to TILE aux block ({div0}, {div1})"
+        )
+        return aux[r // div0 : (r + bm) // div0, c // div1 : (c + bn) // div1]
     raise NotImplementedError(f"aux kind {kind} is not yet implemented")
 
 
@@ -226,10 +245,11 @@ def _manual_tile(
     for r in t0_start:
         for c in t1_start:
             input_tile = input[r : r + tile_size_0, c : c + tile_size_1]
-            # present each aux to this tile per its kind (only REPLICATE implemented: the whole
-            # aux tensor is handed to every tile).
+            # present each aux to this tile per its kind: REPLICATE hands the whole tensor,
+            # TILE slices the matching sub-region (input_tile.shape gives ragged-correct extent).
             aux_tiles = [
-                _aux_for_tile(aux, kind) for aux, kind in zip(aux_inputs, aux_kinds)
+                _aux_for_tile(aux, kind, r, c, input_tile.shape, input.shape)
+                for aux, kind in zip(aux_inputs, aux_kinds)
             ]
             outs = f(input_tile, *aux_tiles)
 
