@@ -42,7 +42,7 @@ class Recipe:
 # (block size 128, eps 1e-12, fp8 e4m3 max 448.0) rather than shared as globals, since
 # other recipes with different constants will be added alongside this one.
 # ---------------------------------------------------------------------------
-def deepseek_1x128_f(x):
+def deepseek_1x128_f(x, **kwargs):  # kwargs: framework-supplied global_row/global_col/num_col (unused)
     fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
     *lead, last = x.shape
     x_b = x.reshape(*lead, last // 128, 128)
@@ -60,7 +60,7 @@ def deepseek_1x128_f(x):
 # gather each 128x128 tile into a contiguous group before reducing. Constants inlined
 # per recipe, as above.
 # ---------------------------------------------------------------------------
-def deepseek_128x128_f(x):
+def deepseek_128x128_f(x, **kwargs):
     fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
     *lead, d1, d2 = x.shape
     n1, n2 = d1 // 128, d2 // 128
@@ -93,7 +93,7 @@ def deepseek_128x128_f(x):
 # the biased exponent back into the fp32 exponent field. Constants (block 32, e8m0/fp32
 # exponent bias 127, 23 fp32 mantissa bits, e4m3 max pow2 8) inlined per recipe.
 # ---------------------------------------------------------------------------
-def mxfp8_floor_f(x):
+def mxfp8_floor_f(x, **kwargs):
     e8m0_exponent_bias = 127
     f32_exp_bias = 127
     mbits_f32 = 23
@@ -198,7 +198,7 @@ E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
 # tile with cat(dim=0). The final serialization to the flat `_scaled_mm` buffer (a global,
 # grid-shape-dependent step) is `.reshape(-1)`, done once outside `f` after reassembly.
 # ---------------------------------------------------------------------------
-def mxfp8_floor_swizzle_f(x):
+def mxfp8_floor_swizzle_f(x, **kwargs):
     qdata, scale_e8m0 = mxfp8_floor_f(x)
     return qdata, _to_blocked_4d(scale_e8m0)
 
@@ -234,7 +234,7 @@ def float8_tensorwise_scale(x):
     return (amax / fp8_max).to(torch.float32)  # scalar forward scale
 
 
-def float8_tensorwise_f(x, scale):
+def float8_tensorwise_f(x, scale, **kwargs):
     """Tile-invariant `f` taking the precomputed per-tensor `scale` as an explicit aux input
     (REPLICATE: the same scalar scale is used for every tile)."""
     qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
@@ -258,7 +258,7 @@ def nvfp4_gs_scale(x):
     return outer_amax / (F8E4M3_MAX * F4_E2M1_MAX)
 
 
-def nvfp4_gs_swizzle_f(x, outer_scale):
+def nvfp4_gs_swizzle_f(x, outer_scale, **kwargs):
     """Tile-invariant `f` taking the precomputed per-tensor `outer_scale` as an explicit aux
     input (REPLICATE: the same scalar outer scale is used for every tile)."""
     *lead, last = x.shape
@@ -354,7 +354,7 @@ def nvfp4_blocked_outer_scale(x, blk=128):
     return block_amax / (F8E4M3_MAX * F4_E2M1_MAX)  # (Mb, Nb)
 
 
-def nvfp4_blocked_outer_f(x, outer_blocked):
+def nvfp4_blocked_outer_f(x, outer_blocked, **kwargs):
     """Tile-invariant `f`: nvfp4 cast with a 128x128-blocked outer scale (AuxKind.TILE).
 
     Instead of expanding the outer scale to per-element, reshape `x` so the outer block grid is
@@ -406,7 +406,7 @@ def nvfp4_blocked_outer_dq_f(q, inner_swizzled, outer_blocked):
 # partitions it exactly like the input (one bias element per input element). `f` just adds it
 # and runs the existing mxfp8 cast; dequant is the plain mxfp8 dequant (the bias is folded in).
 # ---------------------------------------------------------------------------
-def mxfp8_bias_f(x, bias):
+def mxfp8_bias_f(x, bias, **kwargs):
     """Tile-invariant `f`: add an elementwise `bias` (AuxKind.TILE, per-element) then mxfp8."""
     return mxfp8_floor_f(x + bias.to(x.dtype))
 
@@ -519,7 +519,7 @@ def hadamard_rht_matrix(sign_vector, device, dtype):
     return torch.diag(sign_vector.to(device=device, dtype=dtype)) @ H
 
 
-def hadamard_rht_f(x, rht):
+def hadamard_rht_f(x, rht, **kwargs):
     """Tile-invariant `f` applying the 16x16 RHT along the last dim.
 
     `rht` is the RHT matrix (built via `hadamard_rht_matrix`), passed as an explicit aux input
@@ -541,19 +541,25 @@ def hadamard_rht_f(x, rht):
 # p_up = (x-lo)/(hi-lo). Adding a uniform 16-bit int to the fp32 bit pattern then
 # truncating carries into the kept bits with exactly that probability, so E[SR(x)] = x.
 # ---------------------------------------------------------------------------
-def sr_bf16_f(x, key):
-    """Tile-invariant `f` doing fp32 -> bf16 stochastic rounding.
+def _sr_bf16_dither(x, rand16):
+    """Apply a uniform 16-bit dither `rand16` to `x` (fp32) then truncate to bf16.
+
+    dither the 16 mantissa bits fp32->bf16 drops, then truncate them (mask off the low 16
+    bits). -65536 == 0xFFFF0000 as int32; .to(bfloat16) is exact since the low bits are zero.
+    """
+    xi = x.contiguous().view(torch.int32) + rand16
+    xi = xi & -65536
+    return xi.view(torch.float32).to(torch.bfloat16)
+
+
+def sr_bf16_f(x, key, **kwargs):
+    """`f` doing fp32 -> bf16 stochastic rounding, keyed on the TILE-LOCAL element layout.
 
     `key` is a torch.func._random (stateless counter-based Philox) PRNG key, passed as an
     explicit aux input (AuxKind.REPLICATE: the same key is handed to every tile) rather than
-    built from a closed-over seed. One uniform is drawn per element. Offsets are per-element
-    and TILE-LOCAL, so they repeat across tiles; tiling can therefore change the rounding
-    (accepted for now). Returns a 1-tuple `(out,)` -- no scale/aux.
-
-    TODO(future, must-have): key the RNG on the element's GLOBAL position in the parent tensor
-    (non-repeating offsets) via prng.fold_in, to ensure the randomness is not correlated across
-    tiles. Note that the current implementation (below) is only for debugging and implementing
-    this TODO is a must-have for numerically sound results.
+    built from a closed-over seed. One uniform is drawn per element in tile-local order, so
+    offsets repeat across tiles and tiling CHANGES the rounding -- NOT tile-invariant, kept as
+    the counterexample. `sr_bf16_global_f` is the tiling-invariant version. Returns `(out,)`.
     """
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
     # uniform [0, 1) per element from the Philox key, scaled to a uniform 16-bit dither.
@@ -561,9 +567,33 @@ def sr_bf16_f(x, key):
     # instead of having to do a multiply here
     u = prng.uniform(key, tuple(x.shape))
     rand16 = (u * (1 << 16)).to(torch.int32)  # uniform int in [0, 2**16)
-    # dither the 16 mantissa bits fp32->bf16 drops, then truncate them (mask off the
-    # low 16 bits). -65536 == 0xFFFF0000 as int32; .to(bfloat16) is exact since the
-    # low bits are already zero.
-    xi = x.contiguous().view(torch.int32) + rand16
-    xi = xi & -65536
-    return (xi.view(torch.float32).to(torch.bfloat16),)
+    return (_sr_bf16_dither(x, rand16),)
+
+
+def sr_bf16_global_f(x, key, **kwargs):
+    """Tiling-invariant fp32 -> bf16 stochastic rounding: keys the dither on each element's
+    GLOBAL position in the parent tensor, so the draws don't shift with tiling.
+
+    The framework supplies the tile's global origin and row stride via kwargs, read here as
+    `global_row`, `global_col`, `num_col`. Each element's global flat index is
+    `(global_row + i) * num_col + (global_col + j)`; we build a per-element Philox key
+    `[seed, global_index]` (vectorized, no host sync) and draw one uniform each. Because the
+    index is global, element (i, j) gets the same draw regardless of which tile it lands in, so
+    REFERENCE == MANUAL_TILE bit-for-bit. Returns `(out,)`.
+    """
+    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
+    global_row = kwargs["global_row"]
+    global_col = kwargs["global_col"]
+    num_col = kwargs["num_col"]
+    M, N = x.shape
+    # per-element global flat index (int64 arithmetic; uint64 mul is unsupported on cuda).
+    i = (global_row + torch.arange(M, device=x.device)).view(-1, 1)
+    j = (global_col + torch.arange(N, device=x.device)).view(1, -1)
+    gidx = (i * num_col + j).reshape(-1).to(torch.int64)
+    # per-element Philox key [seed, global_index]; seed = key[0:1] (a slice, not .item(), so this
+    # stays traceable / survives the FakeTensor shape-probe).
+    seed = key[0:1].to(torch.int64).expand(gidx.numel())
+    keys = torch.stack([seed, gidx], dim=-1).to(torch.uint64)
+    u = prng.uniform(keys, (gidx.numel(),)).reshape(M, N)
+    rand16 = (u * (1 << 16)).to(torch.int32)
+    return (_sr_bf16_dither(x, rand16),)

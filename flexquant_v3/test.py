@@ -30,6 +30,7 @@ from recipes import (
     nvfp4_gs_scale,
     nvfp4_gs_swizzle_f,
     sr_bf16_f,
+    sr_bf16_global_f,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -286,6 +287,21 @@ def test_sr_bf16_tiling_changes_rounding():
     assert not torch.equal(out_ref, out_tile)
     assert abs(out_ref.float().mean().item() - v) < 2e-3
     assert abs(out_tile.float().mean().item() - v) < 2e-3
+
+
+def test_sr_bf16_global_tiling_invariant():
+    # the tiling-invariant SR: keyed on GLOBAL element position, so REFERENCE == MANUAL_TILE
+    # bit-for-bit (contrast test_sr_bf16_tiling_changes_rounding, which uses the tile-local key).
+    v = 1.0 + 0.003
+    x = torch.full((512, 512), v, dtype=torch.float32, device="cuda")
+
+    key0 = prng.key(0, device="cuda")
+    kw = dict(aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
+    (out_ref,) = flex_cast_quant(x, sr_bf16_global_f, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    (out_tile,) = flex_cast_quant(x, sr_bf16_global_f, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+
+    assert torch.equal(out_ref, out_tile)  # global-position keying is tiling-invariant
+    assert abs(out_ref.float().mean().item() - v) < 2e-3  # still unbiased
 
 
 @pytest.mark.parametrize(

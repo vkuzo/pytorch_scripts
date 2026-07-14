@@ -113,13 +113,17 @@ def flex_cast_quant(
     """Single-kernel quantization API.
 
     `f` must be *tile-invariant*: the same pointwise/blockwise computation applied
-    independently to every tile of `input`. It has signature `(input, *aux_inputs) ->
-    (out, *aux_out)` -- one primary output plus zero or more auxiliary outputs (e.g. a scale;
-    a pure transform has none). Any tensors `f` needs beyond `input` (e.g. a per-tensor scale,
-    an RHT matrix) are passed explicitly via `aux_inputs` rather than captured in a closure, so
-    the framework can present each one per tile according to its `AuxKind`. Recipes needing
-    multiple kernels call this for one kernel and call something else for the rest. This API is
-    consumer-agnostic (no notion of weight/activation/KV/gradient) -- `f` owns all format
+    independently to every tile of `input`. It has signature `(input, *aux_inputs, global_row,
+    global_col, num_col) -> (out, *aux_out)` -- one primary output plus zero or more auxiliary
+    outputs (e.g. a scale; a pure transform has none). Any tensors `f` needs beyond `input`
+    (e.g. a per-tensor scale, an RHT matrix) are passed explicitly via `aux_inputs` rather than
+    captured in a closure, so the framework can present each one per tile according to its
+    `AuxKind`. The framework ALWAYS passes the tile's global position as keyword args --
+    `global_row`/`global_col` (the tile's origin in the full tensor) and `num_col` (the full row
+    stride) -- so a recipe can key per-element behavior on global position (e.g. tiling-invariant
+    stochastic rounding); recipes that don't need position absorb them with `**kwargs`. Recipes
+    needing multiple kernels call this for one kernel and call something else for the rest. This
+    API is consumer-agnostic (no notion of weight/activation/KV/gradient) -- `f` owns all format
     knowledge.
 
     TODO(future work): inspect `f` and lower to an efficient (Helion/Triton) kernel that
@@ -152,8 +156,9 @@ def flex_cast_quant(
         # _inner_tile_multiple_of is satisfied automatically as there is only
         # one tile
 
-        # one tile == whole tensor, so every aux is presented whole (REPLICATE).
-        outs = f(input, *aux_inputs)
+        # one tile == whole tensor, so every aux is presented whole (REPLICATE) and the tile
+        # origin is (0, 0). num_col is the (post-swap, post-pad) row stride.
+        outs = f(input, *aux_inputs, global_row=0, global_col=0, num_col=input.shape[1])
 
     elif _backend is FlexCastQuantBackend.MANUAL_TILE:
         outs = _manual_tile(
@@ -215,7 +220,8 @@ def _manual_tile(
     # whole-tensor, so aux is presented whole (REPLICATE) here regardless of kind.
     with FakeTensorMode(allow_non_fake_inputs=True):
         fake_in = torch.empty(input.shape, dtype=input.dtype, device=input.device)
-        fake_outs = f(fake_in, *aux_inputs)
+        # whole-shape probe: position doesn't affect output shape, use the origin.
+        fake_outs = f(fake_in, *aux_inputs, global_row=0, global_col=0, num_col=input.shape[1])
 
     # 2. preallocate the final outputs on the real device.
     final_outs = [
@@ -251,7 +257,10 @@ def _manual_tile(
                 _aux_for_tile(aux, kind, r, c, input_tile.shape, input.shape)
                 for aux, kind in zip(aux_inputs, aux_kinds)
             ]
-            outs = f(input_tile, *aux_tiles)
+            # pass the tile's global origin (r, c) and the full row stride, so a recipe can key
+            # per-element randomness on global position (tiling-invariant). num_col is the FULL
+            # (post-swap) width -- consecutive rows are num_col apart, not tile-width apart.
+            outs = f(input_tile, *aux_tiles, global_row=r, global_col=c, num_col=input.shape[1])
 
             for i, local in enumerate(outs):
                 div0, div1 = divisors[i]

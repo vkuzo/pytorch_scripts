@@ -86,12 +86,14 @@ plain reference path.
 
 ## Design questions to work through (in flux)
 
-1. to properly implement stochastic rounding, we need a per-element random number. This is
-usually created using a per-tensor seed + per-tile offset. We need to expose the per-tile offset
-(or equivalent information) to `f` to properly implement this inside of `f`. The current
-stochastic rounding example punts this to a TODO: it is unbiased (E[SR(x)] ~= x), but the
-tile-local offset repeats per tile, so draws are correlated across tiles -- not
-statistically sound under tiling.
+1. **(resolved)** to properly implement stochastic rounding, we need a per-element random number
+keyed on the element's GLOBAL position (so draws don't shift with tiling). The framework now
+ALWAYS passes each tile's global position to `f` as keyword args -- `global_row`, `global_col`
+(the tile's origin in the full tensor) and `num_col` (the full row stride) -- and `sr_bf16_global_f`
+uses them to build a per-element Philox key `[seed, (global_row+i)*num_col + (global_col+j)]`,
+making it tiling-invariant (REFERENCE == MANUAL_TILE bit-for-bit). The original `sr_bf16_f` is kept
+as the tile-local, NOT-invariant counterexample. Recipes that don't need position absorb the kwargs
+via `**kwargs`.
 
 ## Missing pieces
 
