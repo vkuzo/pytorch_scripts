@@ -9,7 +9,7 @@ import torch
 import torch.func._random as prng
 import torch.nn.functional as F
 
-from api import AuxKind, FlexCastQuantBackend, GlobalInputTransform, flex_cast_quant
+from api import AuxKind, FlexCastQuantBackend, OutputKind, flex_cast_quant
 from recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
@@ -20,6 +20,8 @@ from recipes import (
     MXFP8_FLOOR_SWIZZLE,
     NVFP4_BLOCKED_OUTER,
     NVFP4_GS_SWIZZLE,
+    deepseek_1x128_dim_m_f,
+    deepseek_1x128_dq_f,
     float8_tensorwise_f,
     float8_tensorwise_scale,
     hadamard_rht_f,
@@ -38,11 +40,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# (recipe_name, recipe, transform, scale shape+dtype, qdata_dtype, flat_compare, sqnr_min).
-# transform: the global_input_transform enum. SWAP_0_AND_1_AXES (transpose-on-load) is how the
-# dim-M recipe is expressed (plain deepseek_1x128_f on the swapped input) so `quant` sees the
-# (K, M) orientation. Because the swap happens BEFORE tiling, dim-M stays tile-invariant and
-# runs under MANUAL_TILE like the rest.
+# (recipe_name, recipe, scale shape+dtype, qdata_dtype, flat_compare, sqnr_min).
+# These recipes are all NORMAL orientation (no tile-index swap). The dim-M recipe, which uses
+# OutputKind.SWAP_TILE_INDEX, has its own dedicated tests (test_deepseek_dim_m_*).
 # qdata_dtype: fp4 packs two values per byte (float4_e2m1fn_x2) and is compared via its
 # uint8 view; everything else compares as fp32 (see _qdata_equal).
 # flat_compare: retained per recipe but now always False -- the swizzled scale is a 4D
@@ -51,11 +51,10 @@ pytestmark = pytest.mark.skipif(
 # sqnr_min: fp8 e4m3 recipes clear ~20 dB; the mxfp8 e8m0 pow2 scale is coarser (15 dB).
 # mxfp8_floor_swizzle scale: (256, 8) block scale -> nrb=2, ncb=2 -> (2, 2, 32, 16).
 RECIPES = [
-    ("deepseek_1x128", DEEPSEEK_1X128, GlobalInputTransform.NONE, (512, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
-    ("deepseek_128x128", DEEPSEEK_128X128, GlobalInputTransform.NONE, (512 // 128, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
-    ("deepseek_1x128_dim_m", DEEPSEEK_1X128_DIM_M, GlobalInputTransform.SWAP_0_AND_1_AXES, (512, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
-    ("mxfp8_floor", MXFP8_FLOOR, GlobalInputTransform.NONE, (512, 512 // 32), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
-    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE, GlobalInputTransform.NONE, (4, 4, 32, 16), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
+    ("deepseek_1x128", DEEPSEEK_1X128, (512, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
+    ("deepseek_128x128", DEEPSEEK_128X128, (512 // 128, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
+    ("mxfp8_floor", MXFP8_FLOOR, (512, 512 // 32), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
+    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE, (4, 4, 32, 16), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
 ]
 
 
@@ -305,25 +304,21 @@ def test_sr_bf16_global_tiling_invariant():
 
 
 @pytest.mark.parametrize(
-    "recipe, transform, scale_shape, scale_dtype, qdata_dtype",
-    [(r, transform, scale_shape, scale_dtype, qdata_dtype) for _, r, transform, scale_shape, scale_dtype, qdata_dtype, _, _ in RECIPES],
+    "recipe, scale_shape, scale_dtype, qdata_dtype",
+    [(r, scale_shape, scale_dtype, qdata_dtype) for _, r, scale_shape, scale_dtype, qdata_dtype, _, _ in RECIPES],
     ids=[name for name, *_ in RECIPES],
 )
-def test_matches_reference(recipe, transform, scale_shape, scale_dtype, qdata_dtype):
+def test_matches_reference(recipe, scale_shape, scale_dtype, qdata_dtype):
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     qdata, scale = flex_cast_quant(
         x,
         recipe.quant,
-        global_input_transform=transform,
         tile_multiple_of=recipe.tile_multiple_of,
         full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
-    # reference applies the same axis swap before running `quant`.
-    swap = transform is GlobalInputTransform.SWAP_0_AND_1_AXES
-    x_ref = x.t().contiguous() if swap else x
-    qdata_ref, scale_ref = recipe.quant(x_ref)
+    qdata_ref, scale_ref = recipe.quant(x)
 
     # shapes / dtypes
     assert qdata.dtype == qdata_dtype
@@ -336,11 +331,11 @@ def test_matches_reference(recipe, transform, scale_shape, scale_dtype, qdata_dt
 
 
 @pytest.mark.parametrize(
-    "recipe, transform, flat_compare",
-    [(r, transform, flat_compare) for _, r, transform, _, _, _, flat_compare, _ in RECIPES],
+    "recipe, flat_compare",
+    [(r, flat_compare) for _, r, _, _, _, flat_compare, _ in RECIPES],
     ids=[name for name, *_ in RECIPES],
 )
-def test_backends_match(recipe, transform, flat_compare):
+def test_backends_match(recipe, flat_compare):
     # every recipe is tile-invariant, so the MANUAL_TILE backend must match REFERENCE
     # exactly. 256 // 2 == 128 keeps the quadrant split on a 128x128 tile boundary.
     torch.manual_seed(0)
@@ -349,7 +344,6 @@ def test_backends_match(recipe, transform, flat_compare):
     qdata_ref, scale_ref = flex_cast_quant(
         x,
         recipe.quant,
-        global_input_transform=transform,
         _backend=FlexCastQuantBackend.REFERENCE,
         tile_multiple_of=recipe.tile_multiple_of,
         full_tile_multiple_of=recipe.full_tile_multiple_of,
@@ -357,7 +351,6 @@ def test_backends_match(recipe, transform, flat_compare):
     qdata_tile, scale_tile = flex_cast_quant(
         x,
         recipe.quant,
-        global_input_transform=transform,
         _backend=FlexCastQuantBackend.MANUAL_TILE,
         tile_multiple_of=recipe.tile_multiple_of,
         full_tile_multiple_of=recipe.full_tile_multiple_of,
@@ -371,11 +364,11 @@ def test_backends_match(recipe, transform, flat_compare):
 
 
 @pytest.mark.parametrize(
-    "recipe, transform, sqnr_min",
-    [(r, transform, sqnr_min) for _, r, transform, _, _, _, _, sqnr_min in RECIPES],
+    "recipe, sqnr_min",
+    [(r, sqnr_min) for _, r, _, _, _, _, sqnr_min in RECIPES],
     ids=[name for name, *_ in RECIPES],
 )
-def test_sqnr_vs_high_precision(recipe, transform, sqnr_min):
+def test_sqnr_vs_high_precision(recipe, sqnr_min):
     # dequantizing (qdata, scale) should recover the input with high SQNR.
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
@@ -383,17 +376,78 @@ def test_sqnr_vs_high_precision(recipe, transform, sqnr_min):
     qdata, scale = flex_cast_quant(
         x,
         recipe.quant,
-        global_input_transform=transform,
         tile_multiple_of=recipe.tile_multiple_of,
         full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
     x_hat = recipe.dequant(qdata, scale)
-    # a swap quantized the transposed (K, M) tensor, so transpose the dequant back to
-    # (M, N) to align with the original x.
-    if transform is GlobalInputTransform.SWAP_0_AND_1_AXES:
-        x_hat = x_hat.t()
     sqnr = _compute_error(x.float(), x_hat.float())
     assert sqnr > sqnr_min, f"{sqnr=} below {sqnr_min}"
+
+
+# dim-M deepseek: `f` transposes the tile + reduces last dim, and OutputKind.SWAP_TILE_INDEX
+# grid-transposes the placement. Together they reproduce deepseek_1x128_f(x.t()) -- the dim-M
+# layout that used to be expressed by the removed global_input_transform=SWAP_0_AND_1_AXES.
+_DIM_M_SWAP = (OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX)
+
+
+def test_deepseek_dim_m_matches_reference():
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+
+    qdata, scale = flex_cast_quant(
+        x,
+        DEEPSEEK_1X128_DIM_M.quant,
+        output_kinds=_DIM_M_SWAP,
+        tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of,
+    )
+    # reference: the old SWAP_0_AND_1_AXES layout == plain 1x128 on the transposed input.
+    qdata_ref, scale_ref = deepseek_1x128_dim_m_f(x)
+    assert qdata.shape == (512, 512)
+    assert scale.shape == (512, 512 // 128)
+    assert _qdata_equal(qdata, qdata_ref)
+    assert torch.equal(scale, scale_ref)
+
+
+def test_deepseek_dim_m_backends_match():
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+
+    kw = dict(output_kinds=_DIM_M_SWAP, tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of)
+    qr, sr = flex_cast_quant(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    qt, st = flex_cast_quant(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    assert _qdata_equal(qt, qr)
+    assert st.shape == sr.shape
+    assert torch.equal(st, sr)
+
+
+def test_deepseek_dim_m_non_square():
+    # non-square input exercises the grid-transpose (P != Q): a 384x512 input produces a
+    # (512, 384) qdata / (512, 3) scale swapped-grid output; REFERENCE == MANUAL_TILE bit-exact.
+    torch.manual_seed(0)
+    x = torch.randn(384, 512, dtype=torch.bfloat16, device="cuda")
+
+    kw = dict(output_kinds=_DIM_M_SWAP, tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of)
+    qr, sr = flex_cast_quant(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    qt, st = flex_cast_quant(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    assert qr.shape == (512, 384)  # grid-transposed
+    assert sr.shape == (512, 384 // 128)
+    assert _qdata_equal(qt, qr)
+    assert torch.equal(st, sr)
+
+
+def test_deepseek_dim_m_sqnr():
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+
+    qdata, scale = flex_cast_quant(
+        x,
+        DEEPSEEK_1X128_DIM_M.quant,
+        output_kinds=_DIM_M_SWAP,
+        tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of,
+    )
+    # dequant works in the (K, M) transposed frame; transpose back to compare with x.
+    x_hat = DEEPSEEK_1X128_DIM_M.dequant(qdata, scale).t()
+    assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 
 # input padding (`pad_input_to_multiple_of`): a ragged input (e.g. LLM decode/prefill token

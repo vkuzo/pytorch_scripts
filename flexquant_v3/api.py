@@ -17,13 +17,20 @@ class FlexCastQuantBackend(enum.Enum):
     # TODO(future): actual backend
 
 
-class GlobalInputTransform(enum.Enum):
-    # no transform
-    NONE = "none"
-    # swap the axes before doing quantization
-    SWAP_0_AND_1_AXES = "swap_0_and_1_axes"
-    # both none and swap_0_and_1_axes
-    BOTH_NONE_AND_SWAP_0_AND_1_AXES = "both_none_and_swap_0_and_1_axes"
+class OutputKind(enum.Enum):
+    """How the framework places one of `f`'s outputs into the final tensor when tiling.
+
+    NORMAL: a tile computed at grid position [m, n] writes to output grid position [m, n].
+    SWAP_TILE_INDEX: writes to output grid position [n, m] instead -- a grid transpose of the
+      tile-index only; the tile's CONTENTS are written as-is (NOT element-transposed). Element
+      orientation is `f`'s job (e.g. a dim-M recipe transposes its own tile then reduces the last
+      dim); combined with this flag, `f` + SWAP_TILE_INDEX reproduces a full transpose. The
+      output buffer is preallocated with the grid-transposed shape (the fake-probe of `f` on the
+      whole tensor already yields it, since `f` transposes within-tile).
+    """
+
+    NORMAL = "normal"
+    SWAP_TILE_INDEX = "swap_tile_index"
 
 
 class AuxKind(enum.Enum):
@@ -62,6 +69,19 @@ def _resolve_aux_kinds(
     return aux_kinds
 
 
+def _resolve_output_kinds(
+    num_outputs: int,
+    output_kinds: Tuple["OutputKind", ...] | None,
+) -> Tuple["OutputKind", ...]:
+    """Validate `output_kinds` against the number of outputs `f` returns, defaulting to NORMAL."""
+    if output_kinds is None:
+        output_kinds = (OutputKind.NORMAL,) * num_outputs
+    assert len(output_kinds) == num_outputs, (
+        f"output_kinds ({len(output_kinds)}) must match number of outputs ({num_outputs})"
+    )
+    return output_kinds
+
+
 def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
     """Present a single aux tensor to one tile according to its `kind`.
 
@@ -69,8 +89,8 @@ def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
     TILE slices the matching sub-region (the aux's leading two dims map to the input (M, N) grid
     at a per-dim ratio inferred from the shapes). ROW/COL are not implemented yet.
 
-    TODO(future): TILE + global_input_transform=SWAP_0_AND_1_AXES needs the aux transposed on
-    load / row<->col swap (cf. flex_gemm _SWAPPED_ARG_KIND); not handled yet.
+    TODO(future): a TILE aux combined with a SWAP_TILE_INDEX output would need the aux's
+    row<->col roles swapped too (cf. flex_gemm _SWAPPED_ARG_KIND); not handled yet.
     """
     if kind is AuxKind.REPLICATE:
         return aux
@@ -98,10 +118,9 @@ def flex_cast_quant(
     *,
     aux_inputs: Tuple[torch.Tensor, ...] = (),  # auxiliary inputs
     aux_kinds: Tuple[AuxKind, ...] | None = None,  # for each aux input, specify how to broadcast it
-    # these are needed for production quant, but final design TBD
-    # TODO(future): we also need a way for a single fused kernel to write
-    # out dim0 and dim1 quant at the same time
-    global_input_transform: GlobalInputTransform = GlobalInputTransform.NONE,
+    # for each output of `f`, how the framework places it into the final tensor when tiling
+    # (None => all NORMAL). SWAP_TILE_INDEX writes tile grid [m,n] to output grid [n,m].
+    output_kinds: Tuple[OutputKind, ...] | None = None,
     # input padding
     pad_input_to_multiple_of: Tuple[int, int] | None = None,
     # restrictions on tiling
@@ -132,14 +151,7 @@ def flex_cast_quant(
 
     assert len(input.shape) == 2, "only input of rank 2 is supported"
 
-    assert (
-        global_input_transform is not GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES
-    ), "GlobalInputTransform.BOTH_NONE_AND_SWAP_0_AND_1_AXES is not yet implemented"
-
     aux_kinds = _resolve_aux_kinds(aux_inputs, aux_kinds)
-
-    if global_input_transform is GlobalInputTransform.SWAP_0_AND_1_AXES:
-        input = input.t().contiguous()
 
     if _backend is FlexCastQuantBackend.REFERENCE:
 
@@ -166,6 +178,7 @@ def flex_cast_quant(
             f,
             aux_inputs,
             aux_kinds,
+            output_kinds,
             pad_input_to_multiple_of,
             tile_multiple_of,
             full_tile_multiple_of,
@@ -182,6 +195,7 @@ def _manual_tile(
     f: Callable,
     aux_inputs: Tuple[torch.Tensor, ...] = (),
     aux_kinds: Tuple[AuxKind, ...] = (),
+    output_kinds: Tuple[OutputKind, ...] | None = None,
     pad_input_to_multiple_of: Tuple[int, int] | None = None,
     tile_multiple_of: Tuple[int, int] | None = None,
     full_tile_multiple_of: Tuple[int, int] | None = None,
@@ -228,20 +242,27 @@ def _manual_tile(
         torch.empty(fo.shape, dtype=fo.dtype, device=input.device) for fo in fake_outs
     ]
 
+    output_kinds = _resolve_output_kinds(len(fake_outs), output_kinds)
+
     # 3. per-output (dim0, dim1) divisors: the input->output tiling ratio, constant across
     # tiles, so a tile at input offset (r, c) writes to output offset (r//div0, c//div1).
     # Only dims 0,1 are tiled; trailing dims (e.g. the swizzle grid's 32,16) are copied whole.
+    # For a SWAP_TILE_INDEX output the grid is transposed -- output dim0 corresponds to the
+    # INPUT's dim1 and vice versa -- so the divisor is taken against the swapped input dims.
     divisors = []
-    for fo in fake_outs:
+    for fo, okind in zip(fake_outs, output_kinds):
         # scalar/replicated outputs (e.g. tensorwise per-tensor scale) are not supported
         # under MANUAL_TILE: every output must be tiled along dims 0 and 1.
         assert fo.ndim >= 2, (
             f"MANUAL_TILE requires outputs tiled on dims 0,1, got shape {tuple(fo.shape)}"
         )
+        # input dim that maps to each output dim (swapped for SWAP_TILE_INDEX).
+        in_dims = (1, 0) if okind is OutputKind.SWAP_TILE_INDEX else (0, 1)
         d = []
-        for dim in range(2):
-            assert input.shape[dim] % fo.shape[dim] == 0
-            d.append(input.shape[dim] // fo.shape[dim])
+        for out_dim in range(2):
+            in_dim = in_dims[out_dim]
+            assert input.shape[in_dim] % fo.shape[out_dim] == 0
+            d.append(input.shape[in_dim] // fo.shape[out_dim])
         divisors.append(d)
 
     # 4. tile the input and scatter each tile's outputs into the preallocated buffers.
@@ -264,10 +285,13 @@ def _manual_tile(
 
             for i, local in enumerate(outs):
                 div0, div1 = divisors[i]
+                # tile-grid offset per output dim: NORMAL -> (r, c); SWAP_TILE_INDEX writes tile
+                # grid [m,n] to output grid [n,m], so the input row/col roles swap -> (c, r).
                 # extent = this tile's own output shape, so ragged last tiles work.
+                off0, off1 = (c, r) if output_kinds[i] is OutputKind.SWAP_TILE_INDEX else (r, c)
                 dst = (
-                    slice(r // div0, r // div0 + local.shape[0]),
-                    slice(c // div1, c // div1 + local.shape[1]),
+                    slice(off0 // div0, off0 // div0 + local.shape[0]),
+                    slice(off1 // div1, off1 // div1 + local.shape[1]),
                 )  # trailing dims (e.g. 32,16) left fully selected
                 final_outs[i][dst] = local
 
