@@ -235,6 +235,51 @@ def deepseek_1x128_dim_m_f(x, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# The recipes: rowwise / colwise fp8 (one scale per row / per column).
+#
+# The scale reduces over an ENTIRE row (rowwise) or column (colwise), so these are only
+# tile-invariant when the reduced dim is never severed by tiling: the caller must pass
+# tile_must_span_dim=DIM1 for rowwise (each tile spans all columns) or DIM0
+# for colwise (each tile spans all rows). Under the wrong tiling mode a tile would see only part
+# of the row/column and compute the wrong amax. No block constraint (the full row/col is the
+# reduction unit); spanning is enforced by tile_must_span_dim, not tile_multiple_of.
+#
+# colwise additionally transposes its outputs locally and is paired with
+# output_kinds=SWAP_TILE_INDEX (like the dim-M recipe) to emit the transposed (N, M) layout;
+# rowwise emits the native (M, N) layout (no swap).
+# ---------------------------------------------------------------------------
+def rowwise_fp8_f(x, **kwargs):
+    """Rowwise fp8: one fp32 scale per row (amax over all columns). Use tile_must_span_dim=DIM1."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    amax = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-12).to(torch.float32)  # (M, 1)
+    scale = (amax / fp8_max).to(torch.float32)
+    qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
+    return qdata, scale  # scale shape (M, 1)
+
+
+def rowwise_fp8_dq_f(q, scale):
+    return q.float() * scale  # scale (M, 1) broadcasts over columns
+
+
+def colwise_fp8_f(x, **kwargs):
+    """Colwise fp8: one fp32 scale per column (amax over all rows). Use tile_must_span_dim=DIM0.
+
+    Writes both outputs transposed locally (q -> (N, M), scale -> (N, 1)); pair with
+    output_kinds=SWAP_TILE_INDEX so the framework's grid swap yields the transposed (N, M) layout.
+    """
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    amax = x.abs().amax(dim=0, keepdim=True).clamp(min=1e-12).to(torch.float32)  # (1, N)
+    scale = (amax / fp8_max).to(torch.float32)
+    qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
+    return qdata.t().contiguous(), scale.t().contiguous()  # (N, M), (N, 1)
+
+
+def colwise_fp8_dq_f(q, scale):
+    # q is (N, M) transposed frame; scale (N, 1) broadcasts over q's columns (the original rows).
+    return q.float() * scale
+
+
+# ---------------------------------------------------------------------------
 # The recipe: float8 tensorwise (per-tensor) scaling.
 #
 # Unlike the block recipes, the scale is a single per-tensor value that needs a GLOBAL
@@ -449,6 +494,10 @@ DEEPSEEK_1X128_DIM_M = Recipe(
     dequant=deepseek_1x128_dq_f,
     tile_multiple_of=(128, 1),
 )
+# rowwise / colwise: no block constraint; the caller enforces spanning via tile_must_span_dim
+# (DIM1 for rowwise, DIM0 for colwise).
+ROWWISE_FP8 = Recipe(quant=rowwise_fp8_f, dequant=rowwise_fp8_dq_f)
+COLWISE_FP8 = Recipe(quant=colwise_fp8_f, dequant=colwise_fp8_dq_f)
 MXFP8_FLOOR = Recipe(
     quant=mxfp8_floor_f, 
     dequant=mxfp8_floor_dq_f,

@@ -9,7 +9,7 @@ import torch
 import torch.func._random as prng
 import torch.nn.functional as F
 
-from api import AuxKind, FlexCastQuantBackend, OutputKind, flex_cast_quant
+from api import AuxKind, FlexCastQuantBackend, OutputKind, TileMustSpanDim, flex_cast_quant
 from recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
@@ -18,8 +18,10 @@ from recipes import (
     MXFP8_BIAS,
     MXFP8_FLOOR,
     MXFP8_FLOOR_SWIZZLE,
+    COLWISE_FP8,
     NVFP4_BLOCKED_OUTER,
     NVFP4_GS_SWIZZLE,
+    ROWWISE_FP8,
     deepseek_1x128_dim_m_f,
     deepseek_1x128_dq_f,
     float8_tensorwise_f,
@@ -447,6 +449,60 @@ def test_deepseek_dim_m_sqnr():
     )
     # dequant works in the (K, M) transposed frame; transpose back to compare with x.
     x_hat = DEEPSEEK_1X128_DIM_M.dequant(qdata, scale).t()
+    assert _compute_error(x.float(), x_hat.float()) > 20.0
+
+
+# rowwise / colwise fp8: the scale reduces over a whole row/column, so tiling must span that dim
+# (tile_must_span_dim=DIM1 for rowwise, DIM0 for colwise). REFERENCE ==
+# MANUAL_TILE bit-exact proves the spanning tile keeps the full-dim reduction intact.
+def test_rowwise_fp8_backends_match():
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+
+    kw = dict(tile_must_span_dim=TileMustSpanDim.DIM1)
+    qr, sr = flex_cast_quant(x, ROWWISE_FP8.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    qt, st = flex_cast_quant(x, ROWWISE_FP8.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    assert sr.shape == (512, 1)
+    assert _qdata_equal(qt, qr)
+    assert torch.equal(st, sr)
+
+
+def test_rowwise_fp8_sqnr():
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+
+    qdata, scale = flex_cast_quant(x, ROWWISE_FP8.quant, tile_must_span_dim=TileMustSpanDim.DIM1)
+    x_hat = ROWWISE_FP8.dequant(qdata, scale)
+    assert _compute_error(x.float(), x_hat.float()) > 20.0
+
+
+# colwise transposes its outputs locally + SWAP_TILE_INDEX, so the emitted layout is the
+# transposed (N, M) qdata / (N, 1) scale. Use a non-square input so the transpose is observable.
+_COLWISE_SWAP = (OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX)
+
+
+def test_colwise_fp8_backends_match():
+    torch.manual_seed(0)
+    x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
+
+    kw = dict(tile_must_span_dim=TileMustSpanDim.DIM0, output_kinds=_COLWISE_SWAP)
+    qr, sr = flex_cast_quant(x, COLWISE_FP8.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    qt, st = flex_cast_quant(x, COLWISE_FP8.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    assert qr.shape == (384, 512)  # transposed (N, M)
+    assert sr.shape == (384, 1)  # transposed (N, 1)
+    assert _qdata_equal(qt, qr)
+    assert torch.equal(st, sr)
+
+
+def test_colwise_fp8_sqnr():
+    torch.manual_seed(0)
+    x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
+
+    qdata, scale = flex_cast_quant(
+        x, COLWISE_FP8.quant, tile_must_span_dim=TileMustSpanDim.DIM0, output_kinds=_COLWISE_SWAP
+    )
+    # outputs are in the transposed (N, M) frame; dequant then transpose back to compare with x.
+    x_hat = COLWISE_FP8.dequant(qdata, scale).t()
     assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 

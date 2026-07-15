@@ -46,6 +46,7 @@ def flex_cast_quant(
     aux_kinds: Tuple[AuxKind, ...] | None = None,              # per-aux broadcast kind (None => REPLICATE)
     output_kinds: Tuple[OutputKind, ...] | None = None,        # per-output placement (None => all NORMAL)
     pad_input_to_multiple_of: Tuple[int, int] | None = None,  # zero-pad ragged dims up on load
+    tile_must_span_dim: TileMustSpanDim = TileMustSpanDim.NONE,             # or DIM0/DIM1 (colwise/rowwise)
     tile_multiple_of: Tuple[int, int] | None = None,          # tile-size divisibility constraint
     full_tile_multiple_of: Tuple[int, int] | None = None,    # swizzle-atom constraint
     _backend: FlexCastQuantBackend = FlexCastQuantBackend.REFERENCE,
@@ -70,9 +71,14 @@ expressed: `f` does the within-tile transpose (e.g. dim-M recipes transpose thei
 the last dim) and the flag does the grid transpose, since `full_transpose = grid_transpose o
 within_tile_transpose`. `output_kinds=None` defaults every output to `NORMAL`.
 
+`tile_must_span_dim` (a `TileMustSpanDim`) controls which dim (if any) a tile must fully span:
+`NONE` (default, 2D tiles), `DIM0` (dim0 spans — for colwise reductions), or `DIM1` (dim1 spans
+— for rowwise reductions). A recipe whose reduction covers a whole dimension (rowwise/colwise) is
+only tile-invariant under the matching spanning mode, so no tile ever severs that reduction.
+
 It applies `f` to `input` under the chosen backend and returns whatever tuple `f`
 produced. The `_`-prefixed args are for debugging/reference; the rest (aux, output placement,
-input padding, tiling constraints) default to the plain reference path.
+input padding, tiling mode/constraints) default to the plain reference path.
 
 ## Example recipes (see `recipes.py`)
 
@@ -83,6 +89,8 @@ input padding, tiling constraints) default to the plain reference path.
 - **float8 tensorwise** — global per-tensor scale computed outside, passed as a REPLICATE aux input.
 - **nvfp4 with global scale** — two-level (per-tensor fp32 outer + per-16 e4m3 inner),
   fp4-packed, swizzled inner scale (same 4D block grid).
+- **rowwise / colwise fp8** — one scale per row (`tile_must_span_dim=DIM1`) or per column
+  (`DIM0`); the spanning tile keeps the full-dim reduction intact.
 - **randomized Hadamard (RHT)** — a non-quant transform (bf16 in, bf16 out, no scale).
 - **stochastic rounding fp32 -> bf16** — unbiased rounding; not tile-invariant by design.
 
@@ -108,8 +116,9 @@ via `**kwargs`.
 
 ## Out of scope
 
-* dynamic rowwise scaling (this needs 1d tiles to efficiently implement, not worth
-  the complexity to start).
+* an EFFICIENT rowwise/colwise backend. Rowwise/colwise are now expressible in the reference
+  backend via `tile_must_span_dim=DIM1/DIM0` (a tile spanning the reduced dim), but a real
+  kernel would want 1d tiles for efficiency -- not worth the complexity to start.
 
 ## Files
 
@@ -123,7 +132,7 @@ via `**kwargs`.
 ## Backends
 
 - **`REFERENCE`** — runs `f` on the whole tensor. The correctness oracle.
-- **`MANUAL_TILE`** — splits the input into 256x256 tiles, runs `f` per tile, and scatters
+- **`MANUAL_TILE`** — splits the input into 2D tiles, runs `f` per tile, and scatters
   each tile's outputs into preallocated buffers (per-output placement follows `output_kinds`).
   For a tile-invariant `f` it must match `REFERENCE` bit-for-bit; it's how we *check*
   tile-invariance.

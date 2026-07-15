@@ -33,6 +33,25 @@ class OutputKind(enum.Enum):
     SWAP_TILE_INDEX = "swap_tile_index"
 
 
+class TileMustSpanDim(enum.Enum):
+    """Which dim, if any, a tile must fully span.
+
+    Controls the tile size the MANUAL_TILE backend uses. A recipe whose reduction spans a whole
+    dimension (e.g. rowwise scaling reduces the entire row) is only tile-invariant if no tile ever
+    severs that dimension -- so the tile must span its full extent.
+
+    NONE: default 2D tiles (no dim must span).
+    DIM0: tiles span all of dim0 -- dim0 is not tiled (enables colwise: one scale per column,
+      reduced over all rows).
+    DIM1: tiles span all of dim1 -- dim1 is not tiled (enables rowwise: one scale per row,
+      reduced over all columns).
+    """
+
+    NONE = "none"
+    DIM0 = "dim0"
+    DIM1 = "dim1"
+
+
 class AuxKind(enum.Enum):
     """How a captured auxiliary input is presented to `f` per tile.
 
@@ -123,6 +142,9 @@ def flex_cast_quant(
     output_kinds: Tuple[OutputKind, ...] | None = None,
     # input padding
     pad_input_to_multiple_of: Tuple[int, int] | None = None,
+    # which dim (if any) a tile must fully span, for reductions over a whole dim
+    # (DIM1 -> rowwise, DIM0 -> colwise); NONE (default) uses 2D tiles
+    tile_must_span_dim: TileMustSpanDim = TileMustSpanDim.NONE,
     # restrictions on tiling
     tile_multiple_of: Tuple[int, int] | None = None,
     full_tile_multiple_of: Tuple[int, int] | None = None,
@@ -180,6 +202,7 @@ def flex_cast_quant(
             aux_kinds,
             output_kinds,
             pad_input_to_multiple_of,
+            tile_must_span_dim,
             tile_multiple_of,
             full_tile_multiple_of,
         )
@@ -197,10 +220,12 @@ def _manual_tile(
     aux_kinds: Tuple[AuxKind, ...] = (),
     output_kinds: Tuple[OutputKind, ...] | None = None,
     pad_input_to_multiple_of: Tuple[int, int] | None = None,
+    tile_must_span_dim: TileMustSpanDim = TileMustSpanDim.NONE,
     tile_multiple_of: Tuple[int, int] | None = None,
     full_tile_multiple_of: Tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Tile `input` into 256x256 tiles, run `f` on each, and recompose (debug backend).
+    """Tile `input`, run `f` on each tile, and recompose (debug backend). Uses 2D tiles by
+    default; `tile_must_span_dim` can make a dim span the tensor (for rowwise/colwise reductions).
     """
     assert input.ndim == 2, f"MANUAL_TILE expects a 2D input, got {input.ndim}D"
 
@@ -209,9 +234,11 @@ def _manual_tile(
     if pad_input_to_multiple_of is not None:
         input = _pad_to_multiple(input, pad_input_to_multiple_of)
 
-    # choose tile size if not specified
-    # TODO(future): make this configurable
-    tile_size_0, tile_size_1 = 256, 256
+    # choose tile size: 256 per dim, except a dim that must span the tensor uses the full
+    # (post-pad) extent, so `f`'s reduction over that whole dim is never severed by tiling.
+    # TODO(future): make the 256 configurable.
+    tile_size_0 = input.shape[0] if tile_must_span_dim is TileMustSpanDim.DIM0 else 256
+    tile_size_1 = input.shape[1] if tile_must_span_dim is TileMustSpanDim.DIM1 else 256
 
     # verify tiling constraints are honored
     if tile_multiple_of is not None:
