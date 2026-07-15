@@ -6,7 +6,7 @@ A single API for one-kernel, tile-invariant tensor casts (quantization and frien
 
 ```python
 # auxiliary inputs (a global scale, an RHT matrix) are passed explicitly, not closed over
-out, *aux = flex_cast_quant(input, f, aux_inputs=(outer_scale,), aux_kinds=(AuxKind.REPLICATE,))
+out, *aux = flex_quant_cast(input, f, aux_inputs=(outer_scale,), aux_kinds=(AuxKind.REPLICATE,))
 ```
 
 `f` is a **tile-invariant** function — the same per-tile computation applied independently
@@ -35,10 +35,10 @@ one to every tile according to its `AuxKind` (see below). E.g. stochastic roundi
 Requirements on all outputs of `f`: must be at least 2d, and the first two dimensions
 must directly correspond to the two input dimensions.
 
-`flex_cast_quant` has the signature:
+`flex_quant_cast` has the signature:
 
 ```python
-def flex_cast_quant(
+def flex_quant_cast(
     input: torch.Tensor,
     f: Callable,
     *,
@@ -49,7 +49,7 @@ def flex_cast_quant(
     tile_must_span_dim: TileMustSpanDim = TileMustSpanDim.NONE,             # or DIM0/DIM1 (colwise/rowwise)
     tile_multiple_of: Tuple[int, int] | None = None,          # tile-size divisibility constraint
     full_tile_multiple_of: Tuple[int, int] | None = None,    # swizzle-atom constraint
-    _backend: FlexCastQuantBackend = FlexCastQuantBackend.REFERENCE,
+    _backend: FlexQuantCastBackend = FlexQuantCastBackend.REFERENCE,
 ) -> tuple[torch.Tensor, ...]:                               # (out, *aux) from `f`
     ...
 ```
@@ -118,7 +118,7 @@ via `**kwargs`.
 
 | File | Contents |
 |------|----------|
-| `api.py` | `flex_cast_quant` + `FlexCastQuantBackend` (`REFERENCE`, `MANUAL_TILE`). |
+| `api.py` | `flex_quant_cast` + `FlexQuantCastBackend` (`REFERENCE`, `MANUAL_TILE`). |
 | `recipes.py` | The `Recipe(quant, dequant)` dataclass and all example `f` recipes. |
 | `utils.py` | Sub-byte fp4 (e2m1) conversion + 4-bit packing helpers. |
 | `test.py` | Numerical tests: reference-vs-backend, SQNR, and per-recipe properties. |

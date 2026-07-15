@@ -1,4 +1,4 @@
-"""Quant recipes for flex_cast_quant, bundled as `Recipe` dataclasses.
+"""Quant recipes for flex_quant_cast, bundled as `Recipe` dataclasses.
 
 Each recipe pairs a plain-PyTorch quant kernel `quant(x) -> (qdata, aux_out)` (v1
 `_reference_fn` style) with its `dequant(qdata, scale) -> fp32` inverse. The `RECIPES`
@@ -19,7 +19,7 @@ from utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uin
 class Recipe:
     """A single-kernel quant recipe: the quant kernel and its dequant.
 
-    `quant(x) -> (qdata, aux_out)` is the `f` passed to `flex_cast_quant`; it is always
+    `quant(x) -> (qdata, aux_out)` is the `f` passed to `flex_quant_cast`; it is always
     tile-invariant (the same computation applied independently to every tile) -- that is a
     precondition of the API, so it isn't a per-recipe field. `dequant(qdata, scale) -> fp32`
     inverts it (for SQNR checks). Single-kernel only for now: recipes that need a separate
@@ -35,7 +35,7 @@ class Recipe:
 # ---------------------------------------------------------------------------
 # The recipe: deepseek fp8 1x128, expressed as a tile-invariant `f`.
 #
-# Whole-tensor + block-aware form (v1 _reference_fn style). `flex_cast_quant` runs this
+# Whole-tensor + block-aware form (v1 _reference_fn style). `flex_quant_cast` runs this
 # as a passthrough today; the reshape->amax->scale->cast is the same computation applied
 # independently to every 1x128 group, i.e. tile-invariant. Math mirrors v1
 # _deepseek_fp8_1_128_reference (recipes.py:60-70). Constants are inlined per recipe
@@ -286,10 +286,10 @@ def colwise_fp8_dq_f(q, scale):
 # (M, 1) per-row scale is computed OUTSIDE and passed as an AuxKind.ROW aux input. `f` only does
 # the divide, which is tile-invariant under plain 2D tiling (each tile receives its rows' slice
 # of the scale, broadcast across its columns) -- so no tile_must_span_dim restriction is needed.
-# `rowwise_precalc_scale` is the global row-reduction that lives outside flex_cast_quant.
+# `rowwise_precalc_scale` is the global row-reduction that lives outside flex_quant_cast.
 # ---------------------------------------------------------------------------
 def rowwise_precalc_scale(x):
-    """Per-row fp32 scale (row reduction; computed outside flex_cast_quant). Returns (M, 1)."""
+    """Per-row fp32 scale (row reduction; computed outside flex_quant_cast). Returns (M, 1)."""
     fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
     amax = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-12).to(torch.float32)
     return (amax / fp8_max).to(torch.float32)  # (M, 1)
@@ -315,7 +315,7 @@ def rowwise_precalc_dq_f(q, scale):
 # transposed (N, M) layout. Tile-invariant under plain 2D tiling -- no tile_must_span_dim needed.
 # ---------------------------------------------------------------------------
 def colwise_precalc_scale(x):
-    """Per-column fp32 scale (col reduction; computed outside flex_cast_quant). Returns (1, N)."""
+    """Per-column fp32 scale (col reduction; computed outside flex_quant_cast). Returns (1, N)."""
     fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
     amax = x.abs().amax(dim=0, keepdim=True).clamp(min=1e-12).to(torch.float32)
     return (amax / fp8_max).to(torch.float32)  # (1, N)
@@ -338,14 +338,14 @@ def colwise_precalc_dq_f(q, scale):
 #
 # Unlike the block recipes, the scale is a single per-tensor value that needs a GLOBAL
 # reduction over the whole tensor -- that reduction is NOT tile-invariant, so it lives
-# OUTSIDE flex_cast_quant (`float8_tensorwise_scale`; the "call something else" kernel
+# OUTSIDE flex_quant_cast (`float8_tensorwise_scale`; the "call something else" kernel
 # from api.py's docstring). Given that precomputed scale, quantization is just dividing
 # every element by one fixed scalar -- identical across tiles, hence tile-invariant -- so
-# it runs INSIDE flex_cast_quant via an `f` that takes the scale as an explicit REPLICATE
+# it runs INSIDE flex_quant_cast via an `f` that takes the scale as an explicit REPLICATE
 # aux input (handed whole to every tile).
 # ---------------------------------------------------------------------------
 def float8_tensorwise_scale(x):
-    """Per-tensor scale (global reduction; computed outside flex_cast_quant)."""
+    """Per-tensor scale (global reduction; computed outside flex_quant_cast)."""
     fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
     amax = x.abs().amax().clamp(min=1e-12).to(torch.float32)
     return (amax / fp8_max).to(torch.float32)  # scalar forward scale
@@ -364,13 +364,13 @@ def float8_tensorwise_f(x, scale, **kwargs):
 # Two-level scaling like v1 nvfp4_with_gs (recipes.py:255-320): a per-tensor fp32 OUTER
 # scale plus a per-16-element e4m3 INNER scale, with fp4-packed qdata. The outer scale is
 # a GLOBAL amax reduction -- not tile-invariant -- so (like tensorwise) it is computed
-# OUTSIDE flex_cast_quant (`nvfp4_gs_scale`) and passed in as a REPLICATE aux input. The inner scale is
+# OUTSIDE flex_quant_cast (`nvfp4_gs_scale`) and passed in as a REPLICATE aux input. The inner scale is
 # additionally swizzled into the NVIDIA blocked layout and returned as the 4D block grid
 # `(n_row_blocks, n_col_blocks, 32, 16)`, so MANUAL_TILE's cat recomposition reproduces the
 # full-tensor swizzle under both row and column splits (cf. mxfp8 swizzle).
 # ---------------------------------------------------------------------------
 def nvfp4_gs_scale(x):
-    """Per-tensor fp32 outer scale (global reduction; computed outside flex_cast_quant)."""
+    """Per-tensor fp32 outer scale (global reduction; computed outside flex_quant_cast)."""
     outer_amax = x.abs().to(torch.float32).amax()
     return outer_amax / (F8E4M3_MAX * F4_E2M1_MAX)
 
@@ -464,7 +464,7 @@ def nvfp4_gs_swizzle_dq_f(q, inner_swizzled, outer_scale):
 # each 16-group, so one representative per 16-group aligns with the inner scale.
 # ---------------------------------------------------------------------------
 def nvfp4_blocked_outer_scale(x, blk=128):
-    """Per-128x128-block fp32 outer scale (block reduction; computed outside flex_cast_quant).
+    """Per-128x128-block fp32 outer scale (block reduction; computed outside flex_quant_cast).
     Returns shape (M//blk, N//blk)."""
     Mb, Nb = x.shape[0] // blk, x.shape[1] // blk
     block_amax = x.abs().to(torch.float32).reshape(Mb, blk, Nb, blk).amax(dim=(1, 3))
@@ -572,7 +572,7 @@ MXFP8_FLOOR_SWIZZLE = Recipe(
 
 
 # Tensorwise recipe: the per-tensor scale is computed outside (via float8_tensorwise_scale)
-# and passed to flex_cast_quant as an explicit aux input (AuxKind.REPLICATE), not bound here.
+# and passed to flex_quant_cast as an explicit aux input (AuxKind.REPLICATE), not bound here.
 FLOAT8_TENSORWISE = Recipe(
     quant=float8_tensorwise_f,
     dequant=dq_tensorwise,
@@ -580,7 +580,7 @@ FLOAT8_TENSORWISE = Recipe(
 
 
 # nvfp4 recipe: the per-tensor outer scale is computed outside (via nvfp4_gs_scale) and passed
-# to flex_cast_quant / dequant as an explicit aux input (AuxKind.REPLICATE), not bound here.
+# to flex_quant_cast / dequant as an explicit aux input (AuxKind.REPLICATE), not bound here.
 NVFP4_GS_SWIZZLE = Recipe(
     quant=nvfp4_gs_swizzle_f,
     dequant=nvfp4_gs_swizzle_dq_f,
