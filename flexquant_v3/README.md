@@ -112,13 +112,7 @@ via `**kwargs`.
 * quantizing both dim0 and dim1 from one call (expressible via per-output SWAP_TILE_INDEX on the
   dim0 outputs + possibly a second `f`, but not implemented yet)
 * a real backend, for not we just have reference backends
-* proper testing (currently not many edge cases are tested)
-
-## Out of scope
-
-* an EFFICIENT rowwise/colwise backend. Rowwise/colwise are now expressible in the reference
-  backend via `tile_must_span_dim=DIM1/DIM0` (a tile spanning the reduced dim), but a real
-  kernel would want 1d tiles for efficiency -- not worth the complexity to start.
+* more edge case testing
 
 ## Files
 
@@ -128,16 +122,6 @@ via `**kwargs`.
 | `recipes.py` | The `Recipe(quant, dequant)` dataclass and all example `f` recipes. |
 | `utils.py` | Sub-byte fp4 (e2m1) conversion + 4-bit packing helpers. |
 | `test.py` | Numerical tests: reference-vs-backend, SQNR, and per-recipe properties. |
-
-## Backends
-
-- **`REFERENCE`** — runs `f` on the whole tensor. The correctness oracle.
-- **`MANUAL_TILE`** — splits the input into 2D tiles, runs `f` per tile, and scatters
-  each tile's outputs into preallocated buffers (per-output placement follows `output_kinds`).
-  For a tile-invariant `f` it must match `REFERENCE` bit-for-bit; it's how we *check*
-  tile-invariance.
-
-Both are debug/reference backends. `TODO`: lower `f` to a non-reference backend.
 
 ## Running the tests
 

@@ -22,11 +22,7 @@ class OutputKind(enum.Enum):
 
     NORMAL: a tile computed at grid position [m, n] writes to output grid position [m, n].
     SWAP_TILE_INDEX: writes to output grid position [n, m] instead -- a grid transpose of the
-      tile-index only; the tile's CONTENTS are written as-is (NOT element-transposed). Element
-      orientation is `f`'s job (e.g. a dim-M recipe transposes its own tile then reduces the last
-      dim); combined with this flag, `f` + SWAP_TILE_INDEX reproduces a full transpose. The
-      output buffer is preallocated with the grid-transposed shape (the fake-probe of `f` on the
-      whole tensor already yields it, since `f` transposes within-tile).
+      tile-index only; the tile's CONTENTS are written as-is (NOT element-transposed).
     """
 
     NORMAL = "normal"
@@ -36,14 +32,10 @@ class OutputKind(enum.Enum):
 class TileMustSpanDim(enum.Enum):
     """Which dim, if any, a tile must fully span.
 
-    Controls the tile size the MANUAL_TILE backend uses. A recipe whose reduction spans a whole
-    dimension (e.g. rowwise scaling reduces the entire row) is only tile-invariant if no tile ever
-    severs that dimension -- so the tile must span its full extent.
-
     NONE: default 2D tiles (no dim must span).
-    DIM0: tiles span all of dim0 -- dim0 is not tiled (enables colwise: one scale per column,
+    DIM0: tiles span all of dim0 (enables colwise: one scale per column,
       reduced over all rows).
-    DIM1: tiles span all of dim1 -- dim1 is not tiled (enables rowwise: one scale per row,
+    DIM1: tiles span all of dim1 (enables rowwise: one scale per row,
       reduced over all columns).
     """
 
@@ -55,19 +47,23 @@ class TileMustSpanDim(enum.Enum):
 class AuxKind(enum.Enum):
     """How a captured auxiliary input is presented to `f` per tile.
 
-    Aux tensors are lifted out of `f`'s closure into explicit `aux_inputs` (cf. flex_gemm's
-    epilogue arg kinds), and each carries a kind saying how the framework hands it to each tile.
-    REPLICATE and TILE are implemented; ROW/COL are defined but raise NotImplementedError.
+    REPLICATE: pass aux_input as-is
+    TILE: tile aux_input consistently with the main input
+      - Example 1 (matching shapes)
+        - input [M, N], aux_input [M, N]
+        - tiling 2x2
+        - tiled input [M // 2, N // 2], tiled aux_input [M // 2, N // 2]
+      - Example 2 (shape of input is a multiple of the shape of aux_input)
+        - input [M, N], aux_input [M // 2, N // 2]
+        - tiling 2x2
+        - tiled input [M // 2, N // 2], tiled aux_input [M // 4, N // 4]
+    ROW: broadcast aux_input down the row (M) tiles
+    COL: broadcast aux_input across the col (N) tiles
     """
 
-    # whole tensor handed to every tile (e.g. a per-tensor scale).
     REPLICATE = "replicate"
-    # leading dims match the input (M, N) grid; slice the matching sub-tile per tile
-    # (e.g. a 128x128-blocked scale, or a same-shape bias). `f` block-broadcasts it.
     TILE = "tile"
-    # (1, N): broadcast down the row (M) tiles.
     ROW = "row"
-    # (M, 1): broadcast across the col (N) tiles.
     COL = "col"
 
 
@@ -133,42 +129,97 @@ def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
 
 def flex_cast_quant(
     input: torch.Tensor,
-    f: Callable,  # tile-invariant fn: (input, *aux_inputs) -> (out, *aux_out)
+    f: Callable,
     *,
-    aux_inputs: Tuple[torch.Tensor, ...] = (),  # auxiliary inputs
-    aux_kinds: Tuple[AuxKind, ...] | None = None,  # for each aux input, specify how to broadcast it
-    # for each output of `f`, how the framework places it into the final tensor when tiling
-    # (None => all NORMAL). SWAP_TILE_INDEX writes tile grid [m,n] to output grid [n,m].
+    aux_inputs: Tuple[torch.Tensor, ...] = (),
+    aux_kinds: Tuple[AuxKind, ...] | None = None,
     output_kinds: Tuple[OutputKind, ...] | None = None,
-    # input padding
     pad_input_to_multiple_of: Tuple[int, int] | None = None,
-    # which dim (if any) a tile must fully span, for reductions over a whole dim
-    # (DIM1 -> rowwise, DIM0 -> colwise); NONE (default) uses 2D tiles
     tile_must_span_dim: TileMustSpanDim = TileMustSpanDim.NONE,
-    # restrictions on tiling
     tile_multiple_of: Tuple[int, int] | None = None,
     full_tile_multiple_of: Tuple[int, int] | None = None,
-    # kwargs below are only for debugging
     _backend: FlexCastQuantBackend = FlexCastQuantBackend.REFERENCE,
 ) -> tuple[torch.Tensor, ...]:
-    """Single-kernel quantization API.
+    """Executes a user specified `f(input, *aux_inputs, **kwargs) -> (outputs)` in a 
+    single kernel, tiled for efficient execution (the "single-kernel" part is not
+    implemented yet as we only have debug backends).
 
-    `f` must be *tile-invariant*: the same pointwise/blockwise computation applied
-    independently to every tile of `input`. It has signature `(input, *aux_inputs, global_row,
-    global_col, num_col) -> (out, *aux_out)` -- one primary output plus zero or more auxiliary
-    outputs (e.g. a scale; a pure transform has none). Any tensors `f` needs beyond `input`
-    (e.g. a per-tensor scale, an RHT matrix) are passed explicitly via `aux_inputs` rather than
-    captured in a closure, so the framework can present each one per tile according to its
-    `AuxKind`. The framework ALWAYS passes the tile's global position as keyword args --
-    `global_row`/`global_col` (the tile's origin in the full tensor) and `num_col` (the full row
-    stride) -- so a recipe can key per-element behavior on global position (e.g. tiling-invariant
-    stochastic rounding); recipes that don't need position absorb them with `**kwargs`. Recipes
-    needing multiple kernels call this for one kernel and call something else for the rest. This
-    API is consumer-agnostic (no notion of weight/activation/KV/gradient) -- `f` owns all format
-    knowledge.
+    `f` must be *near-tile-invariant*. The *near* caveats are:
+    1. `f` must place restrictions on tile size to ensure quantization 
+        validity and correctness. Examples:
+        a. `pad_input_to_multiple_of=(a, b)` for aligning input size with any static
+            quantization block size
+        b. `tile_must_span_dim=TileMustSpanDim.DIM1` for rowwise quantization in
+            a single kernel. Note that this is incompatible with efficient gemm epilogue.
+        c. `tile_multiple_of=(1, 32)` to ensure that a 1x32 quantization block size
+            reduction does not span multiple tiles
+        d. `full_tile_multiple_of=(128, 128)` to ensure that a mxfp8|nvfp4 scale
+            swizzle does not span multiple tiles
+    2. `f` can optionally take a tile's position in the parent tensor
+        with `global_row, global_col, num_col` kwargs to implement tile-invariant 
+        per-element randomness for stochastic rounding.
+       
 
-    TODO(future work): inspect `f` and lower to an efficient (Helion/Triton) kernel that
-    exploits tile-invariance (cf. flexquant_v2 tile_map).
+    Args:
+        input: the 2D tensor to cast. Rank 2 only.
+        f: the tile-invariant function described above.
+        aux_inputs: extra tensors `f` needs beyond `input` (e.g. a per-tensor scale, an RHT
+            matrix, a per-element bias)
+        aux_kinds: control how each tensor in `aux_inputs` is passed to a tile:
+            - AuxKind.REPLICATE
+            - AuxKind.TILE
+            - AuxKind.ROW (not yet implemented)
+            - AuxKind.COL (not yet implemented)
+        output_kinds: control how each output tile is written to the respective output tensor
+            - OutputKind.NORMAL - written as-is
+            - OutputKind.SWAP_TILE_INDEX - 2D transpose the tiles of the output tensor on write.
+                This allows the user to express a global 2D transpose (`tensor.t()`) with a 
+                composition of
+                    (i) a tile-local transpose (`tile.t()` inside of `f`), and 
+                    (ii) a transpose of each tile as a whole with respect to the parent tensor:
+                    given output shape [M, N], output tile shape [m, n] and output tile 
+                    global index [m_start, n_start], write the [m, n] tensor to the
+                    2d region starting in [n_start, m_start].
+        pad_input_to_multiple_of: if given, `(mult0, mult1)` -- zero-pad each `input` dim up to a
+            multiple of `mult{0,1}` on load (for ragged shapes, e.g. LLM decode/prefill token
+            dims). Outputs come back at the padded shape. `None` (default) does no padding.
+        tile_must_span_dim: which dim, if any, a tile must fully span
+            - TileMustSpanDim.NONE (default) - no restrictions
+            - TileMustSpanDim.DIM0 - given input shape [M, N], each tile must be shaped [M, {anything}]
+            - TileMustSpanDim.DIM1 - given input shape [M, N], each tile must be shaped [{anything}, N]
+        tile_multiple_of: if given, `(mult0, mult1)` -- assert every tile's size is a multiple of
+            `mult{0,1}` (a per-dim block/reduction granularity `f` requires). `None` skips the check.
+        full_tile_multiple_of: like `tile_multiple_of` but applies only to full (non-edge) tiles
+            (e.g. the 128x128 swizzle atom, which edge/remainder tiles are exempt from).
+        _backend: debug backend. 
+            REFERENCE runs `f` on the whole tensor without tiling
+            MANUAL_TILE is a debug backend that tiles the input in tiles of 256x256
+            We don't have a real backend yet
+
+    Returns:
+        The tuple `f` produced (`(out, *aux_out)`), assembled over the whole tensor.
+
+    Example:
+        deepseek fp8 1x128 (reduce over 128-element groups along the last dim, one fp8 tensor
+        + one fp32 scale per group). `f` is written for a single tile; the framework applies it
+        to every tile.
+
+        >>> def deepseek_1x128_f(x, **kwargs):
+        ...     fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+        ...     *lead, last = x.shape
+        ...     x_b = x.reshape(*lead, last // 128, 128)
+        ...     amax = x_b.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12).to(torch.float32)
+        ...     scale = amax / fp8_max
+        ...     qdata = (x_b.to(torch.float32) / scale).to(torch.float8_e4m3fn)
+        ...     return qdata.reshape(*lead, last), scale.squeeze(-1)
+        >>>
+        >>> x = torch.randn(1024, 512, dtype=torch.bfloat16, device="cuda")
+        >>> # tile_multiple_of=(1, 128): keep each 1x128 reduction group inside one tile.
+        >>> qdata, scale = flex_cast_quant(x, deepseek_1x128_f, tile_multiple_of=(1, 128))
+        >>> qdata.shape, scale.shape
+        (torch.Size([1024, 512]), torch.Size([1024, 4]))
+
+    TODO(future work): verify we want this, align with flex_gemm|flex_ep|flex_moe, build a backend
     """
 
     assert len(input.shape) == 2, "only input of rank 2 is supported"
@@ -231,6 +282,7 @@ def _manual_tile(
 
     # pad input first, so the whole pipeline (constraint asserts, fake-probe output shapes,
     # preallocation, tiling offsets) all key off the padded shape.
+    # TODO(future): move this inside the tiling logic
     if pad_input_to_multiple_of is not None:
         input = _pad_to_multiple(input, pad_input_to_multiple_of)
 
