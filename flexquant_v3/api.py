@@ -8,11 +8,9 @@ from utils import _pad_to_multiple
 
 
 class FlexCastQuantBackend(enum.Enum):
-    # for debugging, just runs the callback on the entire tensor
+    # for debugging, runs the callback on the entire tensor
     REFERENCE = "reference"
-    # for debugging, manually tiles and runs the callback on each
-    # Note: supports AuxKind.REPLICATE (whole aux to every tile) and AuxKind.TILE (per-tile
-    # sub-region); ROW/COL are defined in AuxKind but not yet implemented.
+    # for debugging, manually tiles in 256x256 tiles and runs the callback on each
     MANUAL_TILE = "manual_tile"
     # TODO(future): actual backend
 
@@ -59,7 +57,9 @@ class AuxKind(enum.Enum):
         - tiled input [M // 2, N // 2], tiled aux_input [M // 4, N // 4]
     ROW: a per-row aux of shape exactly (M, 1); each tile gets its rows sliced (aux[r:r+bm, :])
       and the single column broadcasts across the tile's columns (e.g. a precalculated rowwise scale)
-    COL: a per-column aux of shape (1, N); broadcasts across rows (not yet implemented)
+    COL: a per-column aux of shape exactly (1, N); each tile gets its columns sliced
+      (aux[:, c:c+bn]) and the single row broadcasts across the tile's rows (e.g. a
+      precalculated colwise scale)
     """
 
     REPLICATE = "replicate"
@@ -80,7 +80,7 @@ def _resolve_aux_kinds(
         f"aux_kinds ({len(aux_kinds)}) must match aux_inputs ({len(aux_inputs)})"
     )
     for kind in aux_kinds:
-        if kind not in (AuxKind.REPLICATE, AuxKind.TILE, AuxKind.ROW):
+        if kind not in (AuxKind.REPLICATE, AuxKind.TILE, AuxKind.ROW, AuxKind.COL):
             raise NotImplementedError(f"aux kind {kind} is not yet implemented")
     return aux_kinds
 
@@ -104,7 +104,8 @@ def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
     The single place per-tile aux slicing lives. REPLICATE hands the whole aux to every tile;
     TILE slices the matching sub-region (the aux's leading two dims map to the input (M, N) grid
     at a per-dim ratio inferred from the shapes); ROW slices a (M, 1) per-row aux along dim0 and
-    lets it broadcast across the tile's columns. COL is not implemented yet.
+    lets it broadcast across the tile's columns; COL slices a (1, N) per-column aux along dim1 and
+    lets it broadcast across the tile's rows.
 
     TODO(future): a TILE aux combined with a SWAP_TILE_INDEX output would need the aux's
     row<->col roles swapped too (cf. flex_gemm _SWAPPED_ARG_KIND); not handled yet.
@@ -135,6 +136,15 @@ def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
             f"for input {tuple(input_shape)}"
         )
         return aux[r : r + bm, :]
+    if kind is AuxKind.COL:
+        # a per-column aux: shape (1, N), exactly one value per input column, broadcast across
+        # rows. Slice the tile's columns and leave the size-1 row dim to broadcast.
+        bm, bn = tile_shape
+        assert aux.shape == (1, input_shape[1]), (
+            f"COL aux must be exactly (1, N) matching input cols, got {tuple(aux.shape)} "
+            f"for input {tuple(input_shape)}"
+        )
+        return aux[:, c : c + bn]
     raise NotImplementedError(f"aux kind {kind} is not yet implemented")
 
 
