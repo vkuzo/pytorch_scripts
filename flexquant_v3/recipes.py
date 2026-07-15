@@ -306,6 +306,34 @@ def rowwise_precalc_dq_f(q, scale):
 
 
 # ---------------------------------------------------------------------------
+# The recipe: colwise fp8 with a PRECALCULATED per-column scale (AuxKind.COL), transposed output.
+#
+# The symmetric partner of the ROW precalc recipe: a (1, N) per-column scale is computed OUTSIDE
+# and passed as an AuxKind.COL aux input (each tile gets its columns' slice, broadcast across
+# rows). `f` divides and writes its tile output TRANSPOSED-contiguous; paired with
+# output_kinds=SWAP_TILE_INDEX (like colwise_fp8_f), the framework's grid swap yields the
+# transposed (N, M) layout. Tile-invariant under plain 2D tiling -- no tile_must_span_dim needed.
+# ---------------------------------------------------------------------------
+def colwise_precalc_scale(x):
+    """Per-column fp32 scale (col reduction; computed outside flex_cast_quant). Returns (1, N)."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    amax = x.abs().amax(dim=0, keepdim=True).clamp(min=1e-12).to(torch.float32)
+    return (amax / fp8_max).to(torch.float32)  # (1, N)
+
+
+def colwise_precalc_f(x, scale, **kwargs):
+    """Colwise fp8 cast given a precalculated (1, N) per-column `scale` (AuxKind.COL aux input);
+    writes the tile output transposed-contiguous (pair with output_kinds=SWAP_TILE_INDEX)."""
+    qdata = (x.to(torch.float32) / scale).to(torch.float8_e4m3fn)
+    return (qdata.t().contiguous(),)  # (Ntile, Mtile); scale is an input, not a returned output
+
+
+def colwise_precalc_dq_f(q, scale):
+    # q is (N, M) transposed frame; scale (1, N) -> transpose to (N, 1) to broadcast over q's cols.
+    return q.float() * scale.t()
+
+
+# ---------------------------------------------------------------------------
 # The recipe: float8 tensorwise (per-tensor) scaling.
 #
 # Unlike the block recipes, the scale is a single per-tensor value that needs a GLOBAL
@@ -527,6 +555,9 @@ COLWISE_FP8 = Recipe(quant=colwise_fp8_f, dequant=colwise_fp8_dq_f)
 # rowwise with a precalculated (M, 1) scale passed as an AuxKind.ROW aux input; the divide is
 # tile-invariant under plain 2D tiling (no tile_must_span_dim needed).
 ROWWISE_PRECALC = Recipe(quant=rowwise_precalc_f, dequant=rowwise_precalc_dq_f)
+# colwise with a precalculated (1, N) scale (AuxKind.COL) + transposed-contiguous output (pair
+# with output_kinds=SWAP_TILE_INDEX); tile-invariant under plain 2D tiling.
+COLWISE_PRECALC = Recipe(quant=colwise_precalc_f, dequant=colwise_precalc_dq_f)
 MXFP8_FLOOR = Recipe(
     quant=mxfp8_floor_f, 
     dequant=mxfp8_floor_dq_f,
