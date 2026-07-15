@@ -1,4 +1,4 @@
-"""Battle-test flex_cast_quant against a plain-PyTorch reference, recipe by recipe.
+"""Battle-test flex_quant_cast against a plain-PyTorch reference, recipe by recipe.
 
 Comparison discipline mirrors flexquant v1/v2 test.py: bit-exact `torch.equal` on both
 qdata (compared as fp32) and scale. Recipes live in recipes.py.
@@ -9,7 +9,7 @@ import torch
 import torch.func._random as prng
 import torch.nn.functional as F
 
-from api import AuxKind, FlexCastQuantBackend, OutputKind, TileMustSpanDim, flex_cast_quant
+from api import AuxKind, FlexQuantCastBackend, OutputKind, TileMustSpanDim, flex_quant_cast
 from recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
@@ -85,9 +85,9 @@ def test_float8_tensorwise_matches_reference():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    # scale computed outside flex_cast_quant, passed in as a REPLICATE aux input.
+    # scale computed outside flex_quant_cast, passed in as a REPLICATE aux input.
     scale = float8_tensorwise_scale(x)
-    qdata, scale_out = flex_cast_quant(
+    qdata, scale_out = flex_quant_cast(
         x,
         FLOAT8_TENSORWISE.quant,
         aux_inputs=(scale,),
@@ -112,7 +112,7 @@ def test_float8_tensorwise_sqnr_vs_high_precision():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     scale = float8_tensorwise_scale(x)
-    qdata, scale_out = flex_cast_quant(
+    qdata, scale_out = flex_quant_cast(
         x, FLOAT8_TENSORWISE.quant, aux_inputs=(scale,), aux_kinds=(AuxKind.REPLICATE,)
     )
     x_hat = FLOAT8_TENSORWISE.dequant(qdata, scale_out)
@@ -127,7 +127,7 @@ def test_nvfp4_gs_swizzle_matches_reference():
 
     # outer scale computed outside, passed in as a REPLICATE aux input.
     outer = nvfp4_gs_scale(x)
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         NVFP4_GS_SWIZZLE.quant,
         aux_inputs=(outer,),
@@ -159,11 +159,11 @@ def test_nvfp4_gs_swizzle_backends_match():
         tile_multiple_of=NVFP4_GS_SWIZZLE.tile_multiple_of,
         full_tile_multiple_of=NVFP4_GS_SWIZZLE.full_tile_multiple_of,
     )
-    qdata_ref, scale_ref = flex_cast_quant(
-        x, NVFP4_GS_SWIZZLE.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw
+    qdata_ref, scale_ref = flex_quant_cast(
+        x, NVFP4_GS_SWIZZLE.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw
     )
-    qdata_tile, scale_tile = flex_cast_quant(
-        x, NVFP4_GS_SWIZZLE.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw
+    qdata_tile, scale_tile = flex_quant_cast(
+        x, NVFP4_GS_SWIZZLE.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw
     )
 
     # exercises the _manual_tile packed-fp4 cat (via uint8 view).
@@ -178,7 +178,7 @@ def test_nvfp4_gs_swizzle_sqnr_vs_high_precision():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     outer = nvfp4_gs_scale(x)
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         NVFP4_GS_SWIZZLE.quant,
         aux_inputs=(outer,),
@@ -207,7 +207,7 @@ def test_hadamard_rht_matches_reference():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     rht = _rht_matrix()
-    (out,) = flex_cast_quant(x, hadamard_rht_f, aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
+    (out,) = flex_quant_cast(x, hadamard_rht_f, aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
     (out_ref,) = hadamard_rht_f(x, rht)
 
     assert out.shape == (512, 512)
@@ -223,8 +223,8 @@ def test_hadamard_rht_backends_match():
 
     rht = _rht_matrix()
     kw = dict(aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
-    (out_ref,) = flex_cast_quant(x, hadamard_rht_f, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    (out_tile,) = flex_cast_quant(x, hadamard_rht_f, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    (out_ref,) = flex_quant_cast(x, hadamard_rht_f, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    (out_tile,) = flex_quant_cast(x, hadamard_rht_f, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
 
     assert torch.equal(out_tile, out_ref)
 
@@ -235,7 +235,7 @@ def test_hadamard_rht_roundtrip_sqnr():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     rht = _rht_matrix()
-    (y,) = flex_cast_quant(x, hadamard_rht_f, aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
+    (y,) = flex_quant_cast(x, hadamard_rht_f, aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
 
     M, N = x.shape
     x_rec = (y.reshape(M, N // 16, 16) @ rht.t()).reshape(M, N)
@@ -251,7 +251,7 @@ def test_sr_bf16_matches_reference():
     x = torch.randn(512, 512, dtype=torch.float32, device="cuda")
 
     key0 = prng.key(0, device="cuda")
-    (out,) = flex_cast_quant(x, sr_bf16_f, aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
+    (out,) = flex_quant_cast(x, sr_bf16_f, aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
     (out_ref,) = sr_bf16_f(x, key0)
 
     assert out.shape == (512, 512)
@@ -270,7 +270,7 @@ def test_sr_bf16_unbiased():
     x = torch.full((1024, 1024), v, dtype=torch.float32, device="cuda")
 
     key0 = prng.key(0, device="cuda")
-    (out,) = flex_cast_quant(x, sr_bf16_f, aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
+    (out,) = flex_quant_cast(x, sr_bf16_f, aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
 
     lo = torch.tensor(v, dtype=torch.bfloat16).float().item()  # RTN neighbor (round down)
     hi = torch.tensor(v + 2**-7, dtype=torch.bfloat16).float().item()
@@ -288,8 +288,8 @@ def test_sr_bf16_tiling_changes_rounding():
 
     key0 = prng.key(0, device="cuda")
     kw = dict(aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
-    (out_ref,) = flex_cast_quant(x, sr_bf16_f, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    (out_tile,) = flex_cast_quant(x, sr_bf16_f, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    (out_ref,) = flex_quant_cast(x, sr_bf16_f, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    (out_tile,) = flex_quant_cast(x, sr_bf16_f, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
 
     assert not torch.equal(out_ref, out_tile)
     assert abs(out_ref.float().mean().item() - v) < 2e-3
@@ -304,8 +304,8 @@ def test_sr_bf16_global_tiling_invariant():
 
     key0 = prng.key(0, device="cuda")
     kw = dict(aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
-    (out_ref,) = flex_cast_quant(x, sr_bf16_global_f, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    (out_tile,) = flex_cast_quant(x, sr_bf16_global_f, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    (out_ref,) = flex_quant_cast(x, sr_bf16_global_f, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    (out_tile,) = flex_quant_cast(x, sr_bf16_global_f, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
 
     assert torch.equal(out_ref, out_tile)  # global-position keying is tiling-invariant
     assert abs(out_ref.float().mean().item() - v) < 2e-3  # still unbiased
@@ -320,7 +320,7 @@ def test_matches_reference(recipe, scale_shape, scale_dtype, qdata_dtype):
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         recipe.quant,
         tile_multiple_of=recipe.tile_multiple_of,
@@ -349,17 +349,17 @@ def test_backends_match(recipe, flat_compare):
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    qdata_ref, scale_ref = flex_cast_quant(
+    qdata_ref, scale_ref = flex_quant_cast(
         x,
         recipe.quant,
-        _backend=FlexCastQuantBackend.REFERENCE,
+        _backend=FlexQuantCastBackend.REFERENCE,
         tile_multiple_of=recipe.tile_multiple_of,
         full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
-    qdata_tile, scale_tile = flex_cast_quant(
+    qdata_tile, scale_tile = flex_quant_cast(
         x,
         recipe.quant,
-        _backend=FlexCastQuantBackend.MANUAL_TILE,
+        _backend=FlexQuantCastBackend.MANUAL_TILE,
         tile_multiple_of=recipe.tile_multiple_of,
         full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
@@ -381,7 +381,7 @@ def test_sqnr_vs_high_precision(recipe, sqnr_min):
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         recipe.quant,
         tile_multiple_of=recipe.tile_multiple_of,
@@ -402,7 +402,7 @@ def test_deepseek_dim_m_matches_reference():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         DEEPSEEK_1X128_DIM_M.quant,
         output_kinds=_DIM_M_SWAP,
@@ -421,8 +421,8 @@ def test_deepseek_dim_m_backends_match():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     kw = dict(output_kinds=_DIM_M_SWAP, tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of)
-    qr, sr = flex_cast_quant(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    qt, st = flex_cast_quant(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    qr, sr = flex_quant_cast(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    qt, st = flex_quant_cast(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
     assert _qdata_equal(qt, qr)
     assert st.shape == sr.shape
     assert torch.equal(st, sr)
@@ -435,8 +435,8 @@ def test_deepseek_dim_m_non_square():
     x = torch.randn(384, 512, dtype=torch.bfloat16, device="cuda")
 
     kw = dict(output_kinds=_DIM_M_SWAP, tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of)
-    qr, sr = flex_cast_quant(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    qt, st = flex_cast_quant(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    qr, sr = flex_quant_cast(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    qt, st = flex_quant_cast(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
     assert qr.shape == (512, 384)  # grid-transposed
     assert sr.shape == (512, 384 // 128)
     assert _qdata_equal(qt, qr)
@@ -447,7 +447,7 @@ def test_deepseek_dim_m_sqnr():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         DEEPSEEK_1X128_DIM_M.quant,
         output_kinds=_DIM_M_SWAP,
@@ -466,8 +466,8 @@ def test_rowwise_fp8_backends_match():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     kw = dict(tile_must_span_dim=TileMustSpanDim.DIM1)
-    qr, sr = flex_cast_quant(x, ROWWISE_FP8.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    qt, st = flex_cast_quant(x, ROWWISE_FP8.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    qr, sr = flex_quant_cast(x, ROWWISE_FP8.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    qt, st = flex_quant_cast(x, ROWWISE_FP8.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
     assert sr.shape == (512, 1)
     assert _qdata_equal(qt, qr)
     assert torch.equal(st, sr)
@@ -477,7 +477,7 @@ def test_rowwise_fp8_sqnr():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_cast_quant(x, ROWWISE_FP8.quant, tile_must_span_dim=TileMustSpanDim.DIM1)
+    qdata, scale = flex_quant_cast(x, ROWWISE_FP8.quant, tile_must_span_dim=TileMustSpanDim.DIM1)
     x_hat = ROWWISE_FP8.dequant(qdata, scale)
     assert _compute_error(x.float(), x_hat.float()) > 20.0
 
@@ -492,8 +492,8 @@ def test_rowwise_precalc_row_aux_backends_match():
     scale = rowwise_precalc_scale(x)  # (512, 1)
     assert scale.shape == (512, 1)
     kw = dict(aux_inputs=(scale,), aux_kinds=(AuxKind.ROW,))  # 2D tiling (default)
-    (qr,) = flex_cast_quant(x, ROWWISE_PRECALC.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    (qt,) = flex_cast_quant(x, ROWWISE_PRECALC.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    (qr,) = flex_quant_cast(x, ROWWISE_PRECALC.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    (qt,) = flex_quant_cast(x, ROWWISE_PRECALC.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
 
     # matches applying the precalc scale directly, and REFERENCE == MANUAL_TILE bit-exact.
     (q_direct,) = rowwise_precalc_f(x, scale)
@@ -506,7 +506,7 @@ def test_rowwise_precalc_sqnr():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     scale = rowwise_precalc_scale(x)
-    (qdata,) = flex_cast_quant(
+    (qdata,) = flex_quant_cast(
         x, ROWWISE_PRECALC.quant, aux_inputs=(scale,), aux_kinds=(AuxKind.ROW,)
     )
     x_hat = ROWWISE_PRECALC.dequant(qdata, scale)
@@ -524,8 +524,8 @@ def test_colwise_precalc_col_aux_backends_match():
     scale = colwise_precalc_scale(x)  # (1, 384)
     assert scale.shape == (1, 384)
     kw = dict(aux_inputs=(scale,), aux_kinds=(AuxKind.COL,), output_kinds=(OutputKind.SWAP_TILE_INDEX,))
-    (qr,) = flex_cast_quant(x, COLWISE_PRECALC.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    (qt,) = flex_cast_quant(x, COLWISE_PRECALC.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    (qr,) = flex_quant_cast(x, COLWISE_PRECALC.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    (qt,) = flex_quant_cast(x, COLWISE_PRECALC.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
 
     assert qr.shape == (384, 512)  # transposed (N, M)
     (q_direct,) = colwise_precalc_f(x, scale)
@@ -538,7 +538,7 @@ def test_colwise_precalc_sqnr():
     x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
 
     scale = colwise_precalc_scale(x)
-    (qdata,) = flex_cast_quant(
+    (qdata,) = flex_quant_cast(
         x,
         COLWISE_PRECALC.quant,
         aux_inputs=(scale,),
@@ -560,8 +560,8 @@ def test_colwise_fp8_backends_match():
     x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
 
     kw = dict(tile_must_span_dim=TileMustSpanDim.DIM0, output_kinds=_COLWISE_SWAP)
-    qr, sr = flex_cast_quant(x, COLWISE_FP8.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    qt, st = flex_cast_quant(x, COLWISE_FP8.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    qr, sr = flex_quant_cast(x, COLWISE_FP8.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    qt, st = flex_quant_cast(x, COLWISE_FP8.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
     assert qr.shape == (384, 512)  # transposed (N, M)
     assert sr.shape == (384, 1)  # transposed (N, 1)
     assert _qdata_equal(qt, qr)
@@ -572,7 +572,7 @@ def test_colwise_fp8_sqnr():
     torch.manual_seed(0)
     x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x, COLWISE_FP8.quant, tile_must_span_dim=TileMustSpanDim.DIM0, output_kinds=_COLWISE_SWAP
     )
     # outputs are in the transposed (N, M) frame; dequant then transpose back to compare with x.
@@ -593,7 +593,7 @@ def test_pad_ref_shapes_swizzle():
     # ragged 200x300 padded to (128,128)-multiple -> (256, 384); swizzle grid nrb=2, ncb=3.
     torch.manual_seed(0)
     x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         MXFP8_FLOOR_SWIZZLE.quant,
         pad_input_to_multiple_of=(128, 128),
@@ -623,8 +623,8 @@ def test_pad_backends_match(recipe, pad_to):
         tile_multiple_of=recipe.tile_multiple_of,
         full_tile_multiple_of=recipe.full_tile_multiple_of,
     )
-    qdata_ref, scale_ref = flex_cast_quant(x, recipe.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    qdata_tile, scale_tile = flex_cast_quant(x, recipe.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    qdata_ref, scale_ref = flex_quant_cast(x, recipe.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    qdata_tile, scale_tile = flex_quant_cast(x, recipe.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
     assert _qdata_equal(qdata_tile, qdata_ref)
     assert scale_tile.shape == scale_ref.shape
     assert torch.equal(scale_tile, scale_ref)
@@ -634,7 +634,7 @@ def test_pad_matches_manual_pad():
     # padding inside the API == padding the input outside it, then running the recipe.
     torch.manual_seed(0)
     x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         MXFP8_FLOOR.quant,
         pad_input_to_multiple_of=(1, 32),
@@ -655,7 +655,7 @@ def test_nvfp4_blocked_outer_matches_reference():
 
     outer = nvfp4_blocked_outer_scale(x)  # (2, 2)
     assert outer.shape == (2, 2)
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         NVFP4_BLOCKED_OUTER.quant,
         aux_inputs=(outer,),
@@ -684,8 +684,8 @@ def test_nvfp4_blocked_outer_backends_match():
         tile_multiple_of=NVFP4_BLOCKED_OUTER.tile_multiple_of,
         full_tile_multiple_of=NVFP4_BLOCKED_OUTER.full_tile_multiple_of,
     )
-    qdata_ref, scale_ref = flex_cast_quant(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    qdata_tile, scale_tile = flex_cast_quant(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    qdata_ref, scale_ref = flex_quant_cast(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    qdata_tile, scale_tile = flex_quant_cast(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
 
     assert _qdata_equal(qdata_tile, qdata_ref)
     assert scale_tile.shape == scale_ref.shape
@@ -697,7 +697,7 @@ def test_nvfp4_blocked_outer_sqnr_vs_high_precision():
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
     outer = nvfp4_blocked_outer_scale(x)
-    qdata, scale = flex_cast_quant(
+    qdata, scale = flex_quant_cast(
         x,
         NVFP4_BLOCKED_OUTER.quant,
         aux_inputs=(outer,),
@@ -716,8 +716,8 @@ def test_mxfp8_bias_backends_match():
     bias = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
     kw = dict(aux_inputs=(bias,), aux_kinds=(AuxKind.TILE,), tile_multiple_of=MXFP8_BIAS.tile_multiple_of)
-    qdata_ref, scale_ref = flex_cast_quant(x, MXFP8_BIAS.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
-    qdata_tile, scale_tile = flex_cast_quant(x, MXFP8_BIAS.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+    qdata_ref, scale_ref = flex_quant_cast(x, MXFP8_BIAS.quant, _backend=FlexQuantCastBackend.REFERENCE, **kw)
+    qdata_tile, scale_tile = flex_quant_cast(x, MXFP8_BIAS.quant, _backend=FlexQuantCastBackend.MANUAL_TILE, **kw)
 
     # matches a direct (whole-tensor) bias-add + quant, and REFERENCE == MANUAL_TILE.
     qdata_direct, scale_direct = mxfp8_bias_f(x, bias)
