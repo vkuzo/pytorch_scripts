@@ -7,7 +7,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from utils import _pad_to_multiple
 
 
-class FlexQuantCastBackend(enum.Enum):
+class FlexTileMapBackend(enum.Enum):
     # for debugging, runs the callback on the entire tensor
     REFERENCE = "reference"
     # for debugging, manually tiles in 256x256 tiles and runs the callback on each
@@ -148,7 +148,7 @@ def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
     raise NotImplementedError(f"aux kind {kind} is not yet implemented")
 
 
-def flex_quant_cast(
+def flex_tile_map(
     input: torch.Tensor,
     f: Callable,
     *,
@@ -159,7 +159,7 @@ def flex_quant_cast(
     tile_must_span_dim: TileMustSpanDim = TileMustSpanDim.NONE,
     tile_multiple_of: Tuple[int, int] | None = None,
     full_tile_multiple_of: Tuple[int, int] | None = None,
-    _backend: FlexQuantCastBackend = FlexQuantCastBackend.REFERENCE,
+    _backend: FlexTileMapBackend = FlexTileMapBackend.REFERENCE,
 ) -> tuple[torch.Tensor, ...]:
     """Executes a user specified `f(input, *aux_inputs, **kwargs) -> (outputs)` in a 
     single kernel, tiled for efficient execution (the "single-kernel" part is not
@@ -190,7 +190,7 @@ def flex_quant_cast(
             - AuxKind.REPLICATE
             - AuxKind.TILE
             - AuxKind.ROW
-            - AuxKind.COL (not yet implemented)
+            - AuxKind.COL
         output_kinds: control how each output tile is written to the respective output tensor
             - OutputKind.NORMAL - written as-is
             - OutputKind.SWAP_TILE_INDEX - 2D transpose the tiles of the output tensor on write.
@@ -236,7 +236,7 @@ def flex_quant_cast(
         >>>
         >>> x = torch.randn(1024, 512, dtype=torch.bfloat16, device="cuda")
         >>> # tile_multiple_of=(1, 128): keep each 1x128 reduction group inside one tile.
-        >>> qdata, scale = flex_quant_cast(x, deepseek_1x128_f, tile_multiple_of=(1, 128))
+        >>> qdata, scale = flex_tile_map(x, deepseek_1x128_f, tile_multiple_of=(1, 128))
         >>> qdata.shape, scale.shape
         (torch.Size([1024, 512]), torch.Size([1024, 4]))
 
@@ -247,7 +247,7 @@ def flex_quant_cast(
 
     aux_kinds = _resolve_aux_kinds(aux_inputs, aux_kinds)
 
-    if _backend is FlexQuantCastBackend.REFERENCE:
+    if _backend is FlexTileMapBackend.REFERENCE:
 
         # pad input (before the constraint asserts, so they validate the padded shape)
         if pad_input_to_multiple_of is not None:
@@ -266,7 +266,7 @@ def flex_quant_cast(
         # origin is (0, 0). num_col is the (post-swap, post-pad) row stride.
         outs = f(input, *aux_inputs, global_row=0, global_col=0, num_col=input.shape[1])
 
-    elif _backend is FlexQuantCastBackend.MANUAL_TILE:
+    elif _backend is FlexTileMapBackend.MANUAL_TILE:
         outs = _manual_tile(
             input,
             f,
