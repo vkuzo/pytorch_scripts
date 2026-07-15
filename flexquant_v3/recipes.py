@@ -280,6 +280,32 @@ def colwise_fp8_dq_f(q, scale):
 
 
 # ---------------------------------------------------------------------------
+# The recipe: rowwise fp8 with a PRECALCULATED per-row scale (AuxKind.ROW).
+#
+# Unlike rowwise_fp8_f (which reduces the row itself, needing tile_must_span_dim=DIM1), here the
+# (M, 1) per-row scale is computed OUTSIDE and passed as an AuxKind.ROW aux input. `f` only does
+# the divide, which is tile-invariant under plain 2D tiling (each tile receives its rows' slice
+# of the scale, broadcast across its columns) -- so no tile_must_span_dim restriction is needed.
+# `rowwise_precalc_scale` is the global row-reduction that lives outside flex_cast_quant.
+# ---------------------------------------------------------------------------
+def rowwise_precalc_scale(x):
+    """Per-row fp32 scale (row reduction; computed outside flex_cast_quant). Returns (M, 1)."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    amax = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-12).to(torch.float32)
+    return (amax / fp8_max).to(torch.float32)  # (M, 1)
+
+
+def rowwise_precalc_f(x, scale, **kwargs):
+    """Rowwise fp8 cast given a precalculated (M, 1) per-row `scale` (AuxKind.ROW aux input)."""
+    qdata = (x.to(torch.float32) / scale).to(torch.float8_e4m3fn)
+    return (qdata,)  # scale is an input, not a returned output
+
+
+def rowwise_precalc_dq_f(q, scale):
+    return q.float() * scale  # (M, 1) broadcasts over columns
+
+
+# ---------------------------------------------------------------------------
 # The recipe: float8 tensorwise (per-tensor) scaling.
 #
 # Unlike the block recipes, the scale is a single per-tensor value that needs a GLOBAL
@@ -498,6 +524,9 @@ DEEPSEEK_1X128_DIM_M = Recipe(
 # (DIM1 for rowwise, DIM0 for colwise).
 ROWWISE_FP8 = Recipe(quant=rowwise_fp8_f, dequant=rowwise_fp8_dq_f)
 COLWISE_FP8 = Recipe(quant=colwise_fp8_f, dequant=colwise_fp8_dq_f)
+# rowwise with a precalculated (M, 1) scale passed as an AuxKind.ROW aux input; the divide is
+# tile-invariant under plain 2D tiling (no tile_must_span_dim needed).
+ROWWISE_PRECALC = Recipe(quant=rowwise_precalc_f, dequant=rowwise_precalc_dq_f)
 MXFP8_FLOOR = Recipe(
     quant=mxfp8_floor_f, 
     dequant=mxfp8_floor_dq_f,

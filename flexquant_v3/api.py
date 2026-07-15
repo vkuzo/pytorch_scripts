@@ -57,8 +57,9 @@ class AuxKind(enum.Enum):
         - input [M, N], aux_input [M // 2, N // 2]
         - tiling 2x2
         - tiled input [M // 2, N // 2], tiled aux_input [M // 4, N // 4]
-    ROW: broadcast aux_input down the row (M) tiles
-    COL: broadcast aux_input across the col (N) tiles
+    ROW: a per-row aux of shape exactly (M, 1); each tile gets its rows sliced (aux[r:r+bm, :])
+      and the single column broadcasts across the tile's columns (e.g. a precalculated rowwise scale)
+    COL: a per-column aux of shape (1, N); broadcasts across rows (not yet implemented)
     """
 
     REPLICATE = "replicate"
@@ -79,7 +80,7 @@ def _resolve_aux_kinds(
         f"aux_kinds ({len(aux_kinds)}) must match aux_inputs ({len(aux_inputs)})"
     )
     for kind in aux_kinds:
-        if kind not in (AuxKind.REPLICATE, AuxKind.TILE):
+        if kind not in (AuxKind.REPLICATE, AuxKind.TILE, AuxKind.ROW):
             raise NotImplementedError(f"aux kind {kind} is not yet implemented")
     return aux_kinds
 
@@ -102,7 +103,8 @@ def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
 
     The single place per-tile aux slicing lives. REPLICATE hands the whole aux to every tile;
     TILE slices the matching sub-region (the aux's leading two dims map to the input (M, N) grid
-    at a per-dim ratio inferred from the shapes). ROW/COL are not implemented yet.
+    at a per-dim ratio inferred from the shapes); ROW slices a (M, 1) per-row aux along dim0 and
+    lets it broadcast across the tile's columns. COL is not implemented yet.
 
     TODO(future): a TILE aux combined with a SWAP_TILE_INDEX output would need the aux's
     row<->col roles swapped too (cf. flex_gemm _SWAPPED_ARG_KIND); not handled yet.
@@ -124,6 +126,15 @@ def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
             f"tile ({r}:{r+bm}, {c}:{c+bn}) must align to TILE aux block ({div0}, {div1})"
         )
         return aux[r // div0 : (r + bm) // div0, c // div1 : (c + bn) // div1]
+    if kind is AuxKind.ROW:
+        # a per-row aux: shape (M, 1), exactly one value per input row, broadcast across columns.
+        # Slice the tile's rows and leave the size-1 col dim to broadcast.
+        bm, bn = tile_shape
+        assert aux.shape == (input_shape[0], 1), (
+            f"ROW aux must be exactly (M, 1) matching input rows, got {tuple(aux.shape)} "
+            f"for input {tuple(input_shape)}"
+        )
+        return aux[r : r + bm, :]
     raise NotImplementedError(f"aux kind {kind} is not yet implemented")
 
 
@@ -168,7 +179,7 @@ def flex_cast_quant(
         aux_kinds: control how each tensor in `aux_inputs` is passed to a tile:
             - AuxKind.REPLICATE
             - AuxKind.TILE
-            - AuxKind.ROW (not yet implemented)
+            - AuxKind.ROW
             - AuxKind.COL (not yet implemented)
         output_kinds: control how each output tile is written to the respective output tensor
             - OutputKind.NORMAL - written as-is

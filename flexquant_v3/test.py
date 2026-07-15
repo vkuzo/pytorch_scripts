@@ -22,6 +22,7 @@ from recipes import (
     NVFP4_BLOCKED_OUTER,
     NVFP4_GS_SWIZZLE,
     ROWWISE_FP8,
+    ROWWISE_PRECALC,
     deepseek_1x128_dim_m_f,
     deepseek_1x128_dq_f,
     float8_tensorwise_f,
@@ -33,6 +34,8 @@ from recipes import (
     nvfp4_blocked_outer_scale,
     nvfp4_gs_scale,
     nvfp4_gs_swizzle_f,
+    rowwise_precalc_f,
+    rowwise_precalc_scale,
     sr_bf16_f,
     sr_bf16_global_f,
 )
@@ -476,6 +479,37 @@ def test_rowwise_fp8_sqnr():
     assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 
+# rowwise with a PRECALCULATED (M, 1) scale passed as an AuxKind.ROW aux input. The divide is
+# tile-invariant under plain 2D tiling (each tile gets its rows' slice of the scale, broadcast
+# across columns), so -- unlike ROWWISE_FP8 -- no tile_must_span_dim is needed.
+def test_rowwise_precalc_row_aux_backends_match():
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+
+    scale = rowwise_precalc_scale(x)  # (512, 1)
+    assert scale.shape == (512, 1)
+    kw = dict(aux_inputs=(scale,), aux_kinds=(AuxKind.ROW,))  # 2D tiling (default)
+    (qr,) = flex_cast_quant(x, ROWWISE_PRECALC.quant, _backend=FlexCastQuantBackend.REFERENCE, **kw)
+    (qt,) = flex_cast_quant(x, ROWWISE_PRECALC.quant, _backend=FlexCastQuantBackend.MANUAL_TILE, **kw)
+
+    # matches applying the precalc scale directly, and REFERENCE == MANUAL_TILE bit-exact.
+    (q_direct,) = rowwise_precalc_f(x, scale)
+    assert _qdata_equal(qr, q_direct)
+    assert _qdata_equal(qt, qr)
+
+
+def test_rowwise_precalc_sqnr():
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+
+    scale = rowwise_precalc_scale(x)
+    (qdata,) = flex_cast_quant(
+        x, ROWWISE_PRECALC.quant, aux_inputs=(scale,), aux_kinds=(AuxKind.ROW,)
+    )
+    x_hat = ROWWISE_PRECALC.dequant(qdata, scale)
+    assert _compute_error(x.float(), x_hat.float()) > 20.0
+
+
 # colwise transposes its outputs locally + SWAP_TILE_INDEX, so the emitted layout is the
 # transposed (N, M) qdata / (N, 1) scale. Use a non-square input so the transpose is observable.
 _COLWISE_SWAP = (OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX)
@@ -573,8 +607,8 @@ def test_pad_matches_manual_pad():
     assert torch.equal(scale, scale_ref)
 
 
-# aux inputs: REPLICATE and TILE are implemented; ROW/COL must still raise.
-@pytest.mark.parametrize("kind", [AuxKind.ROW, AuxKind.COL])
+# aux inputs: REPLICATE, TILE, ROW are implemented; COL must still raise.
+@pytest.mark.parametrize("kind", [AuxKind.COL])
 def test_aux_unimplemented_kind_raises(kind):
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
