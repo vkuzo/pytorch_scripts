@@ -27,21 +27,6 @@ class OutputKind(enum.Enum):
     SWAP_TILE_INDEX = "swap_tile_index"
 
 
-class TileMustSpanDim(enum.Enum):
-    """Which dim, if any, a tile must fully span.
-
-    NONE: default 2D tiles (no dim must span).
-    DIM0: tiles span all of dim0 (enables colwise: one scale per column,
-      reduced over all rows).
-    DIM1: tiles span all of dim1 (enables rowwise: one scale per row,
-      reduced over all columns).
-    """
-
-    NONE = "none"
-    DIM0 = "dim0"
-    DIM1 = "dim1"
-
-
 class AuxKind(enum.Enum):
     """How a captured auxiliary input is presented to `f` per tile.
 
@@ -156,9 +141,9 @@ def flex_tile_map(
     aux_kinds: Tuple[AuxKind, ...] | None = None,
     output_kinds: Tuple[OutputKind, ...] | None = None,
     pad_input_to_multiple_of: Tuple[int, int] | None = None,
-    tile_must_span_dim: TileMustSpanDim = TileMustSpanDim.NONE,
-    tile_multiple_of: Tuple[int, int] | None = None,
-    full_tile_multiple_of: Tuple[int, int] | None = None,
+    valid_tile_size_fn: Callable[
+        [Tuple[int, int], Tuple[int, int], Tuple[int, int]], bool
+    ] | None = None,
     _backend: FlexTileMapBackend = FlexTileMapBackend.REFERENCE,
 ) -> tuple[torch.Tensor, ...]:
     """Executes a user specified `f(input, *aux_inputs, **kwargs) -> (outputs)` in a 
@@ -166,20 +151,20 @@ def flex_tile_map(
     implemented yet as we only have debug backends).
 
     `f` must be *near-tile-invariant*. The *near* caveats are:
-    1. `f` must place restrictions on tile size to ensure quantization 
-        validity and correctness. Examples:
-        a. `pad_input_to_multiple_of=(a, b)` for aligning input size with any static
-            quantization block size
-        b. `tile_must_span_dim=TileMustSpanDim.DIM1` for rowwise quantization in
-            a single kernel. Note that this is incompatible with efficient gemm epilogue.
-        c. `tile_multiple_of=(1, 32)` to ensure that a 1x32 quantization block size
-            reduction does not span multiple tiles
-        d. `full_tile_multiple_of=(128, 128)` to ensure that a mxfp8|nvfp4 scale
-            swizzle does not span multiple tiles
+    1. `f` must place restrictions on tile size to ensure quantization
+        validity and correctness, via `valid_tile_size_fn` (and optionally
+        `pad_input_to_multiple_of` to align a ragged input first). Examples of what
+        `valid_tile_size_fn(tensor_size, actual_tile_size, padded_tile_size)` can express:
+        a. rowwise quant: `actual_tile_size[1] == tensor_size[1]` (each tile spans all
+            columns). Note that a spanning tile is incompatible with an efficient gemm epilogue.
+        b. a 1x32 reduction block staying inside a tile: `actual_tile_size[1] % 32 == 0`
+            (checked on the real edge extent).
+        c. an mxfp8|nvfp4 scale swizzle atom not crossing a tile: `padded_tile_size[0] % 128 == 0`
+            (checked on the nominal size, so ragged edge tiles are exempt).
     2. `f` can optionally take a tile's position in the parent tensor
-        with `global_row, global_col, num_col` kwargs to implement tile-invariant 
+        with `global_row, global_col, num_col` kwargs to implement tile-invariant
         per-element randomness for stochastic rounding.
-       
+
 
     Args:
         input: the 2D tensor to cast. Rank 2 only.
@@ -204,15 +189,14 @@ def flex_tile_map(
         pad_input_to_multiple_of: if given, `(mult0, mult1)` -- zero-pad each `input` dim up to a
             multiple of `mult{0,1}` on load (for ragged shapes, e.g. LLM decode/prefill token
             dims). Outputs come back at the padded shape. `None` (default) does no padding.
-        tile_must_span_dim: which dim, if any, a tile must fully span
-            - TileMustSpanDim.NONE (default) - no restrictions
-            - TileMustSpanDim.DIM0 - given input shape [M, N], each tile must be shaped [M, {anything}]
-            - TileMustSpanDim.DIM1 - given input shape [M, N], each tile must be shaped [{anything}, N]
-        tile_multiple_of: if given, `(mult0, mult1)` -- assert every tile's size is a multiple of
-            `mult{0,1}` (a per-dim block/reduction granularity `f` requires). `None` skips the check.
-        full_tile_multiple_of: like `tile_multiple_of` but applies only to full (non-edge) tiles
-            (e.g. the 128x128 swizzle atom, which edge/remainder tiles are exempt from).
-        _backend: debug backend. 
+        valid_tile_size_fn: `(tensor_size, actual_tile_size, padded_tile_size) -> bool` (all
+            `(dim0, dim1)` int tuples). The framework searches candidate tile sizes and picks one
+            whose predicate holds on EVERY tile; if none does it raises (pad first). `tensor_size`
+            is the full (post-pad) shape; `actual_tile_size` is this tile's real (ragged at the
+            bottom/right edge) extent; `padded_tile_size` is the nominal tile size it's a clamped
+            instance of. Constrain `actual` for reduction granularity (edges included) and `padded`
+            for a swizzle atom (edges exempt). `None` (default) means any tile size is valid.
+        _backend: debug backend.
             REFERENCE runs `f` on the whole tensor without tiling
             MANUAL_TILE is a debug backend that tiles the input in tiles of 256x256
             We don't have a real backend yet
@@ -235,8 +219,9 @@ def flex_tile_map(
         ...     return qdata.reshape(*lead, last), scale.squeeze(-1)
         >>>
         >>> x = torch.randn(1024, 512, dtype=torch.bfloat16, device="cuda")
-        >>> # tile_multiple_of=(1, 128): keep each 1x128 reduction group inside one tile.
-        >>> qdata, scale = flex_tile_map(x, deepseek_1x128_f, tile_multiple_of=(1, 128))
+        >>> # keep each 1x128 reduction group inside one tile (check the real edge extent).
+        >>> valid = lambda ts, actual, padded: actual[1] % 128 == 0
+        >>> qdata, scale = flex_tile_map(x, deepseek_1x128_f, valid_tile_size_fn=valid)
         >>> qdata.shape, scale.shape
         (torch.Size([1024, 512]), torch.Size([1024, 4]))
 
@@ -253,14 +238,12 @@ def flex_tile_map(
         if pad_input_to_multiple_of is not None:
             input = _pad_to_multiple(input, pad_input_to_multiple_of)
 
-        # verify that tile constraints are respected, if specified
-        if tile_multiple_of is not None:
-            M, K = input.shape
-            assert M % tile_multiple_of[0] == 0
-            assert K % tile_multiple_of[1] == 0
-
-        # full_tile_multiple_of is satisfied automatically as there is only
-        # one tile
+        # the whole tensor is a single tile: actual == padded == tensor_size.
+        if valid_tile_size_fn is not None:
+            ts = tuple(input.shape)
+            assert valid_tile_size_fn(ts, ts, ts), (
+                f"valid_tile_size_fn rejects the whole-tensor tile {ts} under REFERENCE"
+            )
 
         # one tile == whole tensor, so every aux is presented whole (REPLICATE) and the tile
         # origin is (0, 0). num_col is the (post-swap, post-pad) row stride.
@@ -274,15 +257,44 @@ def flex_tile_map(
             aux_kinds,
             output_kinds,
             pad_input_to_multiple_of,
-            tile_must_span_dim,
-            tile_multiple_of,
-            full_tile_multiple_of,
+            valid_tile_size_fn,
         )
 
     else:
         raise AssertionError(f"unknown {_backend=}")
 
     return outs
+
+
+def _choose_tile_size(tensor_shape, valid_tile_size_fn, base=256):
+    """Pick a (tile_size_0, tile_size_1) whose predicate holds on EVERY tile it produces.
+
+    Candidates per dim are {min(base, extent), extent} (the base tile and full-span). We try the
+    smaller (more parallel) sizes first, and for each candidate enumerate the tiles it produces --
+    each with a nominal `padded` size and its real (ragged-at-edge) `actual` size -- accepting the
+    candidate iff `valid_tile_size_fn(tensor_shape, actual, padded)` is True for all. Raises if no
+    candidate works (pad the input to a compatible shape first). `None` => `base` per dim, no check.
+    """
+    M, N = tensor_shape
+    if valid_tile_size_fn is None:
+        return (min(base, M), min(base, N))
+
+    cands0 = sorted({min(base, M), M})
+    cands1 = sorted({min(base, N), N})
+    for t0 in cands0:
+        for t1 in cands1:
+            padded = (t0, t1)
+            ok = all(
+                valid_tile_size_fn(tensor_shape, (min(t0, M - r), min(t1, N - c)), padded)
+                for r in range(0, M, t0)
+                for c in range(0, N, t1)
+            )
+            if ok:
+                return (t0, t1)
+    raise ValueError(
+        f"no valid tile size for input {tensor_shape} under valid_tile_size_fn "
+        f"(tried {cands0} x {cands1}); consider pad_input_to_multiple_of"
+    )
 
 
 def _manual_tile(
@@ -292,36 +304,24 @@ def _manual_tile(
     aux_kinds: Tuple[AuxKind, ...] = (),
     output_kinds: Tuple[OutputKind, ...] | None = None,
     pad_input_to_multiple_of: Tuple[int, int] | None = None,
-    tile_must_span_dim: TileMustSpanDim = TileMustSpanDim.NONE,
-    tile_multiple_of: Tuple[int, int] | None = None,
-    full_tile_multiple_of: Tuple[int, int] | None = None,
+    valid_tile_size_fn: Callable[
+        [Tuple[int, int], Tuple[int, int], Tuple[int, int]], bool
+    ] | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Tile `input`, run `f` on each tile, and recompose (debug backend). Uses 2D tiles by
-    default; `tile_must_span_dim` can make a dim span the tensor (for rowwise/colwise reductions).
+    """Tile `input`, run `f` on each tile, and recompose (debug backend). Tile size is chosen by
+    searching candidates against `valid_tile_size_fn` (defaults to 256 per dim when unconstrained).
     """
     assert input.ndim == 2, f"MANUAL_TILE expects a 2D input, got {input.ndim}D"
 
-    # pad input first, so the whole pipeline (constraint asserts, fake-probe output shapes,
+    # pad input first, so the whole pipeline (tile-size search, fake-probe output shapes,
     # preallocation, tiling offsets) all key off the padded shape.
     # TODO(future): move this inside the tiling logic
     if pad_input_to_multiple_of is not None:
         input = _pad_to_multiple(input, pad_input_to_multiple_of)
 
-    # choose tile size: 256 per dim, except a dim that must span the tensor uses the full
-    # (post-pad) extent, so `f`'s reduction over that whole dim is never severed by tiling.
-    # TODO(future): make the 256 configurable.
-    tile_size_0 = input.shape[0] if tile_must_span_dim is TileMustSpanDim.DIM0 else 256
-    tile_size_1 = input.shape[1] if tile_must_span_dim is TileMustSpanDim.DIM1 else 256
-
-    # verify tiling constraints are honored
-    if tile_multiple_of is not None:
-        assert tile_size_0 % tile_multiple_of[0] == 0
-        assert tile_size_1 % tile_multiple_of[1] == 0
-        assert input.shape[0] % tile_multiple_of[0] == 0
-        assert input.shape[1] % tile_multiple_of[1] == 0
-    if full_tile_multiple_of is not None:
-        assert tile_size_0 % full_tile_multiple_of[0] == 0
-        assert tile_size_1 % full_tile_multiple_of[1] == 0
+    # choose the tile size: search candidate sizes against the recipe's predicate.
+    # TODO(future): make the base 256 configurable / the candidate set richer.
+    tile_size_0, tile_size_1 = _choose_tile_size(tuple(input.shape), valid_tile_size_fn)
 
     # Preallocate-then-scatter: infer each output's global shape/dtype by running `f` on a
     # FakeTensor of the full input, preallocate the outputs, then write each tile's local
