@@ -28,8 +28,11 @@ class Recipe:
 
     quant: Callable
     dequant: Callable
-    tile_multiple_of: Tuple[int, int] | None = None
-    full_tile_multiple_of: Tuple[int, int] | None = None
+    # per-recipe tiling constraint: (tensor_size, actual_tile_size, padded_tile_size) -> bool.
+    # None => any tile size is valid. See flex_tile_map's `valid_tile_size_fn`.
+    valid_tile_size_fn: Callable[
+        [Tuple[int, int], Tuple[int, int], Tuple[int, int]], bool
+    ] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -238,18 +241,17 @@ def deepseek_1x128_dim_m_f(x, **kwargs):
 # The recipes: rowwise / colwise fp8 (one scale per row / per column).
 #
 # The scale reduces over an ENTIRE row (rowwise) or column (colwise), so these are only
-# tile-invariant when the reduced dim is never severed by tiling: the caller must pass
-# tile_must_span_dim=DIM1 for rowwise (each tile spans all columns) or DIM0
-# for colwise (each tile spans all rows). Under the wrong tiling mode a tile would see only part
-# of the row/column and compute the wrong amax. No block constraint (the full row/col is the
-# reduction unit); spanning is enforced by tile_must_span_dim, not tile_multiple_of.
+# tile-invariant when the reduced dim is never severed by tiling: the recipe's valid_tile_size_fn
+# requires the tile to span all columns (rowwise, `actual[1] == tensor[1]`) or all rows (colwise,
+# `actual[0] == tensor[0]`), which makes the framework's tile-size search pick a full-span tile.
+# Under a non-spanning tile a tile would see only part of the row/column and compute the wrong amax.
 #
 # colwise additionally transposes its outputs locally and is paired with
 # output_kinds=SWAP_TILE_INDEX (like the dim-M recipe) to emit the transposed (N, M) layout;
 # rowwise emits the native (M, N) layout (no swap).
 # ---------------------------------------------------------------------------
 def rowwise_fp8_f(x, **kwargs):
-    """Rowwise fp8: one fp32 scale per row (amax over all columns). Use tile_must_span_dim=DIM1."""
+    """Rowwise fp8: one fp32 scale per row (amax over all columns). Tile must span all columns."""
     fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
     amax = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-12).to(torch.float32)  # (M, 1)
     scale = (amax / fp8_max).to(torch.float32)
@@ -262,7 +264,7 @@ def rowwise_fp8_dq_f(q, scale):
 
 
 def colwise_fp8_f(x, **kwargs):
-    """Colwise fp8: one fp32 scale per column (amax over all rows). Use tile_must_span_dim=DIM0.
+    """Colwise fp8: one fp32 scale per column (amax over all rows). Tile must span all rows.
 
     Writes both outputs transposed locally (q -> (N, M), scale -> (N, 1)); pair with
     output_kinds=SWAP_TILE_INDEX so the framework's grid swap yields the transposed (N, M) layout.
@@ -282,10 +284,10 @@ def colwise_fp8_dq_f(q, scale):
 # ---------------------------------------------------------------------------
 # The recipe: rowwise fp8 with a PRECALCULATED per-row scale (AuxKind.ROW).
 #
-# Unlike rowwise_fp8_f (which reduces the row itself, needing tile_must_span_dim=DIM1), here the
-# (M, 1) per-row scale is computed OUTSIDE and passed as an AuxKind.ROW aux input. `f` only does
+# Unlike rowwise_fp8_f (which reduces the row itself, needing a full-column-spanning tile), here
+# the (M, 1) per-row scale is computed OUTSIDE and passed as an AuxKind.ROW aux input. `f` only does
 # the divide, which is tile-invariant under plain 2D tiling (each tile receives its rows' slice
-# of the scale, broadcast across its columns) -- so no tile_must_span_dim restriction is needed.
+# of the scale, broadcast across its columns) -- so no tiling constraint is needed.
 # `rowwise_precalc_scale` is the global row-reduction that lives outside flex_tile_map.
 # ---------------------------------------------------------------------------
 def rowwise_precalc_scale(x):
@@ -312,7 +314,7 @@ def rowwise_precalc_dq_f(q, scale):
 # and passed as an AuxKind.COL aux input (each tile gets its columns' slice, broadcast across
 # rows). `f` divides and writes its tile output TRANSPOSED-contiguous; paired with
 # output_kinds=SWAP_TILE_INDEX (like colwise_fp8_f), the framework's grid swap yields the
-# transposed (N, M) layout. Tile-invariant under plain 2D tiling -- no tile_must_span_dim needed.
+# transposed (N, M) layout. Tile-invariant under plain 2D tiling -- no tiling constraint needed.
 # ---------------------------------------------------------------------------
 def colwise_precalc_scale(x):
     """Per-column fp32 scale (col reduction; computed outside flex_tile_map). Returns (1, N)."""
@@ -528,46 +530,57 @@ def mxfp8_bias_f(x, bias, **kwargs):
     return mxfp8_floor_f(x + bias.to(x.dtype))
 
 
+# Reduction constraints check `actual` (the real, possibly-ragged tile extent) so a severed
+# reduction block is rejected at the edge; swizzle-atom constraints check `padded` (the nominal
+# tile size, so ragged edge tiles are exempt -- recovers the old full_tile_multiple_of semantics).
 DEEPSEEK_1X128 = Recipe(
     quant=deepseek_1x128_f,
     dequant=deepseek_1x128_dq_f,
-    tile_multiple_of=(1, 128),
+    valid_tile_size_fn=lambda ts, a, p: a[1] % 128 == 0,
 )
 DEEPSEEK_128X128 = Recipe(
-    quant=deepseek_128x128_f, 
+    quant=deepseek_128x128_f,
     dequant=deepseek_128x128_dq_f,
-    tile_multiple_of=(128, 128),
+    valid_tile_size_fn=lambda ts, a, p: a[0] % 128 == 0 and a[1] % 128 == 0,
 )
 # dim-M: `f` transposes the tile + reduces last dim; caller pairs it with
 # output_kinds=SWAP_TILE_INDEX for the grid transpose. dequant is the plain 1x128 dequant (it
 # works in the (K, M) transposed frame); the test transposes the dequant result back to (M, N).
-# tile_multiple_of=(128, 1): after the within-tile transpose the reduced (last) dim is the tile's
-# original ROWS, so rows must be a 128-multiple.
+# After the within-tile transpose the reduced (last) dim is the tile's original ROWS, so rows
+# must be a 128-multiple (checked on `actual`).
 DEEPSEEK_1X128_DIM_M = Recipe(
     quant=deepseek_1x128_dim_m_f,
     dequant=deepseek_1x128_dq_f,
-    tile_multiple_of=(128, 1),
+    valid_tile_size_fn=lambda ts, a, p: a[0] % 128 == 0,
 )
-# rowwise / colwise: no block constraint; the caller enforces spanning via tile_must_span_dim
-# (DIM1 for rowwise, DIM0 for colwise).
-ROWWISE_FP8 = Recipe(quant=rowwise_fp8_f, dequant=rowwise_fp8_dq_f)
-COLWISE_FP8 = Recipe(quant=colwise_fp8_f, dequant=colwise_fp8_dq_f)
+# rowwise / colwise: the tile must span the reduced dim (predicate forces it to equal the tensor
+# extent), so the framework's tile-size search selects a full-span tile.
+ROWWISE_FP8 = Recipe(
+    quant=rowwise_fp8_f,
+    dequant=rowwise_fp8_dq_f,
+    valid_tile_size_fn=lambda ts, a, p: a[1] == ts[1],  # span all columns
+)
+COLWISE_FP8 = Recipe(
+    quant=colwise_fp8_f,
+    dequant=colwise_fp8_dq_f,
+    valid_tile_size_fn=lambda ts, a, p: a[0] == ts[0],  # span all rows
+)
 # rowwise with a precalculated (M, 1) scale passed as an AuxKind.ROW aux input; the divide is
-# tile-invariant under plain 2D tiling (no tile_must_span_dim needed).
+# tile-invariant under plain 2D tiling (no tiling constraint needed).
 ROWWISE_PRECALC = Recipe(quant=rowwise_precalc_f, dequant=rowwise_precalc_dq_f)
 # colwise with a precalculated (1, N) scale (AuxKind.COL) + transposed-contiguous output (pair
 # with output_kinds=SWAP_TILE_INDEX); tile-invariant under plain 2D tiling.
 COLWISE_PRECALC = Recipe(quant=colwise_precalc_f, dequant=colwise_precalc_dq_f)
 MXFP8_FLOOR = Recipe(
-    quant=mxfp8_floor_f, 
+    quant=mxfp8_floor_f,
     dequant=mxfp8_floor_dq_f,
-    tile_multiple_of=(1, 32),
+    valid_tile_size_fn=lambda ts, a, p: a[1] % 32 == 0,
 )
+# reduction (1x32) checked on `actual`; swizzle atom (128x128) checked on `padded` (edge-exempt).
 MXFP8_FLOOR_SWIZZLE = Recipe(
-    quant=mxfp8_floor_swizzle_f, 
+    quant=mxfp8_floor_swizzle_f,
     dequant=mxfp8_floor_swizzle_dq_f,
-    tile_multiple_of=(1, 32),
-    full_tile_multiple_of=(128, 128),  # 128x128 to enforce that each scale swizzle does not cross tile boundaries
+    valid_tile_size_fn=lambda ts, a, p: a[1] % 32 == 0 and p[0] % 128 == 0 and p[1] % 128 == 0,
 )
 
 
@@ -581,11 +594,11 @@ FLOAT8_TENSORWISE = Recipe(
 
 # nvfp4 recipe: the per-tensor outer scale is computed outside (via nvfp4_gs_scale) and passed
 # to flex_tile_map / dequant as an explicit aux input (AuxKind.REPLICATE), not bound here.
+# reduction (1x16 inner) on `actual`; swizzle atom (128x64) on `padded` (edge-exempt).
 NVFP4_GS_SWIZZLE = Recipe(
     quant=nvfp4_gs_swizzle_f,
     dequant=nvfp4_gs_swizzle_dq_f,
-    tile_multiple_of=(1, 16),
-    full_tile_multiple_of=(128, 64),  # 128x64 to enforce that each scale swizzle does not cross tile boundaries
+    valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0 and p[0] % 128 == 0 and p[1] % 64 == 0,
 )
 
 
@@ -595,8 +608,7 @@ NVFP4_GS_SWIZZLE = Recipe(
 NVFP4_BLOCKED_OUTER = Recipe(
     quant=nvfp4_blocked_outer_f,
     dequant=nvfp4_blocked_outer_dq_f,
-    tile_multiple_of=(1, 16),
-    full_tile_multiple_of=(128, 64),
+    valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0 and p[0] % 128 == 0 and p[1] % 64 == 0,
 )
 
 
@@ -605,7 +617,7 @@ NVFP4_BLOCKED_OUTER = Recipe(
 MXFP8_BIAS = Recipe(
     quant=mxfp8_bias_f,
     dequant=mxfp8_floor_dq_f,
-    tile_multiple_of=(1, 32),
+    valid_tile_size_fn=lambda ts, a, p: a[1] % 32 == 0,
 )
 
 

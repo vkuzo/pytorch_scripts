@@ -9,7 +9,7 @@ import torch
 import torch.func._random as prng
 import torch.nn.functional as F
 
-from api import AuxKind, FlexTileMapBackend, OutputKind, TileMustSpanDim, flex_tile_map
+from api import AuxKind, FlexTileMapBackend, OutputKind, flex_tile_map
 from recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
@@ -92,7 +92,7 @@ def test_float8_tensorwise_matches_reference():
         FLOAT8_TENSORWISE.quant,
         aux_inputs=(scale,),
         aux_kinds=(AuxKind.REPLICATE,),
-        tile_multiple_of=FLOAT8_TENSORWISE.tile_multiple_of,
+        valid_tile_size_fn=FLOAT8_TENSORWISE.valid_tile_size_fn,
     )
     qdata_ref, scale_ref = float8_tensorwise_f(x, scale)
 
@@ -132,8 +132,7 @@ def test_nvfp4_gs_swizzle_matches_reference():
         NVFP4_GS_SWIZZLE.quant,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.REPLICATE,),
-        tile_multiple_of=NVFP4_GS_SWIZZLE.tile_multiple_of,
-        full_tile_multiple_of=NVFP4_GS_SWIZZLE.full_tile_multiple_of,
+        valid_tile_size_fn=NVFP4_GS_SWIZZLE.valid_tile_size_fn,
     )
     qdata_ref, scale_ref = nvfp4_gs_swizzle_f(x, outer)
 
@@ -156,8 +155,7 @@ def test_nvfp4_gs_swizzle_backends_match():
     kw = dict(
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.REPLICATE,),
-        tile_multiple_of=NVFP4_GS_SWIZZLE.tile_multiple_of,
-        full_tile_multiple_of=NVFP4_GS_SWIZZLE.full_tile_multiple_of,
+        valid_tile_size_fn=NVFP4_GS_SWIZZLE.valid_tile_size_fn,
     )
     qdata_ref, scale_ref = flex_tile_map(
         x, NVFP4_GS_SWIZZLE.quant, _backend=FlexTileMapBackend.REFERENCE, **kw
@@ -183,8 +181,7 @@ def test_nvfp4_gs_swizzle_sqnr_vs_high_precision():
         NVFP4_GS_SWIZZLE.quant,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.REPLICATE,),
-        tile_multiple_of=NVFP4_GS_SWIZZLE.tile_multiple_of,
-        full_tile_multiple_of=NVFP4_GS_SWIZZLE.full_tile_multiple_of,
+        valid_tile_size_fn=NVFP4_GS_SWIZZLE.valid_tile_size_fn,
     )
     x_hat = NVFP4_GS_SWIZZLE.dequant(qdata, scale, outer)
     # nvfp4 is 4-bit, coarser than fp8/mxfp8, so a lower SQNR floor.
@@ -323,8 +320,7 @@ def test_matches_reference(recipe, scale_shape, scale_dtype, qdata_dtype):
     qdata, scale = flex_tile_map(
         x,
         recipe.quant,
-        tile_multiple_of=recipe.tile_multiple_of,
-        full_tile_multiple_of=recipe.full_tile_multiple_of,
+        valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
     qdata_ref, scale_ref = recipe.quant(x)
 
@@ -353,15 +349,13 @@ def test_backends_match(recipe, flat_compare):
         x,
         recipe.quant,
         _backend=FlexTileMapBackend.REFERENCE,
-        tile_multiple_of=recipe.tile_multiple_of,
-        full_tile_multiple_of=recipe.full_tile_multiple_of,
+        valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
     qdata_tile, scale_tile = flex_tile_map(
         x,
         recipe.quant,
         _backend=FlexTileMapBackend.MANUAL_TILE,
-        tile_multiple_of=recipe.tile_multiple_of,
-        full_tile_multiple_of=recipe.full_tile_multiple_of,
+        valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
 
     assert _qdata_equal(qdata_tile, qdata_ref)
@@ -384,8 +378,7 @@ def test_sqnr_vs_high_precision(recipe, sqnr_min):
     qdata, scale = flex_tile_map(
         x,
         recipe.quant,
-        tile_multiple_of=recipe.tile_multiple_of,
-        full_tile_multiple_of=recipe.full_tile_multiple_of,
+        valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
     x_hat = recipe.dequant(qdata, scale)
     sqnr = _compute_error(x.float(), x_hat.float())
@@ -406,7 +399,7 @@ def test_deepseek_dim_m_matches_reference():
         x,
         DEEPSEEK_1X128_DIM_M.quant,
         output_kinds=_DIM_M_SWAP,
-        tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of,
+        valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn,
     )
     # reference: the old SWAP_0_AND_1_AXES layout == plain 1x128 on the transposed input.
     qdata_ref, scale_ref = deepseek_1x128_dim_m_f(x)
@@ -420,7 +413,7 @@ def test_deepseek_dim_m_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    kw = dict(output_kinds=_DIM_M_SWAP, tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of)
+    kw = dict(output_kinds=_DIM_M_SWAP, valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn)
     qr, sr = flex_tile_map(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
     qt, st = flex_tile_map(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert _qdata_equal(qt, qr)
@@ -434,7 +427,7 @@ def test_deepseek_dim_m_non_square():
     torch.manual_seed(0)
     x = torch.randn(384, 512, dtype=torch.bfloat16, device="cuda")
 
-    kw = dict(output_kinds=_DIM_M_SWAP, tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of)
+    kw = dict(output_kinds=_DIM_M_SWAP, valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn)
     qr, sr = flex_tile_map(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
     qt, st = flex_tile_map(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert qr.shape == (512, 384)  # grid-transposed
@@ -451,7 +444,7 @@ def test_deepseek_dim_m_sqnr():
         x,
         DEEPSEEK_1X128_DIM_M.quant,
         output_kinds=_DIM_M_SWAP,
-        tile_multiple_of=DEEPSEEK_1X128_DIM_M.tile_multiple_of,
+        valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn,
     )
     # dequant works in the (K, M) transposed frame; transpose back to compare with x.
     x_hat = DEEPSEEK_1X128_DIM_M.dequant(qdata, scale).t()
@@ -459,13 +452,13 @@ def test_deepseek_dim_m_sqnr():
 
 
 # rowwise / colwise fp8: the scale reduces over a whole row/column, so tiling must span that dim
-# (tile_must_span_dim=DIM1 for rowwise, DIM0 for colwise). REFERENCE ==
+# (valid_tile_size_fn forces the tile to span all columns / all rows). REFERENCE ==
 # MANUAL_TILE bit-exact proves the spanning tile keeps the full-dim reduction intact.
 def test_rowwise_fp8_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    kw = dict(tile_must_span_dim=TileMustSpanDim.DIM1)
+    kw = dict(valid_tile_size_fn=ROWWISE_FP8.valid_tile_size_fn)
     qr, sr = flex_tile_map(x, ROWWISE_FP8.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
     qt, st = flex_tile_map(x, ROWWISE_FP8.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert sr.shape == (512, 1)
@@ -477,14 +470,16 @@ def test_rowwise_fp8_sqnr():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_tile_map(x, ROWWISE_FP8.quant, tile_must_span_dim=TileMustSpanDim.DIM1)
+    qdata, scale = flex_tile_map(
+        x, ROWWISE_FP8.quant, valid_tile_size_fn=ROWWISE_FP8.valid_tile_size_fn
+    )
     x_hat = ROWWISE_FP8.dequant(qdata, scale)
     assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 
 # rowwise with a PRECALCULATED (M, 1) scale passed as an AuxKind.ROW aux input. The divide is
 # tile-invariant under plain 2D tiling (each tile gets its rows' slice of the scale, broadcast
-# across columns), so -- unlike ROWWISE_FP8 -- no tile_must_span_dim is needed.
+# across columns), so -- unlike ROWWISE_FP8 -- no tiling constraint is needed.
 def test_rowwise_precalc_row_aux_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
@@ -559,7 +554,7 @@ def test_colwise_fp8_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
 
-    kw = dict(tile_must_span_dim=TileMustSpanDim.DIM0, output_kinds=_COLWISE_SWAP)
+    kw = dict(valid_tile_size_fn=COLWISE_FP8.valid_tile_size_fn, output_kinds=_COLWISE_SWAP)
     qr, sr = flex_tile_map(x, COLWISE_FP8.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
     qt, st = flex_tile_map(x, COLWISE_FP8.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert qr.shape == (384, 512)  # transposed (N, M)
@@ -573,7 +568,10 @@ def test_colwise_fp8_sqnr():
     x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
 
     qdata, scale = flex_tile_map(
-        x, COLWISE_FP8.quant, tile_must_span_dim=TileMustSpanDim.DIM0, output_kinds=_COLWISE_SWAP
+        x,
+        COLWISE_FP8.quant,
+        valid_tile_size_fn=COLWISE_FP8.valid_tile_size_fn,
+        output_kinds=_COLWISE_SWAP,
     )
     # outputs are in the transposed (N, M) frame; dequant then transpose back to compare with x.
     x_hat = COLWISE_FP8.dequant(qdata, scale).t()
@@ -589,6 +587,32 @@ def _ceil_to(v, m):
     return ((v + m - 1) // m) * m
 
 
+def test_valid_tile_size_fn_unsatisfiable_raises_then_pad_fixes():
+    # deepseek's predicate (actual[1] % 128 == 0) can't be satisfied on a ragged 512x300 (the
+    # 44-wide edge fails, and spanning 300 fails too) -> the tile-size search raises. Padding the
+    # columns up to a multiple of 128 makes it satisfiable.
+    torch.manual_seed(0)
+    x = torch.randn(512, 300, dtype=torch.bfloat16, device="cuda")
+
+    with pytest.raises(ValueError):
+        flex_tile_map(
+            x,
+            DEEPSEEK_1X128.quant,
+            valid_tile_size_fn=DEEPSEEK_1X128.valid_tile_size_fn,
+            _backend=FlexTileMapBackend.MANUAL_TILE,
+        )
+
+    # pad N 300 -> 384 (multiple of 128); now every tile's column extent is 128-aligned.
+    qdata, scale = flex_tile_map(
+        x,
+        DEEPSEEK_1X128.quant,
+        valid_tile_size_fn=DEEPSEEK_1X128.valid_tile_size_fn,
+        pad_input_to_multiple_of=(1, 128),
+        _backend=FlexTileMapBackend.MANUAL_TILE,
+    )
+    assert qdata.shape == (512, 384)  # returned at the padded shape
+
+
 def test_pad_ref_shapes_swizzle():
     # ragged 200x300 padded to (128,128)-multiple -> (256, 384); swizzle grid nrb=2, ncb=3.
     torch.manual_seed(0)
@@ -597,8 +621,7 @@ def test_pad_ref_shapes_swizzle():
         x,
         MXFP8_FLOOR_SWIZZLE.quant,
         pad_input_to_multiple_of=(128, 128),
-        tile_multiple_of=MXFP8_FLOOR_SWIZZLE.tile_multiple_of,
-        full_tile_multiple_of=MXFP8_FLOOR_SWIZZLE.full_tile_multiple_of,
+        valid_tile_size_fn=MXFP8_FLOOR_SWIZZLE.valid_tile_size_fn,
     )
     assert qdata.shape == (256, 384)
     assert scale.shape == (2, 3, 32, 16)
@@ -620,8 +643,7 @@ def test_pad_backends_match(recipe, pad_to):
     x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
     kw = dict(
         pad_input_to_multiple_of=pad_to,
-        tile_multiple_of=recipe.tile_multiple_of,
-        full_tile_multiple_of=recipe.full_tile_multiple_of,
+        valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
     qdata_ref, scale_ref = flex_tile_map(x, recipe.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
     qdata_tile, scale_tile = flex_tile_map(x, recipe.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
@@ -638,7 +660,7 @@ def test_pad_matches_manual_pad():
         x,
         MXFP8_FLOOR.quant,
         pad_input_to_multiple_of=(1, 32),
-        tile_multiple_of=MXFP8_FLOOR.tile_multiple_of,
+        valid_tile_size_fn=MXFP8_FLOOR.valid_tile_size_fn,
     )
     # manual pad: 200 stays (mult of 1), 300 -> 320 (mult of 32); high-edge zero pad.
     x_padded = F.pad(x, (0, _ceil_to(300, 32) - 300, 0, 0))
@@ -660,8 +682,7 @@ def test_nvfp4_blocked_outer_matches_reference():
         NVFP4_BLOCKED_OUTER.quant,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.TILE,),
-        tile_multiple_of=NVFP4_BLOCKED_OUTER.tile_multiple_of,
-        full_tile_multiple_of=NVFP4_BLOCKED_OUTER.full_tile_multiple_of,
+        valid_tile_size_fn=NVFP4_BLOCKED_OUTER.valid_tile_size_fn,
     )
     qdata_ref, scale_ref = nvfp4_blocked_outer_f(x, outer)
 
@@ -681,8 +702,7 @@ def test_nvfp4_blocked_outer_backends_match():
     kw = dict(
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.TILE,),
-        tile_multiple_of=NVFP4_BLOCKED_OUTER.tile_multiple_of,
-        full_tile_multiple_of=NVFP4_BLOCKED_OUTER.full_tile_multiple_of,
+        valid_tile_size_fn=NVFP4_BLOCKED_OUTER.valid_tile_size_fn,
     )
     qdata_ref, scale_ref = flex_tile_map(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
     qdata_tile, scale_tile = flex_tile_map(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
@@ -702,8 +722,7 @@ def test_nvfp4_blocked_outer_sqnr_vs_high_precision():
         NVFP4_BLOCKED_OUTER.quant,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.TILE,),
-        tile_multiple_of=NVFP4_BLOCKED_OUTER.tile_multiple_of,
-        full_tile_multiple_of=NVFP4_BLOCKED_OUTER.full_tile_multiple_of,
+        valid_tile_size_fn=NVFP4_BLOCKED_OUTER.valid_tile_size_fn,
     )
     x_hat = NVFP4_BLOCKED_OUTER.dequant(qdata, scale, outer)
     assert _compute_error(x.float(), x_hat.float()) > 12.0
@@ -715,7 +734,7 @@ def test_mxfp8_bias_backends_match():
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    kw = dict(aux_inputs=(bias,), aux_kinds=(AuxKind.TILE,), tile_multiple_of=MXFP8_BIAS.tile_multiple_of)
+    kw = dict(aux_inputs=(bias,), aux_kinds=(AuxKind.TILE,), valid_tile_size_fn=MXFP8_BIAS.valid_tile_size_fn)
     qdata_ref, scale_ref = flex_tile_map(x, MXFP8_BIAS.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
     qdata_tile, scale_tile = flex_tile_map(x, MXFP8_BIAS.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
 
