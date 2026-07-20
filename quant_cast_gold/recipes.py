@@ -387,19 +387,15 @@ ColwisePrecalcGold = QuantCastSingleKernelGold(
 # reconstructs the pow2 factor by shifting the biased exponent back into the fp32 exponent
 # field.
 # ---------------------------------------------------------------------------
-def mxfp8_floor_f(x, **kwargs):
+def _amax_to_e8m0_floor(amax):
+    """amax (any shape) -> e8m0 (float8_e8m0fnu) power-of-two block scale via FLOOR: extract
+    amax's fp32 exponent by integer bit-ops (no log2). Shared by the mxfp8-floor recipes."""
     e8m0_exponent_bias = 127
     f32_exp_bias = 127
     mbits_f32 = 23
     f8e4m3_max_pow2 = 8
-    f32_min_normal = 2.0**-126
     e8m0_nan = 255
 
-    *lead, last = x.shape
-    x_b = x.reshape(*lead, last // 32, 32)
-    amax = x_b.abs().amax(dim=-1, keepdim=True)
-
-    # amax -> e8m0 block scale (FLOOR): extract fp32 exponent by integer bit-ops.
     max_abs = amax.to(torch.float32)
     max_abs_int32 = max_abs.view(torch.int32)
     extracted_pow2 = ((max_abs_int32 >> mbits_f32) & 0xFF) - f32_exp_bias
@@ -411,22 +407,24 @@ def mxfp8_floor_f(x, **kwargs):
     scale_biased = torch.where(
         torch.isnan(max_abs), torch.full_like(scale_biased, e8m0_nan), scale_biased
     )
-    scale_e8m0 = scale_biased.view(torch.float8_e8m0fnu)
-
-    # cast: reconstruct the fp32 pow2 factor from the e8m0 biased exponent, then divide.
-    biased_i32 = scale_e8m0.view(torch.uint8).to(torch.int32)
-    scale_fp32 = (biased_i32 << mbits_f32).view(torch.float32)
-    scale_fp32 = torch.clamp(scale_fp32, min=f32_min_normal)
-    qdata = (x_b.to(torch.float32) / scale_fp32).to(torch.float8_e4m3fn)
-
-    return qdata.reshape(*lead, last), scale_e8m0.squeeze(-1)
+    return scale_biased.view(torch.float8_e8m0fnu)
 
 
 def _e8m0_to_fp32(scale):
-    # inverse of mxfp8_floor_f's cast: e8m0 biased exponent -> fp32 pow2 factor.
+    # inverse of the e8m0 cast: e8m0 biased exponent -> fp32 pow2 factor.
     biased_i32 = scale.contiguous().view(torch.uint8).to(torch.int32)
     scale_fp32 = (biased_i32 << 23).view(torch.float32)
     return torch.clamp(scale_fp32, min=2.0**-126)
+
+
+def mxfp8_floor_f(x, **kwargs):
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 32, 32)
+    amax = x_b.abs().amax(dim=-1, keepdim=True)
+    scale_e8m0 = _amax_to_e8m0_floor(amax)
+    # cast: reconstruct the fp32 pow2 factor from the e8m0 scale, then divide.
+    qdata = (x_b.to(torch.float32) / _e8m0_to_fp32(scale_e8m0)).to(torch.float8_e4m3fn)
+    return qdata.reshape(*lead, last), scale_e8m0.squeeze(-1)
 
 
 def mxfp8_floor_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -457,6 +455,47 @@ Mxfp8FloorGold = QuantCastSingleKernelGold(
     correctness_fn=_mxfp8_floor_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(1,32) block",
+)
+
+
+# ---------------------------------------------------------------------------
+# Golden recipe: mxfp8 FLOOR, reduced across M (32x1 blocks), transposed output.
+# Same math as mxfp8_floor_f but the 1x32 e8m0 block runs down M; mirrors deepseek_1x128_dim_m_f.
+# ---------------------------------------------------------------------------
+def mxfp8_floor_dim_m_f(x, **kwargs):
+    """dim-M mxfp8 floor: reshape rows into 32-blocks and reduce down M (dim1 of the block view),
+    then write both outputs transposed-contiguous (pair with OutputKind.SWAP_TILE_INDEX on both).
+    Inlined from mxfp8_floor_f reducing the other axis, like deepseek_1x128_dim_m_f relative to
+    deepseek_1x128_f."""
+    M, N = x.shape
+    x_b = x.reshape(M // 32, 32, N)
+    amax = x_b.abs().amax(dim=1, keepdim=True)  # (M//32, 1, N), reduce down M
+    scale_e8m0 = _amax_to_e8m0_floor(amax)  # (M//32, 1, N)
+    qdata = (
+        (x_b.to(torch.float32) / _e8m0_to_fp32(scale_e8m0)).to(torch.float8_e4m3fn).reshape(M, N)
+    )
+    # write outputs transposed locally; the framework's SWAP_TILE_INDEX handles the grid swap.
+    return qdata.t().contiguous(), scale_e8m0.squeeze(1).t().contiguous()  # (N, M), (N, M//32)
+
+
+def _mxfp8_floor_dim_m_correctness(
+    inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """dequant works in the (N, M) transposed frame (mxfp8_floor_dq_f reduces the last dim in
+    32-blocks); transpose back before comparing to `x`."""
+    (x,) = inputs
+    qdata, scale = outputs
+    x_hat = mxfp8_floor_dq_f(qdata, scale).t()
+    sqnr = _compute_error(x.float(), x_hat.float())
+    threshold = 15.0
+    assert sqnr > threshold, f"mxfp8_floor_dim_m: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+
+
+Mxfp8FloorDimMGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_floor_dim_m_f,
+    correctness_fn=_mxfp8_floor_dim_m_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(32,1) block, t-contig",
 )
 
 
@@ -1023,6 +1062,7 @@ ALL_RECIPES = [
     # 1x32, 8-bit
     ("mxfp8_floor", Mxfp8FloorGold),
     ("mxfp8_floor_swizzle", Mxfp8FloorSwizzleGold),
+    ("mxfp8_floor_dim_m", Mxfp8FloorDimMGold),
     # 1x128, 8-bit
     ("fp8_deepseek_1x128", Deepseek1x128Gold),
     ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
