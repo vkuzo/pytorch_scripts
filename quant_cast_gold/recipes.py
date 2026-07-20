@@ -991,3 +991,25 @@ SrF32ToBf16Global = QuantCastSingleKernelGold(
     correctness_fn=_sr_bf16_unbiased_correctness,
     example_input_fn=_sr_inputs,
 )
+
+
+# (name, gold) index of every golden recipe. Consumed by quant_cast_gold/test.py (correctness)
+# and quant_cast_bench/benchmark.py (bandwidth sweep).
+ALL_RECIPES = [
+    ("deepseek_1x128", Deepseek1x128Gold),
+    ("deepseek_128x128", Deepseek128x128Gold),
+    ("deepseek_1x128_dim_m", Deepseek1x128DimMGold),
+    ("rowwise_fp8", RowwiseFp8Gold),
+    ("colwise_fp8", ColwiseFp8Gold),
+    ("rowwise_precalc", RowwisePrecalcGold),
+    ("colwise_precalc", ColwisePrecalcGold),
+    ("mxfp8_floor", Mxfp8FloorGold),
+    ("mxfp8_floor_swizzle", Mxfp8FloorSwizzleGold),
+    ("float8_tensorwise", Float8TensorwiseGold),
+    ("nvfp4_gs_swizzle", Nvfp4GsSwizzleGold),
+    ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
+    ("mxfp8_bias", Mxfp8BiasGold),
+    ("hadamard_rht", HadamardRht),
+    ("sr_bf16", SrF32ToBf16),
+    ("sr_bf16_global", SrF32ToBf16Global),
+]
