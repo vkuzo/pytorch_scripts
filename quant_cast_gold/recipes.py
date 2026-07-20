@@ -30,10 +30,15 @@ class QuantCastSingleKernelGold:
       The function checks that the outputs are valid, and asserts with an error
       message if they are not. For example, if `pt_ref_fn` quantizes a tensor,
       `correctness_fn` could check SQNR between ref and quantized outputs.
+
+    `example_input_fn(M, K) -> (x, *aux)` builds one representative set of positional
+      inputs for `pt_ref_fn` at the given (rows, cols): the tensor `x` plus any extra args
+      the recipe takes (a precalculated scale, a bias, an RHT matrix, a PRNG key).
     """
 
     pt_ref_fn: Callable
     correctness_fn: Callable
+    example_input_fn: Callable[[int, int], Tuple[torch.Tensor, ...]]
 
 
 def _compute_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -81,6 +86,7 @@ def _deepseek_1x128_correctness(
 Deepseek1x128Gold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_1x128_f,
     correctness_fn=_deepseek_1x128_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
 )
 
 
@@ -132,6 +138,7 @@ def _deepseek_128x128_correctness(
 Deepseek128x128Gold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_128x128_f,
     correctness_fn=_deepseek_128x128_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
 )
 
 
@@ -173,6 +180,7 @@ def _deepseek_1x128_dim_m_correctness(
 Deepseek1x128DimMGold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_1x128_dim_m_f,
     correctness_fn=_deepseek_1x128_dim_m_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
 )
 
 
@@ -209,6 +217,7 @@ def _rowwise_fp8_correctness(
 RowwiseFp8Gold = QuantCastSingleKernelGold(
     pt_ref_fn=rowwise_fp8_f,
     correctness_fn=_rowwise_fp8_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
 )
 
 
@@ -251,6 +260,7 @@ def _colwise_fp8_correctness(
 ColwiseFp8Gold = QuantCastSingleKernelGold(
     pt_ref_fn=colwise_fp8_f,
     correctness_fn=_colwise_fp8_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
 )
 
 
@@ -295,9 +305,15 @@ def _rowwise_precalc_correctness(
     assert sqnr > threshold, f"rowwise_precalc: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
+def _rowwise_precalc_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    return (x, rowwise_precalc_scale(x))
+
+
 RowwisePrecalcGold = QuantCastSingleKernelGold(
     pt_ref_fn=rowwise_precalc_f,
     correctness_fn=_rowwise_precalc_correctness,
+    example_input_fn=_rowwise_precalc_inputs,
 )
 
 
@@ -339,9 +355,15 @@ def _colwise_precalc_correctness(
     assert sqnr > threshold, f"colwise_precalc: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
+def _colwise_precalc_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    return (x, colwise_precalc_scale(x))
+
+
 ColwisePrecalcGold = QuantCastSingleKernelGold(
     pt_ref_fn=colwise_precalc_f,
     correctness_fn=_colwise_precalc_correctness,
+    example_input_fn=_colwise_precalc_inputs,
 )
 
 
@@ -422,6 +444,7 @@ def _mxfp8_floor_correctness(
 Mxfp8FloorGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_floor_f,
     correctness_fn=_mxfp8_floor_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
 )
 
 
@@ -519,6 +542,7 @@ def _mxfp8_floor_swizzle_correctness(
 Mxfp8FloorSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_floor_swizzle_f,
     correctness_fn=_mxfp8_floor_swizzle_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
 )
 
 
@@ -566,9 +590,15 @@ def _float8_tensorwise_correctness(
     assert sqnr > threshold, f"float8_tensorwise: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
+def _float8_tensorwise_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    return (x, float8_tensorwise_scale(x))
+
+
 Float8TensorwiseGold = QuantCastSingleKernelGold(
     pt_ref_fn=float8_tensorwise_f,
     correctness_fn=_float8_tensorwise_correctness,
+    example_input_fn=_float8_tensorwise_inputs,
 )
 
 
@@ -644,9 +674,15 @@ def _nvfp4_gs_swizzle_correctness(
     assert sqnr > threshold, f"nvfp4_gs_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
+def _nvfp4_gs_swizzle_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    return (x, nvfp4_gs_scale(x))
+
+
 Nvfp4GsSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_f,
     correctness_fn=_nvfp4_gs_swizzle_correctness,
+    example_input_fn=_nvfp4_gs_swizzle_inputs,
 )
 
 
@@ -728,9 +764,15 @@ def _nvfp4_blocked_outer_correctness(
     assert sqnr > threshold, f"nvfp4_blocked_outer: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
+def _nvfp4_blocked_outer_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    return (x, nvfp4_blocked_outer_scale(x))
+
+
 Nvfp4BlockedOuterGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_blocked_outer_f,
     correctness_fn=_nvfp4_blocked_outer_correctness,
+    example_input_fn=_nvfp4_blocked_outer_inputs,
 )
 
 
@@ -760,9 +802,15 @@ def _mxfp8_bias_correctness(
     assert scale.dtype == torch.float8_e8m0fnu
 
 
+def _mxfp8_bias_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    return (x, torch.ones_like(x))  # bias is an arbitrary same-shape input; ones is fine
+
+
 Mxfp8BiasGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_bias_f,
     correctness_fn=_mxfp8_bias_correctness,
+    example_input_fn=_mxfp8_bias_inputs,
 )
 
 # ---------------------------------------------------------------------------
@@ -827,9 +875,17 @@ def _hadamard_rht_correctness(
     assert sqnr > threshold, f"hadamard_rht: roundtrip sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
+def _hadamard_rht_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    # fixed +/-1 sign vector (deterministic); build the 16x16 RHT matrix pt_ref_fn transforms with.
+    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    return (x, hadamard_rht_matrix(sign, x.device, x.dtype))
+
+
 HadamardRht = QuantCastSingleKernelGold(
     pt_ref_fn=hadamard_rht_f,
     correctness_fn=_hadamard_rht_correctness,
+    example_input_fn=_hadamard_rht_inputs,
 )
 
 # ---------------------------------------------------------------------------
@@ -884,9 +940,17 @@ def _sr_bf16_unbiased_correctness(
     assert abs(out.float().mean().item() - v) < 1e-3, "sr_bf16: mean not unbiased"
 
 
+def _sr_inputs(M, K):
+    # SR asserts fp32 (not bf16) and its correctness_fn checks unbiasedness on a CONSTANT value
+    # strictly between two bf16 grid points (spacing 2**-7 near 1.0). Shared by both SR variants.
+    x = torch.full((M, K), 1.0 + 0.003, dtype=torch.float32, device="cuda")
+    return (x, prng.key(0, device=x.device))
+
+
 SrF32ToBf16 = QuantCastSingleKernelGold(
     pt_ref_fn=sr_bf16_f,
     correctness_fn=_sr_bf16_unbiased_correctness,
+    example_input_fn=_sr_inputs,
 )
 
 
@@ -925,4 +989,5 @@ def sr_bf16_global_f(x, key, **kwargs):
 SrF32ToBf16Global = QuantCastSingleKernelGold(
     pt_ref_fn=sr_bf16_global_f,
     correctness_fn=_sr_bf16_unbiased_correctness,
+    example_input_fn=_sr_inputs,
 )
