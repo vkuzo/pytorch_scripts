@@ -4,6 +4,9 @@ Comparison discipline mirrors flexquant v1/v2 test.py: bit-exact `torch.equal` o
 qdata (compared as fp32) and scale. Recipes live in recipes.py.
 """
 
+import os
+import sys
+
 import pytest
 import torch
 import torch.func._random as prng
@@ -16,13 +19,27 @@ from recipes import (
     MXFP8_FLOOR,
     MXFP8_FLOOR_SWIZZLE,
     RECIPES_V2,
-    sr_bf16_f,
-    sr_bf16_global_f,
 )
+
+# The SR variants (`sr_bf16_f` tile-local, `sr_bf16_global_f` tiling-invariant) live in
+# quant_cast_gold (SrF32ToBf16 / SrF32ToBf16Global); the dedicated SR tests use the fns directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from quant_cast_gold.recipes import sr_bf16_f, sr_bf16_global_f
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
+
+
+def _recipe_input(name):
+    # the input `x` the generic RECIPES_V2 tests feed each recipe. The SR recipes (both the
+    # tile-local sr_bf16 and the tiling-invariant sr_bf16_global) are the exception: their `f`
+    # asserts fp32 (not the default bf16), and their correctness_fn checks unbiasedness on a
+    # CONSTANT value strictly between two bf16 grid points (spacing 2**-7 near 1.0). Everything
+    # else uses the default bf16 randn.
+    if name in ("sr_bf16", "sr_bf16_global"):
+        return torch.full((512, 512), 1.0 + 0.003, dtype=torch.float32, device="cuda")
+    return torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
 
 def _qdata_equal(a, b):
@@ -31,98 +48,6 @@ def _qdata_equal(a, b):
     if a.dtype == torch.float4_e2m1fn_x2:
         return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
     return torch.equal(a.to(torch.float32), b.to(torch.float32))
-
-
-# float8_tensorwise is covered by the generic RECIPES_V2 suite: test_ref_correctness (raw fn),
-# test_flex_tile_map_ref_correctness (REFERENCE backend), and test_flex_tile_map_backends_keep_numerics
-# (REFERENCE == MANUAL_TILE bit-exact). No dedicated matches-reference test needed.
-
-
-# nvfp4_gs_swizzle correctness (raw fn, REFERENCE backend, and REFERENCE == MANUAL_TILE
-# bit-exact) is covered by the generic RECIPES_V2 suite: test_ref_correctness,
-# test_flex_tile_map_ref_correctness, test_flex_tile_map_backends_keep_numerics.
-
-
-# the randomized Hadamard transform (RHT) is now a RecipeV2 (HADAMARD_RHT in recipes.py), so
-# it's covered by the generic RECIPES_V2 suite: test_ref_correctness (raw fn roundtrip),
-# test_flex_tile_map_ref_correctness (REFERENCE backend), and
-# test_flex_tile_map_backends_keep_numerics (REFERENCE == MANUAL_TILE bit-exact).
-
-
-# stochastic rounding fp32 -> bf16: non-quant, single-output `(out,)`, and by design NOT
-# tile-invariant (tile-local RNG offsets repeat across tiles, so tiling changes rounding).
-# The PRNG key is a tensor passed as a REPLICATE aux input (built via prng.key(seed)).
-def test_sr_bf16_matches_reference():
-    # determinism: same key -> bit-exact; different key -> differs.
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.float32, device="cuda")
-
-    key0 = prng.key(0, device="cuda")
-    (out,) = flex_tile_map(x, sr_bf16_f, aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
-    (out_ref,) = sr_bf16_f(x, key0)
-
-    assert out.shape == (512, 512)
-    assert out.dtype == torch.bfloat16
-    assert torch.equal(out, out_ref)
-
-    (out_other,) = sr_bf16_f(x, prng.key(1, device="cuda"))
-    assert not torch.equal(out, out_other)
-
-
-def test_sr_bf16_unbiased():
-    # the defining SR property: outputs land on the two bracketing bf16 grid points and
-    # E[SR(x)] ~= x. Pick a value strictly between two bf16 values (spacing near 1.0 is
-    # 2**-7 ~= 0.0078).
-    v = 1.0 + 0.003
-    x = torch.full((1024, 1024), v, dtype=torch.float32, device="cuda")
-
-    key0 = prng.key(0, device="cuda")
-    (out,) = flex_tile_map(x, sr_bf16_f, aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
-
-    lo = torch.tensor(v, dtype=torch.bfloat16).float().item()  # RTN neighbor (round down)
-    hi = torch.tensor(v + 2**-7, dtype=torch.bfloat16).float().item()
-    assert lo < v < hi
-    uniq = set(out.float().unique().tolist())
-    assert uniq <= {lo, hi}, f"unexpected values {uniq - {lo, hi}}"
-    assert abs(out.float().mean().item() - v) < 1e-3
-
-
-def test_sr_bf16_tiling_changes_rounding():
-    # documents the accepted non-invariance: REFERENCE vs MANUAL_TILE differ bit-for-bit
-    # (tile-local offsets repeat), yet both stay unbiased (mean ~= input).
-    v = 1.0 + 0.003
-    x = torch.full((512, 512), v, dtype=torch.float32, device="cuda")
-
-    key0 = prng.key(0, device="cuda")
-    kw = dict(aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
-    (out_ref,) = flex_tile_map(x, sr_bf16_f, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    (out_tile,) = flex_tile_map(x, sr_bf16_f, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-
-    assert not torch.equal(out_ref, out_tile)
-    assert abs(out_ref.float().mean().item() - v) < 2e-3
-    assert abs(out_tile.float().mean().item() - v) < 2e-3
-
-
-def test_sr_bf16_global_tiling_invariant():
-    # the tiling-invariant SR: keyed on GLOBAL element position, so REFERENCE == MANUAL_TILE
-    # bit-for-bit (contrast test_sr_bf16_tiling_changes_rounding, which uses the tile-local key).
-    v = 1.0 + 0.003
-    x = torch.full((512, 512), v, dtype=torch.float32, device="cuda")
-
-    key0 = prng.key(0, device="cuda")
-    kw = dict(aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
-    (out_ref,) = flex_tile_map(x, sr_bf16_global_f, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    (out_tile,) = flex_tile_map(x, sr_bf16_global_f, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-
-    assert torch.equal(out_ref, out_tile)  # global-position keying is tiling-invariant
-    assert abs(out_ref.float().mean().item() - v) < 2e-3  # still unbiased
-
-
-# deepseek_1x128, deepseek_128x128, mxfp8_floor, mxfp8_floor_swizzle (and every other recipe)
-# are covered by the generic RECIPES_V2 suite: test_ref_correctness (raw fn), and
-# test_flex_tile_map_ref_correctness / test_flex_tile_map_backends_keep_numerics (REFERENCE
-# backend, and REFERENCE == MANUAL_TILE bit-exact). No per-recipe matches-reference /
-# backends-match tests needed.
 
 
 @pytest.mark.parametrize(
@@ -136,12 +61,15 @@ def test_ref_correctness(name, recipe):
     # correctness_fn), independent of flex_tile_map. Mirrors test_flex_tile_map_correctness
     # but calls pt_ref_fn directly on the whole tensor instead of tiling it.
     torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+    x = _recipe_input(name)
 
     aux = recipe.aux_fn(x) if recipe.aux_fn is not None else ()
     inputs = (x, *aux)
 
-    outputs = recipe.pt_ref_fn(*inputs)
+    # the whole tensor is one tile: pass the same position kwargs the REFERENCE backend would
+    # (origin (0,0), full row stride). Recipes that ignore them (all but sr_bf16_global) accept
+    # **kwargs; sr_bf16_global needs them to key its per-element global-position dither.
+    outputs = recipe.pt_ref_fn(*inputs, global_row=0, global_col=0, num_col=x.shape[1])
     recipe.correctness_fn(inputs, outputs)  # raises AssertionError on failure
 
 
@@ -154,7 +82,7 @@ def test_flex_tile_map_ref_correctness(name, recipe):
     # tests that running correctness_fn on the outputs of flex_tile_map passes
 
     torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+    x = _recipe_input(name)
 
     # aux_fn (if any) precomputes extra positional args pt_ref_fn takes beyond `x` (e.g. a
     # precalculated scale); inputs is the full tuple correctness_fn compares outputs against.
@@ -181,8 +109,17 @@ def test_flex_tile_map_backends_keep_numerics(name, recipe):
     # outputs to REFERENCE. Compares every output tensor (qdata + any scale/aux outputs)
     # exactly via _qdata_equal (packed fp4 via its uint8 view; everything else -- fp8_e4m3,
     # e8m0, fp32, 4D swizzle grids -- as a bit-exact fp32 compare).
+    #
+    # the SR recipes are skipped here; both keep their REFERENCE-vs-MANUAL_TILE behavior in
+    # dedicated tests. sr_bf16 is the NON-tile-invariant counterexample (dither keyed on
+    # tile-local order, so MANUAL_TILE != REFERENCE by design -- test_sr_bf16_tiling_changes_rounding).
+    # sr_bf16_global IS tile-invariant (keyed on global position); that equality is asserted by
+    # test_sr_bf16_global_tiling_invariant, so it's skipped here too rather than duplicated.
+    if name in ("sr_bf16", "sr_bf16_global"):
+        pytest.skip(f"{name}: REFERENCE-vs-MANUAL_TILE behavior is covered by a dedicated SR test")
+
     torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+    x = _recipe_input(name)
 
     aux = recipe.aux_fn(x) if recipe.aux_fn is not None else ()
     kw = dict(
@@ -225,12 +162,6 @@ def test_deepseek_dim_m_non_square():
     assert sr.shape == (512, 384 // 128)
     assert _qdata_equal(qt, qr)
     assert torch.equal(st, sr)
-
-
-# rowwise_fp8, colwise_fp8, rowwise_precalc, and colwise_precalc are covered by the generic
-# RECIPES_V2 suite (their RecipeV2 objects carry the needed valid_tile_size_fn / aux_fn /
-# aux_kinds / output_kinds): test_ref_correctness, test_flex_tile_map_ref_correctness, and
-# test_flex_tile_map_backends_keep_numerics (REFERENCE == MANUAL_TILE bit-exact).
 
 
 # input padding (`pad_input_to_multiple_of`): a ragged input (e.g. LLM decode/prefill token
@@ -326,6 +257,32 @@ def test_pad_matches_manual_pad():
     assert torch.equal(scale, scale_ref)
 
 
-# nvfp4_blocked_outer (AuxKind.TILE) and mxfp8_bias (AuxKind.TILE, divisor (1,1)) are covered
-# by the generic RECIPES_V2 suite: test_ref_correctness, test_flex_tile_map_ref_correctness,
-# and test_flex_tile_map_backends_keep_numerics (REFERENCE == MANUAL_TILE bit-exact).
+def test_sr_bf16_tiling_changes_rounding():
+    # documents the accepted non-invariance: REFERENCE vs MANUAL_TILE differ bit-for-bit
+    # (tile-local offsets repeat), yet both stay unbiased (mean ~= input).
+    v = 1.0 + 0.003
+    x = torch.full((512, 512), v, dtype=torch.float32, device="cuda")
+
+    key0 = prng.key(0, device="cuda")
+    kw = dict(aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
+    (out_ref,) = flex_tile_map(x, sr_bf16_f, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    (out_tile,) = flex_tile_map(x, sr_bf16_f, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+
+    assert not torch.equal(out_ref, out_tile)
+    assert abs(out_ref.float().mean().item() - v) < 2e-3
+    assert abs(out_tile.float().mean().item() - v) < 2e-3
+
+
+def test_sr_bf16_global_tiling_invariant():
+    # the tiling-invariant SR: keyed on GLOBAL element position, so REFERENCE == MANUAL_TILE
+    # bit-for-bit (contrast test_sr_bf16_tiling_changes_rounding, which uses the tile-local key).
+    v = 1.0 + 0.003
+    x = torch.full((512, 512), v, dtype=torch.float32, device="cuda")
+
+    key0 = prng.key(0, device="cuda")
+    kw = dict(aux_inputs=(key0,), aux_kinds=(AuxKind.REPLICATE,))
+    (out_ref,) = flex_tile_map(x, sr_bf16_global_f, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    (out_tile,) = flex_tile_map(x, sr_bf16_global_f, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+
+    assert torch.equal(out_ref, out_tile)  # global-position keying is tiling-invariant
+    assert abs(out_ref.float().mean().item() - v) < 2e-3  # still unbiased
