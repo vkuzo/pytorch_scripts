@@ -77,7 +77,7 @@ def test_flex_tile_map_backends_keep_numerics(name, recipe):
     # tile-local order, so MANUAL_TILE != REFERENCE by design -- test_sr_bf16_tiling_changes_rounding).
     # sr_bf16_global IS tile-invariant (keyed on global position); that equality is asserted by
     # test_sr_bf16_global_tiling_invariant, so it's skipped here too rather than duplicated.
-    if name in ("sr_bf16", "sr_bf16_global"):
+    if name in ("fp32_to_bf16_sr", "fp32_to_bf16_sr_global_offsets"):
         pytest.skip(f"{name}: REFERENCE-vs-MANUAL_TILE behavior is covered by a dedicated SR test")
 
     torch.manual_seed(0)
@@ -182,7 +182,7 @@ def test_pad_ref_shapes_swizzle():
         (MXFP8_FLOOR_SWIZZLE, (128, 128)),
         (DEEPSEEK_1X128, (1, 128)),
     ],
-    ids=["mxfp8_floor", "mxfp8_floor_swizzle", "deepseek_1x128"],
+    ids=["mxfp8_floor", "mxfp8_floor_swizzle", "fp8_deepseek_1x128"],
 )
 def test_pad_backends_match(recipe, pad_to):
     # padded ragged input: MANUAL_TILE must match REFERENCE bit-exact (padding happens before
