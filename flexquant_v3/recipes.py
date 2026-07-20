@@ -22,6 +22,7 @@ from quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
+    Mxfp832x32FloorGold,
     Mxfp8FloorDimMGold,
     Mxfp8FloorGold,
     Mxfp8FloorSwizzleGold,
@@ -144,6 +145,12 @@ MXFP8_FLOOR_DIM_M = RecipeV2.from_gold(
     valid_tile_size_fn=lambda ts, a, p: a[0] % 32 == 0,
     output_kinds=(OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX),
 )
+# mxfp8 with square 32x32 blocks: each block is independent, so a tile just needs whole blocks
+# on both dims (checked on `actual`). No swizzle, no transpose.
+MXFP8_32X32_FLOOR = RecipeV2.from_gold(
+    Mxfp832x32FloorGold,
+    valid_tile_size_fn=lambda ts, a, p: a[0] % 32 == 0 and a[1] % 32 == 0,
+)
 # reduction (1x32) checked on `actual`; swizzle atom (128x128) checked on `padded` (edge-exempt).
 MXFP8_FLOOR_SWIZZLE = RecipeV2.from_gold(
     Mxfp8FloorSwizzleGold,
@@ -216,6 +223,7 @@ RECIPES_V2 = [
     ("fp8_colwise_precalc_scale", COLWISE_PRECALC),
     ("mxfp8_floor", MXFP8_FLOOR),
     ("mxfp8_floor_dim_m", MXFP8_FLOOR_DIM_M),
+    ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),
     ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE),
     ("fp8_tensorwise_precalc_scale", FLOAT8_TENSORWISE),
     ("nvfp4_swizzle", NVFP4_GS_SWIZZLE),
