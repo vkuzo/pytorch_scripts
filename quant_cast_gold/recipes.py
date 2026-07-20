@@ -21,15 +21,15 @@ from quant_cast_gold.utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_u
 class QuantCastSingleKernelGold:
     """A golden single-kernel quant-cast reference.
 
-    `pt_ref_fn(x, *aux, **kwargs) -> outputs` is the plain-PyTorch reference kernel (the
-    tile-invariant `f` that would be handed to flex_tile_map); some recipes need extra
-    positional args beyond `x` (e.g. a precalculated scale). `correctness_fn(inputs,
-    outputs) -> None` takes `inputs` -- the tuple of ALL positional args passed to
-    `pt_ref_fn` (starting with `x`) -- and a candidate `outputs` tuple (same shape as
-    what `pt_ref_fn`/flex_tile_map returns), and asserts `outputs` is close enough to
-    `inputs` to be considered correct, raising `AssertionError` with a clear message on
-    failure. Passing the precomputed aux through `inputs` means correctness_fn never
-    needs to recompute it itself.
+    `pt_ref_fn(*inputs, **kwargs) -> outputs` is a plain-PyTorch reference function 
+
+    `correctness_fn(inputs, outputs) -> None`
+      - inputs - inputs to pt_ref_fn
+      - outputs - outputs from an implementation of pt_ref_fn
+
+      The function checks that the outputs are valid, and asserts with an error
+      message if they are not. For example, if `pt_ref_fn` quantizes a tensor,
+      `correctness_fn` could check SQNR between ref and quantized outputs.
     """
 
     pt_ref_fn: Callable
@@ -541,9 +541,10 @@ def float8_tensorwise_scale(x):
 
 def float8_tensorwise_f(x, scale, **kwargs):
     """Tile-invariant `f` taking the precomputed per-tensor `scale` as an explicit aux input
-    (REPLICATE: the same scalar scale is used for every tile)."""
+    (REPLICATE: the same scalar scale is used for every tile). `scale` is an input, not a
+    returned output, so `f` returns a 1-tuple `(qdata,)`."""
     qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
-    return qdata, scale
+    return (qdata,)
 
 
 def dq_tensorwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -553,12 +554,12 @@ def dq_tensorwise(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def _float8_tensorwise_correctness(
-    inputs: Tuple[torch.Tensor, torch.Tensor], outputs: Tuple[torch.Tensor, torch.Tensor]
+    inputs: Tuple[torch.Tensor, torch.Tensor], outputs: Tuple[torch.Tensor]
 ) -> None:
     """Assert dequant(outputs, using the precalculated scale from `inputs`) recovers `x`
     with SQNR above threshold."""
     x, scale = inputs
-    qdata, _scale_out = outputs
+    (qdata,) = outputs
     x_hat = dq_tensorwise(qdata, scale)
     sqnr = _compute_error(x.float(), x_hat.float())
     threshold = 20.0

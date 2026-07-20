@@ -86,26 +86,24 @@ def test_float8_tensorwise_matches_reference():
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
     kernel = FLOAT8_TENSORWISE.pt_ref_fn
-    # scale computed outside flex_tile_map, passed in as a REPLICATE aux input.
+    # scale computed outside flex_tile_map, passed in as a REPLICATE aux input. `f` returns
+    # only qdata (the scale is an input, not a returned output).
     scale = float8_tensorwise_scale(x)
-    qdata, scale_out = flex_tile_map(
+    (qdata,) = flex_tile_map(
         x,
         kernel,
         aux_inputs=(scale,),
         aux_kinds=(AuxKind.REPLICATE,),
         valid_tile_size_fn=FLOAT8_TENSORWISE.valid_tile_size_fn,
     )
-    qdata_ref, scale_ref = kernel(x, scale)
+    (qdata_ref,) = kernel(x, scale)
 
-    # shapes / dtypes: scale is a single per-tensor scalar
+    # shapes / dtypes
     assert qdata.shape == (512, 512)
     assert qdata.dtype == torch.float8_e4m3fn
-    assert scale_out.shape == ()
-    assert scale_out.dtype == torch.float32
 
     # bit-exact vs reference (matches v1/v2 discipline)
     assert torch.equal(qdata.to(torch.float32), qdata_ref.to(torch.float32))
-    assert torch.equal(scale_out, scale_ref)
 
 
 # nvfp4 with global scale needs the runtime outer scale (a REPLICATE aux input), so -- like
