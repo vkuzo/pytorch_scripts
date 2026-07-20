@@ -1,7 +1,8 @@
 """Memory-bandwidth benchmark for quant_cast_gold recipes.
 
 Each recipe is a memory-bound cast, so the signal we care about is achieved memory bandwidth
-vs. the B200 ceiling (8 TB/s). We torch.compile each recipe's reference fn, time it with
+vs. the B200 ceiling (8 TB/s). Per `mode`, we either torch.compile each gold recipe's reference
+fn ("compile", the default) or run its hand-written Triton kernel ("triton"), time it with
 `do_bench_using_profiling`, and report latency + GB/s + % of peak. Structured after
 flexquant/benchmark.py.
 """
@@ -58,11 +59,13 @@ def _bench_relu(M, K):
     return gpu_time_ms, gbps, pct_peak
 
 
-def _bench_one(gold, M, K):
+def _bench_one(recipe, M, K, mode):
     torch.manual_seed(0)
     torch._dynamo.reset()
-    inputs = gold.example_input_fn(M, K)  # (x, *aux)
-    fn = torch.compile(gold.pt_ref_fn, fullgraph=True)
+    inputs = recipe.example_input_fn(M, K)  # (x, *aux)
+    # "compile": torch.compile the plain-PyTorch reference fn. "triton": run the recipe's
+    # hand-written Triton kernel directly (QuantCastTritonRecipe.triton_fn).
+    fn = recipe.triton_fn if mode == "triton" else torch.compile(recipe.pt_ref_fn, fullgraph=True)
 
     def run():
         return fn(*inputs)
@@ -81,19 +84,35 @@ def _bench_one(gold, M, K):
     return gpu_time_ms, gbps, pct_peak
 
 
-def main(M: int = 16384, K: int = 16384, recipe_name_filter: str | None = None):
+def main(
+    M: int = 16384,
+    K: int = 16384,
+    recipe_name_filter: str | None = None,
+    mode: str | None = None,
+):
     device_name = torch.cuda.get_device_name(0)
     assert "B200" in device_name, f"this benchmark assumes B200, got {device_name!r}"
 
+    mode = mode or "compile"
+    assert mode in ("compile", "triton"), f"mode must be 'compile' or 'triton', got {mode!r}"
+
+    # "compile" sweeps the gold recipes (torch.compile their pt_ref_fn); "triton" sweeps the
+    # QuantCastTritonRecipe set (run their hand-written triton_fn). Both recipe kinds carry
+    # example_input_fn / perf_description, so the rest of the sweep is identical.
+    if mode == "triton":
+        from quant_cast_triton.recipes import ALL_RECIPES as recipes_all
+    else:
+        recipes_all = ALL_RECIPES
+
     recipes = [
-        (n, g)
-        for n, g in ALL_RECIPES
+        (n, r)
+        for n, r in recipes_all
         if n not in _BENCH_SKIP
         and (recipe_name_filter is None or recipe_name_filter in n)
     ]
     if not recipes:
         raise ValueError(
-            f"no recipe matched {recipe_name_filter!r}; have {[n for n, _ in ALL_RECIPES]}"
+            f"no recipe matched {recipe_name_filter!r}; have {[n for n, _ in recipes_all]}"
         )
 
     rows = []  # (recipe, gpu_time_ms, gbps, pct_peak, perf_description)
@@ -103,19 +122,19 @@ def main(M: int = 16384, K: int = 16384, recipe_name_filter: str | None = None):
         ms, gbps, pct = _bench_relu(M, K)
         rows.append(("relu (baseline)", f"{ms:.4f}", f"{gbps:.1f}", f"{pct:.1f}%", ""))
 
-    for name, gold in recipes:
+    for name, recipe in recipes:
         # TODO: some recipes don't benchmark cleanly yet (e.g. fp4-packed byte accounting under
         # torch.compile, swizzle grids, SR's fp32/const input). Skip failures for now so the
         # sweep still reports the ones that work; revisit each skipped recipe.
         try:
-            ms, gbps, pct = _bench_one(gold, M, K)
+            ms, gbps, pct = _bench_one(recipe, M, K, mode)
         except Exception as e:
             reason = f"SKIPPED: {type(e).__name__}: {str(e).splitlines()[0][:60]}"
-            rows.append((name, reason, "", "", gold.perf_description))
+            rows.append((name, reason, "", "", recipe.perf_description))
             continue
-        rows.append((name, f"{ms:.4f}", f"{gbps:.1f}", f"{pct:.1f}%", gold.perf_description))
+        rows.append((name, f"{ms:.4f}", f"{gbps:.1f}", f"{pct:.1f}%", recipe.perf_description))
 
-    print(f"shape: ({M}, {K})")
+    print(f"shape: ({M}, {K})  mode: {mode}")
     print(
         tabulate.tabulate(
             rows,
