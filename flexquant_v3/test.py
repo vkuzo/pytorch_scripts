@@ -22,22 +22,16 @@ from recipes import (
     COLWISE_PRECALC,
     NVFP4_BLOCKED_OUTER,
     NVFP4_GS_SWIZZLE,
+    RECIPES_V2,
     ROWWISE_FP8,
     ROWWISE_PRECALC,
-    deepseek_1x128_dim_m_f,
-    deepseek_1x128_dq_f,
-    float8_tensorwise_f,
+    RecipeV2,
     float8_tensorwise_scale,
     hadamard_rht_f,
     hadamard_rht_matrix,
-    mxfp8_bias_f,
-    nvfp4_blocked_outer_f,
     nvfp4_blocked_outer_scale,
-    colwise_precalc_f,
     colwise_precalc_scale,
     nvfp4_gs_scale,
-    nvfp4_gs_swizzle_f,
-    rowwise_precalc_f,
     rowwise_precalc_scale,
     sr_bf16_f,
     sr_bf16_global_f,
@@ -81,20 +75,27 @@ def _qdata_equal(a, b):
     return torch.equal(a.to(torch.float32), b.to(torch.float32))
 
 
+def _recipe_kernel(recipe):
+    """The flex_tile_map kernel `f` for either a v1 Recipe (`.quant`) or a migrated
+    RecipeV2 (`.pt_ref_fn`) -- the RECIPES table mixes both while migration is ongoing."""
+    return recipe.pt_ref_fn if isinstance(recipe, RecipeV2) else recipe.quant
+
+
 def test_float8_tensorwise_matches_reference():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
+    kernel = FLOAT8_TENSORWISE.pt_ref_fn
     # scale computed outside flex_tile_map, passed in as a REPLICATE aux input.
     scale = float8_tensorwise_scale(x)
     qdata, scale_out = flex_tile_map(
         x,
-        FLOAT8_TENSORWISE.quant,
+        kernel,
         aux_inputs=(scale,),
         aux_kinds=(AuxKind.REPLICATE,),
         valid_tile_size_fn=FLOAT8_TENSORWISE.valid_tile_size_fn,
     )
-    qdata_ref, scale_ref = float8_tensorwise_f(x, scale)
+    qdata_ref, scale_ref = kernel(x, scale)
 
     # shapes / dtypes: scale is a single per-tensor scalar
     assert qdata.shape == (512, 512)
@@ -107,34 +108,23 @@ def test_float8_tensorwise_matches_reference():
     assert torch.equal(scale_out, scale_ref)
 
 
-def test_float8_tensorwise_sqnr_vs_high_precision():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    scale = float8_tensorwise_scale(x)
-    qdata, scale_out = flex_tile_map(
-        x, FLOAT8_TENSORWISE.quant, aux_inputs=(scale,), aux_kinds=(AuxKind.REPLICATE,)
-    )
-    x_hat = FLOAT8_TENSORWISE.dequant(qdata, scale_out)
-    assert _compute_error(x.float(), x_hat.float()) > 20.0
-
-
 # nvfp4 with global scale needs the runtime outer scale (a REPLICATE aux input), so -- like
 # tensorwise -- it lives in dedicated tests rather than the static RECIPES table.
 def test_nvfp4_gs_swizzle_matches_reference():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
+    kernel = NVFP4_GS_SWIZZLE.pt_ref_fn
     # outer scale computed outside, passed in as a REPLICATE aux input.
     outer = nvfp4_gs_scale(x)
     qdata, scale = flex_tile_map(
         x,
-        NVFP4_GS_SWIZZLE.quant,
+        kernel,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.REPLICATE,),
         valid_tile_size_fn=NVFP4_GS_SWIZZLE.valid_tile_size_fn,
     )
-    qdata_ref, scale_ref = nvfp4_gs_swizzle_f(x, outer)
+    qdata_ref, scale_ref = kernel(x, outer)
 
     # shapes / dtypes: packed fp4 qdata + swizzled e4m3 inner scale as a 4D block grid.
     # inner scale is (256, 256//16) = (256, 16) -> nrb=2, ncb=4 -> (2, 4, 32, 16).
@@ -151,6 +141,7 @@ def test_nvfp4_gs_swizzle_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
+    kernel = NVFP4_GS_SWIZZLE.pt_ref_fn
     outer = nvfp4_gs_scale(x)
     kw = dict(
         aux_inputs=(outer,),
@@ -158,10 +149,10 @@ def test_nvfp4_gs_swizzle_backends_match():
         valid_tile_size_fn=NVFP4_GS_SWIZZLE.valid_tile_size_fn,
     )
     qdata_ref, scale_ref = flex_tile_map(
-        x, NVFP4_GS_SWIZZLE.quant, _backend=FlexTileMapBackend.REFERENCE, **kw
+        x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw
     )
     qdata_tile, scale_tile = flex_tile_map(
-        x, NVFP4_GS_SWIZZLE.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw
+        x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw
     )
 
     # exercises the _manual_tile packed-fp4 cat (via uint8 view).
@@ -169,23 +160,6 @@ def test_nvfp4_gs_swizzle_backends_match():
     # swizzled scale is a 4D block grid: tile-invariant, so same shape AND bit-exact.
     assert scale_tile.shape == scale_ref.shape
     assert torch.equal(scale_tile, scale_ref)
-
-
-def test_nvfp4_gs_swizzle_sqnr_vs_high_precision():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    outer = nvfp4_gs_scale(x)
-    qdata, scale = flex_tile_map(
-        x,
-        NVFP4_GS_SWIZZLE.quant,
-        aux_inputs=(outer,),
-        aux_kinds=(AuxKind.REPLICATE,),
-        valid_tile_size_fn=NVFP4_GS_SWIZZLE.valid_tile_size_fn,
-    )
-    x_hat = NVFP4_GS_SWIZZLE.dequant(qdata, scale, outer)
-    # nvfp4 is 4-bit, coarser than fp8/mxfp8, so a lower SQNR floor.
-    assert _compute_error(x.float(), x_hat.float()) > 12.0
 
 
 # randomized Hadamard transform (RHT): a non-quant example. `f` returns a 1-tuple `(out,)`
@@ -316,13 +290,14 @@ def test_sr_bf16_global_tiling_invariant():
 def test_matches_reference(recipe, scale_shape, scale_dtype, qdata_dtype):
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+    kernel = _recipe_kernel(recipe)
 
     qdata, scale = flex_tile_map(
         x,
-        recipe.quant,
+        kernel,
         valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
-    qdata_ref, scale_ref = recipe.quant(x)
+    qdata_ref, scale_ref = kernel(x)
 
     # shapes / dtypes
     assert qdata.dtype == qdata_dtype
@@ -344,16 +319,17 @@ def test_backends_match(recipe, flat_compare):
     # exactly. 256 // 2 == 128 keeps the quadrant split on a 128x128 tile boundary.
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+    kernel = _recipe_kernel(recipe)
 
     qdata_ref, scale_ref = flex_tile_map(
         x,
-        recipe.quant,
+        kernel,
         _backend=FlexTileMapBackend.REFERENCE,
         valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
     qdata_tile, scale_tile = flex_tile_map(
         x,
-        recipe.quant,
+        kernel,
         _backend=FlexTileMapBackend.MANUAL_TILE,
         valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
@@ -366,23 +342,28 @@ def test_backends_match(recipe, flat_compare):
 
 
 @pytest.mark.parametrize(
-    "recipe, sqnr_min",
-    [(r, sqnr_min) for _, r, _, _, _, _, sqnr_min in RECIPES],
-    ids=[name for name, *_ in RECIPES],
+    "name, recipe",
+    RECIPES_V2,
+    ids=[name for name, _ in RECIPES_V2],
 )
-def test_sqnr_vs_high_precision(recipe, sqnr_min):
-    # dequantizing (qdata, scale) should recover the input with high SQNR.
+def test_gold_correctness(name, recipe):
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
-    qdata, scale = flex_tile_map(
+    # aux_fn (if any) precomputes extra positional args pt_ref_fn takes beyond `x` (e.g. a
+    # precalculated scale); inputs is the full tuple correctness_fn compares outputs against.
+    aux = recipe.aux_fn(x) if recipe.aux_fn is not None else ()
+    inputs = (x, *aux)
+
+    outputs = flex_tile_map(
         x,
-        recipe.quant,
+        recipe.pt_ref_fn,
+        aux_inputs=aux,
+        aux_kinds=recipe.aux_kinds,
+        output_kinds=recipe.output_kinds,
         valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
-    x_hat = recipe.dequant(qdata, scale)
-    sqnr = _compute_error(x.float(), x_hat.float())
-    assert sqnr > sqnr_min, f"{sqnr=} below {sqnr_min}"
+    recipe.correctness_fn(inputs, outputs)  # raises AssertionError on failure
 
 
 # dim-M deepseek: `f` transposes the tile + reduces last dim, and OutputKind.SWAP_TILE_INDEX
@@ -394,15 +375,16 @@ _DIM_M_SWAP = (OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX)
 def test_deepseek_dim_m_matches_reference():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+    kernel = DEEPSEEK_1X128_DIM_M.pt_ref_fn
 
     qdata, scale = flex_tile_map(
         x,
-        DEEPSEEK_1X128_DIM_M.quant,
+        kernel,
         output_kinds=_DIM_M_SWAP,
         valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn,
     )
     # reference: the old SWAP_0_AND_1_AXES layout == plain 1x128 on the transposed input.
-    qdata_ref, scale_ref = deepseek_1x128_dim_m_f(x)
+    qdata_ref, scale_ref = kernel(x)
     assert qdata.shape == (512, 512)
     assert scale.shape == (512, 512 // 128)
     assert _qdata_equal(qdata, qdata_ref)
@@ -413,9 +395,10 @@ def test_deepseek_dim_m_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
+    kernel = DEEPSEEK_1X128_DIM_M.pt_ref_fn
     kw = dict(output_kinds=_DIM_M_SWAP, valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn)
-    qr, sr = flex_tile_map(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qt, st = flex_tile_map(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+    qr, sr = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    qt, st = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert _qdata_equal(qt, qr)
     assert st.shape == sr.shape
     assert torch.equal(st, sr)
@@ -427,28 +410,14 @@ def test_deepseek_dim_m_non_square():
     torch.manual_seed(0)
     x = torch.randn(384, 512, dtype=torch.bfloat16, device="cuda")
 
+    kernel = DEEPSEEK_1X128_DIM_M.pt_ref_fn
     kw = dict(output_kinds=_DIM_M_SWAP, valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn)
-    qr, sr = flex_tile_map(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qt, st = flex_tile_map(x, DEEPSEEK_1X128_DIM_M.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+    qr, sr = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    qt, st = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert qr.shape == (512, 384)  # grid-transposed
     assert sr.shape == (512, 384 // 128)
     assert _qdata_equal(qt, qr)
     assert torch.equal(st, sr)
-
-
-def test_deepseek_dim_m_sqnr():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    qdata, scale = flex_tile_map(
-        x,
-        DEEPSEEK_1X128_DIM_M.quant,
-        output_kinds=_DIM_M_SWAP,
-        valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn,
-    )
-    # dequant works in the (K, M) transposed frame; transpose back to compare with x.
-    x_hat = DEEPSEEK_1X128_DIM_M.dequant(qdata, scale).t()
-    assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 
 # rowwise / colwise fp8: the scale reduces over a whole row/column, so tiling must span that dim
@@ -458,23 +427,13 @@ def test_rowwise_fp8_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
+    kernel = ROWWISE_FP8.pt_ref_fn
     kw = dict(valid_tile_size_fn=ROWWISE_FP8.valid_tile_size_fn)
-    qr, sr = flex_tile_map(x, ROWWISE_FP8.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qt, st = flex_tile_map(x, ROWWISE_FP8.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+    qr, sr = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    qt, st = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert sr.shape == (512, 1)
     assert _qdata_equal(qt, qr)
     assert torch.equal(st, sr)
-
-
-def test_rowwise_fp8_sqnr():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    qdata, scale = flex_tile_map(
-        x, ROWWISE_FP8.quant, valid_tile_size_fn=ROWWISE_FP8.valid_tile_size_fn
-    )
-    x_hat = ROWWISE_FP8.dequant(qdata, scale)
-    assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 
 # rowwise with a PRECALCULATED (M, 1) scale passed as an AuxKind.ROW aux input. The divide is
@@ -484,28 +443,17 @@ def test_rowwise_precalc_row_aux_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
+    kernel = ROWWISE_PRECALC.pt_ref_fn
     scale = rowwise_precalc_scale(x)  # (512, 1)
     assert scale.shape == (512, 1)
     kw = dict(aux_inputs=(scale,), aux_kinds=(AuxKind.ROW,))  # 2D tiling (default)
-    (qr,) = flex_tile_map(x, ROWWISE_PRECALC.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    (qt,) = flex_tile_map(x, ROWWISE_PRECALC.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+    (qr,) = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    (qt,) = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
 
     # matches applying the precalc scale directly, and REFERENCE == MANUAL_TILE bit-exact.
-    (q_direct,) = rowwise_precalc_f(x, scale)
+    (q_direct,) = kernel(x, scale)
     assert _qdata_equal(qr, q_direct)
     assert _qdata_equal(qt, qr)
-
-
-def test_rowwise_precalc_sqnr():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    scale = rowwise_precalc_scale(x)
-    (qdata,) = flex_tile_map(
-        x, ROWWISE_PRECALC.quant, aux_inputs=(scale,), aux_kinds=(AuxKind.ROW,)
-    )
-    x_hat = ROWWISE_PRECALC.dequant(qdata, scale)
-    assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 
 # colwise with a PRECALCULATED (1, N) scale passed as an AuxKind.COL aux input, writing the
@@ -516,33 +464,17 @@ def test_colwise_precalc_col_aux_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
 
+    kernel = COLWISE_PRECALC.pt_ref_fn
     scale = colwise_precalc_scale(x)  # (1, 384)
     assert scale.shape == (1, 384)
     kw = dict(aux_inputs=(scale,), aux_kinds=(AuxKind.COL,), output_kinds=(OutputKind.SWAP_TILE_INDEX,))
-    (qr,) = flex_tile_map(x, COLWISE_PRECALC.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    (qt,) = flex_tile_map(x, COLWISE_PRECALC.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+    (qr,) = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    (qt,) = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
 
     assert qr.shape == (384, 512)  # transposed (N, M)
-    (q_direct,) = colwise_precalc_f(x, scale)
+    (q_direct,) = kernel(x, scale)
     assert _qdata_equal(qr, q_direct)
     assert _qdata_equal(qt, qr)
-
-
-def test_colwise_precalc_sqnr():
-    torch.manual_seed(0)
-    x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
-
-    scale = colwise_precalc_scale(x)
-    (qdata,) = flex_tile_map(
-        x,
-        COLWISE_PRECALC.quant,
-        aux_inputs=(scale,),
-        aux_kinds=(AuxKind.COL,),
-        output_kinds=(OutputKind.SWAP_TILE_INDEX,),
-    )
-    # output is transposed (N, M); dequant then transpose back to compare with x.
-    x_hat = COLWISE_PRECALC.dequant(qdata, scale).t()
-    assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 
 # colwise transposes its outputs locally + SWAP_TILE_INDEX, so the emitted layout is the
@@ -554,28 +486,14 @@ def test_colwise_fp8_backends_match():
     torch.manual_seed(0)
     x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
 
+    kernel = COLWISE_FP8.pt_ref_fn
     kw = dict(valid_tile_size_fn=COLWISE_FP8.valid_tile_size_fn, output_kinds=_COLWISE_SWAP)
-    qr, sr = flex_tile_map(x, COLWISE_FP8.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qt, st = flex_tile_map(x, COLWISE_FP8.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+    qr, sr = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    qt, st = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert qr.shape == (384, 512)  # transposed (N, M)
     assert sr.shape == (384, 1)  # transposed (N, 1)
     assert _qdata_equal(qt, qr)
     assert torch.equal(st, sr)
-
-
-def test_colwise_fp8_sqnr():
-    torch.manual_seed(0)
-    x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
-
-    qdata, scale = flex_tile_map(
-        x,
-        COLWISE_FP8.quant,
-        valid_tile_size_fn=COLWISE_FP8.valid_tile_size_fn,
-        output_kinds=_COLWISE_SWAP,
-    )
-    # outputs are in the transposed (N, M) frame; dequant then transpose back to compare with x.
-    x_hat = COLWISE_FP8.dequant(qdata, scale).t()
-    assert _compute_error(x.float(), x_hat.float()) > 20.0
 
 
 # input padding (`pad_input_to_multiple_of`): a ragged input (e.g. LLM decode/prefill token
@@ -597,7 +515,7 @@ def test_valid_tile_size_fn_unsatisfiable_raises_then_pad_fixes():
     with pytest.raises(ValueError):
         flex_tile_map(
             x,
-            DEEPSEEK_1X128.quant,
+            DEEPSEEK_1X128.pt_ref_fn,
             valid_tile_size_fn=DEEPSEEK_1X128.valid_tile_size_fn,
             _backend=FlexTileMapBackend.MANUAL_TILE,
         )
@@ -605,7 +523,7 @@ def test_valid_tile_size_fn_unsatisfiable_raises_then_pad_fixes():
     # pad N 300 -> 384 (multiple of 128); now every tile's column extent is 128-aligned.
     qdata, scale = flex_tile_map(
         x,
-        DEEPSEEK_1X128.quant,
+        DEEPSEEK_1X128.pt_ref_fn,
         valid_tile_size_fn=DEEPSEEK_1X128.valid_tile_size_fn,
         pad_input_to_multiple_of=(1, 128),
         _backend=FlexTileMapBackend.MANUAL_TILE,
@@ -619,7 +537,7 @@ def test_pad_ref_shapes_swizzle():
     x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
     qdata, scale = flex_tile_map(
         x,
-        MXFP8_FLOOR_SWIZZLE.quant,
+        MXFP8_FLOOR_SWIZZLE.pt_ref_fn,
         pad_input_to_multiple_of=(128, 128),
         valid_tile_size_fn=MXFP8_FLOOR_SWIZZLE.valid_tile_size_fn,
     )
@@ -641,12 +559,13 @@ def test_pad_backends_match(recipe, pad_to):
     # tiling in both paths, so the two backends see the identical padded tensor).
     torch.manual_seed(0)
     x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
+    kernel = _recipe_kernel(recipe)
     kw = dict(
         pad_input_to_multiple_of=pad_to,
         valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
-    qdata_ref, scale_ref = flex_tile_map(x, recipe.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qdata_tile, scale_tile = flex_tile_map(x, recipe.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+    qdata_ref, scale_ref = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    qdata_tile, scale_tile = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert _qdata_equal(qdata_tile, qdata_ref)
     assert scale_tile.shape == scale_ref.shape
     assert torch.equal(scale_tile, scale_ref)
@@ -656,15 +575,16 @@ def test_pad_matches_manual_pad():
     # padding inside the API == padding the input outside it, then running the recipe.
     torch.manual_seed(0)
     x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
+    kernel = MXFP8_FLOOR.pt_ref_fn
     qdata, scale = flex_tile_map(
         x,
-        MXFP8_FLOOR.quant,
+        kernel,
         pad_input_to_multiple_of=(1, 32),
         valid_tile_size_fn=MXFP8_FLOOR.valid_tile_size_fn,
     )
     # manual pad: 200 stays (mult of 1), 300 -> 320 (mult of 32); high-edge zero pad.
     x_padded = F.pad(x, (0, _ceil_to(300, 32) - 300, 0, 0))
-    qdata_ref, scale_ref = MXFP8_FLOOR.quant(x_padded)
+    qdata_ref, scale_ref = kernel(x_padded)
     assert _qdata_equal(qdata, qdata_ref)
     assert torch.equal(scale, scale_ref)
 
@@ -675,16 +595,17 @@ def test_nvfp4_blocked_outer_matches_reference():
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
+    kernel = NVFP4_BLOCKED_OUTER.pt_ref_fn
     outer = nvfp4_blocked_outer_scale(x)  # (2, 2)
     assert outer.shape == (2, 2)
     qdata, scale = flex_tile_map(
         x,
-        NVFP4_BLOCKED_OUTER.quant,
+        kernel,
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.TILE,),
         valid_tile_size_fn=NVFP4_BLOCKED_OUTER.valid_tile_size_fn,
     )
-    qdata_ref, scale_ref = nvfp4_blocked_outer_f(x, outer)
+    qdata_ref, scale_ref = kernel(x, outer)
 
     assert qdata.shape == (256, 128)
     assert qdata.dtype == torch.float4_e2m1fn_x2
@@ -698,34 +619,23 @@ def test_nvfp4_blocked_outer_backends_match():
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
+    kernel = NVFP4_BLOCKED_OUTER.pt_ref_fn
     outer = nvfp4_blocked_outer_scale(x)
     kw = dict(
         aux_inputs=(outer,),
         aux_kinds=(AuxKind.TILE,),
         valid_tile_size_fn=NVFP4_BLOCKED_OUTER.valid_tile_size_fn,
     )
-    qdata_ref, scale_ref = flex_tile_map(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qdata_tile, scale_tile = flex_tile_map(x, NVFP4_BLOCKED_OUTER.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+    qdata_ref, scale_ref = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    qdata_tile, scale_tile = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
 
     assert _qdata_equal(qdata_tile, qdata_ref)
     assert scale_tile.shape == scale_ref.shape
     assert torch.equal(scale_tile, scale_ref)
 
 
-def test_nvfp4_blocked_outer_sqnr_vs_high_precision():
-    torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
-
-    outer = nvfp4_blocked_outer_scale(x)
-    qdata, scale = flex_tile_map(
-        x,
-        NVFP4_BLOCKED_OUTER.quant,
-        aux_inputs=(outer,),
-        aux_kinds=(AuxKind.TILE,),
-        valid_tile_size_fn=NVFP4_BLOCKED_OUTER.valid_tile_size_fn,
-    )
-    x_hat = NVFP4_BLOCKED_OUTER.dequant(qdata, scale, outer)
-    assert _compute_error(x.float(), x_hat.float()) > 12.0
+# test_nvfp4_blocked_outer_sqnr_vs_high_precision has migrated to quant_cast_gold (see
+# quant_cast_gold/recipes.py) and is now covered by the generic test_gold_correctness above.
 
 
 # AuxKind.TILE with divisor (1, 1): an elementwise bias (same shape as input) added before mxfp8.
@@ -734,12 +644,13 @@ def test_mxfp8_bias_backends_match():
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
+    kernel = MXFP8_BIAS.pt_ref_fn
     kw = dict(aux_inputs=(bias,), aux_kinds=(AuxKind.TILE,), valid_tile_size_fn=MXFP8_BIAS.valid_tile_size_fn)
-    qdata_ref, scale_ref = flex_tile_map(x, MXFP8_BIAS.quant, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qdata_tile, scale_tile = flex_tile_map(x, MXFP8_BIAS.quant, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+    qdata_ref, scale_ref = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    qdata_tile, scale_tile = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
 
     # matches a direct (whole-tensor) bias-add + quant, and REFERENCE == MANUAL_TILE.
-    qdata_direct, scale_direct = mxfp8_bias_f(x, bias)
+    qdata_direct, scale_direct = kernel(x, bias)
     assert _qdata_equal(qdata_ref, qdata_direct)
     assert torch.equal(scale_ref, scale_direct)
     assert _qdata_equal(qdata_tile, qdata_ref)

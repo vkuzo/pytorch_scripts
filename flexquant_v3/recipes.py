@@ -6,619 +6,199 @@ table registers them (plus per-recipe test metadata) for the tests in test.py. M
 mirrors flexquant v1 recipes.py.
 """
 
+import os
+import sys
 from dataclasses import dataclass
-from typing import Callable, Tuple
+from typing import Any, Callable, Tuple
 
 import torch
 import torch.func._random as prng
 
-from utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uint4
+from api import AuxKind, OutputKind
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from quant_cast_gold.recipes import (
+    colwise_precalc_scale,
+    ColwiseFp8Gold,
+    ColwisePrecalcGold,
+    Deepseek1x128DimMGold,
+    Deepseek1x128Gold,
+    Deepseek128x128Gold,
+    float8_tensorwise_scale,
+    Float8TensorwiseGold,
+    Mxfp8FloorGold,
+    Mxfp8FloorSwizzleGold,
+    Mxfp8BiasGold,
+    nvfp4_blocked_outer_scale,
+    nvfp4_gs_scale,
+    Nvfp4BlockedOuterGold,
+    Nvfp4GsSwizzleGold,
+    QuantCastSingleKernelGold,
+    rowwise_precalc_scale,
+    RowwiseFp8Gold,
+    RowwisePrecalcGold,
+)
 
 
 @dataclass(frozen=True)
-class Recipe:
-    """A single-kernel quant recipe: the quant kernel and its dequant.
+class RecipeV2(QuantCastSingleKernelGold):
+    """A flexquant_v3 recipe backed directly by a quant_cast_gold golden recipe.
 
-    `quant(x) -> (qdata, aux_out)` is the `f` passed to `flex_tile_map`; it is always
-    tile-invariant (the same computation applied independently to every tile) -- that is a
-    precondition of the API, so it isn't a per-recipe field. `dequant(qdata, scale) -> fp32`
-    inverts it (for SQNR checks). Single-kernel only for now: recipes that need a separate
-    kernel (e.g. tensorwise's global scale reduction) keep that step outside the Recipe.
+    Inherits `pt_ref_fn`/`correctness_fn` from `QuantCastSingleKernelGold` unchanged --
+    flexquant_v3 adds the things gold doesn't know about: the flex_tile_map tiling
+    constraint, and (for recipes whose `pt_ref_fn` takes precomputed aux args beyond `x`,
+    e.g. a precalculated per-row/per-col scale) how to build and pass those aux inputs.
+    Recipes migrate here incrementally (see quant_cast_gold/recipes.py); `Recipe` above
+    remains for not-yet-migrated recipes.
     """
 
-    quant: Callable
-    dequant: Callable
-    # per-recipe tiling constraint: (tensor_size, actual_tile_size, padded_tile_size) -> bool.
-    # None => any tile size is valid. See flex_tile_map's `valid_tile_size_fn`.
     valid_tile_size_fn: Callable[
         [Tuple[int, int], Tuple[int, int], Tuple[int, int]], bool
     ] | None = None
+    # (x) -> tuple of precomputed aux tensors (e.g. a precalculated scale), computed OUTSIDE
+    # flex_tile_map and passed as `aux_inputs`. None => pt_ref_fn takes only `x`.
+    aux_fn: Callable[[torch.Tensor], Tuple[torch.Tensor, ...]] | None = None
+    aux_kinds: Tuple[Any, ...] | None = None  # AuxKind per aux_fn() output
+    output_kinds: Tuple[Any, ...] | None = None  # OutputKind per pt_ref_fn() output
 
-
-# ---------------------------------------------------------------------------
-# The recipe: deepseek fp8 1x128, expressed as a tile-invariant `f`.
-#
-# Whole-tensor + block-aware form (v1 _reference_fn style). `flex_tile_map` runs this
-# as a passthrough today; the reshape->amax->scale->cast is the same computation applied
-# independently to every 1x128 group, i.e. tile-invariant. Math mirrors v1
-# _deepseek_fp8_1_128_reference (recipes.py:60-70). Constants are inlined per recipe
-# (block size 128, eps 1e-12, fp8 e4m3 max 448.0) rather than shared as globals, since
-# other recipes with different constants will be added alongside this one.
-# ---------------------------------------------------------------------------
-def deepseek_1x128_f(x, **kwargs):  # kwargs: framework-supplied global_row/global_col/num_col (unused)
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    *lead, last = x.shape
-    x_b = x.reshape(*lead, last // 128, 128)
-    amax = x_b.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12).to(torch.float32)
-    scale = (amax / fp8_max).to(torch.float32)  # forward scale
-    qdata = (x_b.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
-    return qdata.reshape(*lead, last), scale.squeeze(-1)
-
-
-# ---------------------------------------------------------------------------
-# The recipe: deepseek fp8 128x128, expressed as a tile-invariant `f`.
-#
-# 2D block variant: amax over a full 128x128 tile, one scale per tile. Math mirrors v1
-# _deepseek_fp8_128_128_reference (recipes.py:100-121); the reshape/transpose gymnastics
-# gather each 128x128 tile into a contiguous group before reducing. Constants inlined
-# per recipe, as above.
-# ---------------------------------------------------------------------------
-def deepseek_128x128_f(x, **kwargs):
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    *lead, d1, d2 = x.shape
-    n1, n2 = d1 // 128, d2 // 128
-    x_b = (
-        x.reshape(*lead, n1, 128, n2, 128)
-        .transpose(-3, -2)
-        .contiguous()
-        .reshape(*lead, n1, n2, 128 * 128)
-    )
-    amax = x_b.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12).to(torch.float32)
-    scale = (amax / fp8_max).to(torch.float32)  # forward scale
-    qdata_b = (x_b.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
-    qdata = (
-        qdata_b.reshape(*lead, n1, n2, 128, 128)
-        .transpose(-3, -2)
-        .contiguous()
-        .reshape(*lead, d1, d2)
-    )
-    return qdata, scale.squeeze(-1)
-
-
-# ---------------------------------------------------------------------------
-# The recipe: mxfp8 with FLOOR rounding (1x32 blocks, e8m0 power-of-two scale).
-#
-# Tile-invariant like deepseek_1x128 (reduce over 32-element groups along N, no
-# transpose), but the scale is an e8m0 (float8_e8m0fnu) power-of-two rather than fp32.
-# Math mirrors v1 _mxfp8_floor_reference + its amax_to_scale/cast helpers
-# (recipes.py:321-362): the e8m0 scale is derived by extracting amax's fp32 exponent via
-# integer bit-ops (FLOOR, no log2), and the cast reconstructs the pow2 factor by shifting
-# the biased exponent back into the fp32 exponent field. Constants (block 32, e8m0/fp32
-# exponent bias 127, 23 fp32 mantissa bits, e4m3 max pow2 8) inlined per recipe.
-# ---------------------------------------------------------------------------
-def mxfp8_floor_f(x, **kwargs):
-    e8m0_exponent_bias = 127
-    f32_exp_bias = 127
-    mbits_f32 = 23
-    f8e4m3_max_pow2 = 8
-    f32_min_normal = 2.0**-126
-    e8m0_nan = 255
-
-    *lead, last = x.shape
-    x_b = x.reshape(*lead, last // 32, 32)
-    amax = x_b.abs().amax(dim=-1, keepdim=True)
-
-    # amax -> e8m0 block scale (FLOOR): extract fp32 exponent by integer bit-ops.
-    max_abs = amax.to(torch.float32)
-    max_abs_int32 = max_abs.view(torch.int32)
-    extracted_pow2 = ((max_abs_int32 >> mbits_f32) & 0xFF) - f32_exp_bias
-    scale_unbiased = extracted_pow2 - f8e4m3_max_pow2
-    scale_unbiased = torch.clamp(
-        scale_unbiased, -e8m0_exponent_bias, e8m0_exponent_bias + 1
-    )
-    scale_biased = (scale_unbiased + e8m0_exponent_bias).to(torch.uint8)
-    scale_biased = torch.where(
-        torch.isnan(max_abs), torch.full_like(scale_biased, e8m0_nan), scale_biased
-    )
-    scale_e8m0 = scale_biased.view(torch.float8_e8m0fnu)
-
-    # cast: reconstruct the fp32 pow2 factor from the e8m0 biased exponent, then divide.
-    biased_i32 = scale_e8m0.view(torch.uint8).to(torch.int32)
-    scale_fp32 = (biased_i32 << mbits_f32).view(torch.float32)
-    scale_fp32 = torch.clamp(scale_fp32, min=f32_min_normal)
-    qdata = (x_b.to(torch.float32) / scale_fp32).to(torch.float8_e4m3fn)
-
-    return qdata.reshape(*lead, last), scale_e8m0.squeeze(-1)
-
-
-def _to_blocked_4d(scale):
-    """Swizzle a row-major block-scale (H, W) into NVIDIA's blocked layout, kept as an
-    explicit 4D block grid `(n_row_blocks, n_col_blocks, 32, 16)`.
-
-    Ported from flexquant v1 swizzle.py:11-46 (itself a port of torchao's `to_blocked`,
-    torchao/prototype/mx_formats/utils.py), but the final `(n_row_blocks*32,
-    n_col_blocks*16)` reshape is NOT applied here. Serializing to that 2D buffer folds the
-    (row-block, col-block) walk order into the axes, which makes the result depend on the
-    GLOBAL grid shape -- a column split then reorders the buffer, so `f` composed with the
-    2D swizzle is not tile-invariant. Keeping the two block axes separate makes the swizzle
-    tile-invariant: a column tile concatenates on `dim=1` (n_col_blocks), a row tile on
-    `dim=0` (n_row_blocks), and `.reshape(-1)` still equals torchao's `to_blocked` buffer
-    (do that serialization once, outside `f`, after tiles are reassembled).
-
-    Each 128x4 scale block swizzles independently into a 32x16 block, so this is a LOCAL
-    (per-atom) transform: valid only when tiles are whole 128x4 scale atoms.
-    """
-    def _ceil_div(a, b):
-        return (a + b - 1) // b
-
-    rows, cols = scale.shape
-    n_row_blocks = _ceil_div(rows, 128)
-    n_col_blocks = _ceil_div(cols, 4)
-    padded_rows = n_row_blocks * 128
-    padded_cols = n_col_blocks * 4
-
-    padded = scale
-    if torch.compiler.is_compiling() or (rows, cols) != (padded_rows, padded_cols):
-        padded = torch.zeros(
-            (padded_rows, padded_cols), device=scale.device, dtype=scale.dtype
+    @classmethod
+    def from_gold(
+        cls,
+        gold: QuantCastSingleKernelGold,
+        valid_tile_size_fn=None,
+        aux_fn=None,
+        aux_kinds=None,
+        output_kinds=None,
+    ) -> "RecipeV2":
+        """Build a RecipeV2 from a gold recipe, adding the tiling constraint and (if the
+        recipe needs it) how to build its precomputed aux inputs."""
+        return cls(
+            pt_ref_fn=gold.pt_ref_fn,
+            correctness_fn=gold.correctness_fn,
+            valid_tile_size_fn=valid_tile_size_fn,
+            aux_fn=aux_fn,
+            aux_kinds=aux_kinds,
+            output_kinds=output_kinds,
         )
-        padded[:rows, :cols] = scale
-
-    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
-    # (n_row_blocks, n_col_blocks, 128, 4) -> (n_row_blocks, n_col_blocks, 32, 16), keeping
-    # the two block axes intact (no reshape across them).
-    rearranged = blocks.reshape(n_row_blocks, n_col_blocks, 4, 32, 4).transpose(-3, -2)
-    return rearranged.reshape(n_row_blocks, n_col_blocks, 32, 16)
 
 
-def _from_blocked_4d(blocked, rows, cols):
-    """Inverse of `_to_blocked_4d` for the exact case rows % 128 == 0, cols % 4 == 0.
-
-    `blocked` is the 4D block grid `(n_row_blocks, n_col_blocks, 32, 16)`.
-    """
-    nrb, ncb = rows // 128, cols // 4
-    x = blocked.reshape(nrb, ncb, 32, 4, 4).transpose(-3, -2)
-    x = x.reshape(nrb, ncb, 128, 4).permute(0, 2, 1, 3)
-    return x.reshape(rows, cols)
-
-
-# nvfp4 format constants (fp4 e2m1 max value + e4m3 scale range).
-F4_E2M1_MAX = 6.0
-F8E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
-
-
-# ---------------------------------------------------------------------------
-# The recipe: mxfp8 FLOOR with swizzled (NVIDIA 32x4x4 blocked) scale.
-#
-# Same quantization as mxfp8_floor_f, but the e8m0 scale is emitted in the blocked layout
-# `_scaled_mm` consumes (v1 mxfp8_floor_swizzle, recipes.py:401-423). The swizzle is a
-# LOCAL, tile-invariant transform when tiles are whole 128x128 hp units (= 128x4 e8m0
-# tiles): each 128x4 scale tile swizzles independently into a 32x16 block. The scale is
-# returned as the 4D block grid `(n_row_blocks, n_col_blocks, 32, 16)` (see
-# `_to_blocked_4d`): keeping the block axes separate makes it tile-invariant under BOTH
-# row and column splits -- MANUAL_TILE reassembles a column tile with cat(dim=1) and a row
-# tile with cat(dim=0). The final serialization to the flat `_scaled_mm` buffer (a global,
-# grid-shape-dependent step) is `.reshape(-1)`, done once outside `f` after reassembly.
-# ---------------------------------------------------------------------------
-def mxfp8_floor_swizzle_f(x, **kwargs):
-    qdata, scale_e8m0 = mxfp8_floor_f(x)
-    return qdata, _to_blocked_4d(scale_e8m0)
-
-
-# ---------------------------------------------------------------------------
-# The recipe: deepseek fp8 1x128, reduced across M (128x1 blocks), transposed output.
-#
-# Orientation is expressed as `f` (within-tile transpose) + OutputKind.SWAP_TILE_INDEX (grid
-# transpose), since `full_transpose = grid_transpose o within_tile_transpose`. `f` reduces over
-# dim0 (128x1 row blocks) directly and writes its tile outputs transposed; the framework's
-# tile-index swap places each tile at grid [n,m]. Together they yield (K, M) qdata and
-# (K, M//128) scale -- equivalent to v1 _deepseek_fp8_1_128_dim_m_reference. Both parts are
-# tile-invariant (the per-tile reduce+transpose needs no global info; the grid swap is the
-# framework's job), so it runs bit-exactly under both REFERENCE and MANUAL_TILE. The caller
-# passes output_kinds=(SWAP_TILE_INDEX, SWAP_TILE_INDEX) for the (qdata, scale) outputs.
-# ---------------------------------------------------------------------------
-def deepseek_1x128_dim_m_f(x, **kwargs):
-    """dim-M deepseek: reduce over dim0 (128x1 blocks along rows), then write the tile's outputs
-    TRANSPOSED locally. Pair with OutputKind.SWAP_TILE_INDEX on both outputs so the framework
-    places each transposed tile at the swapped grid position -> the full (K, M) layout.
-
-    Inlined from deepseek_1x128_f but reducing the other axis: reshape rows into 128-blocks and
-    amax over dim1 (the 128 within-block dim), giving a (M//128, N) scale; transpose both outputs
-    to (N, M) / (N, M//128) so a tile computed at grid [m, n] carries (bn, bm)-shaped data.
-    """
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    M, N = x.shape
-    x_b = x.reshape(M // 128, 128, N)
-    amax = x_b.abs().amax(dim=1, keepdim=True).clamp(min=1e-12).to(torch.float32)
-    scale = (amax / fp8_max).to(torch.float32)  # forward scale, (M//128, 1, N)
-    qdata = (x_b.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn).reshape(M, N)
-    # write outputs transposed locally; the framework's SWAP_TILE_INDEX handles the grid swap.
-    return qdata.t().contiguous(), scale.squeeze(1).t().contiguous()
-
-
-# ---------------------------------------------------------------------------
-# The recipes: rowwise / colwise fp8 (one scale per row / per column).
-#
-# The scale reduces over an ENTIRE row (rowwise) or column (colwise), so these are only
-# tile-invariant when the reduced dim is never severed by tiling: the recipe's valid_tile_size_fn
-# requires the tile to span all columns (rowwise, `actual[1] == tensor[1]`) or all rows (colwise,
-# `actual[0] == tensor[0]`), which makes the framework's tile-size search pick a full-span tile.
-# Under a non-spanning tile a tile would see only part of the row/column and compute the wrong amax.
-#
-# colwise additionally transposes its outputs locally and is paired with
-# output_kinds=SWAP_TILE_INDEX (like the dim-M recipe) to emit the transposed (N, M) layout;
-# rowwise emits the native (M, N) layout (no swap).
-# ---------------------------------------------------------------------------
-def rowwise_fp8_f(x, **kwargs):
-    """Rowwise fp8: one fp32 scale per row (amax over all columns). Tile must span all columns."""
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    amax = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-12).to(torch.float32)  # (M, 1)
-    scale = (amax / fp8_max).to(torch.float32)
-    qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
-    return qdata, scale  # scale shape (M, 1)
-
-
-def rowwise_fp8_dq_f(q, scale):
-    return q.float() * scale  # scale (M, 1) broadcasts over columns
-
-
-def colwise_fp8_f(x, **kwargs):
-    """Colwise fp8: one fp32 scale per column (amax over all rows). Tile must span all rows.
-
-    Writes both outputs transposed locally (q -> (N, M), scale -> (N, 1)); pair with
-    output_kinds=SWAP_TILE_INDEX so the framework's grid swap yields the transposed (N, M) layout.
-    """
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    amax = x.abs().amax(dim=0, keepdim=True).clamp(min=1e-12).to(torch.float32)  # (1, N)
-    scale = (amax / fp8_max).to(torch.float32)
-    qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
-    return qdata.t().contiguous(), scale.t().contiguous()  # (N, M), (N, 1)
-
-
-def colwise_fp8_dq_f(q, scale):
-    # q is (N, M) transposed frame; scale (N, 1) broadcasts over q's columns (the original rows).
-    return q.float() * scale
-
-
-# ---------------------------------------------------------------------------
-# The recipe: rowwise fp8 with a PRECALCULATED per-row scale (AuxKind.ROW).
-#
-# Unlike rowwise_fp8_f (which reduces the row itself, needing a full-column-spanning tile), here
-# the (M, 1) per-row scale is computed OUTSIDE and passed as an AuxKind.ROW aux input. `f` only does
-# the divide, which is tile-invariant under plain 2D tiling (each tile receives its rows' slice
-# of the scale, broadcast across its columns) -- so no tiling constraint is needed.
-# `rowwise_precalc_scale` is the global row-reduction that lives outside flex_tile_map.
-# ---------------------------------------------------------------------------
-def rowwise_precalc_scale(x):
-    """Per-row fp32 scale (row reduction; computed outside flex_tile_map). Returns (M, 1)."""
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    amax = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-12).to(torch.float32)
-    return (amax / fp8_max).to(torch.float32)  # (M, 1)
-
-
-def rowwise_precalc_f(x, scale, **kwargs):
-    """Rowwise fp8 cast given a precalculated (M, 1) per-row `scale` (AuxKind.ROW aux input)."""
-    qdata = (x.to(torch.float32) / scale).to(torch.float8_e4m3fn)
-    return (qdata,)  # scale is an input, not a returned output
-
-
-def rowwise_precalc_dq_f(q, scale):
-    return q.float() * scale  # (M, 1) broadcasts over columns
-
-
-# ---------------------------------------------------------------------------
-# The recipe: colwise fp8 with a PRECALCULATED per-column scale (AuxKind.COL), transposed output.
-#
-# The symmetric partner of the ROW precalc recipe: a (1, N) per-column scale is computed OUTSIDE
-# and passed as an AuxKind.COL aux input (each tile gets its columns' slice, broadcast across
-# rows). `f` divides and writes its tile output TRANSPOSED-contiguous; paired with
-# output_kinds=SWAP_TILE_INDEX (like colwise_fp8_f), the framework's grid swap yields the
-# transposed (N, M) layout. Tile-invariant under plain 2D tiling -- no tiling constraint needed.
-# ---------------------------------------------------------------------------
-def colwise_precalc_scale(x):
-    """Per-column fp32 scale (col reduction; computed outside flex_tile_map). Returns (1, N)."""
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    amax = x.abs().amax(dim=0, keepdim=True).clamp(min=1e-12).to(torch.float32)
-    return (amax / fp8_max).to(torch.float32)  # (1, N)
-
-
-def colwise_precalc_f(x, scale, **kwargs):
-    """Colwise fp8 cast given a precalculated (1, N) per-column `scale` (AuxKind.COL aux input);
-    writes the tile output transposed-contiguous (pair with output_kinds=SWAP_TILE_INDEX)."""
-    qdata = (x.to(torch.float32) / scale).to(torch.float8_e4m3fn)
-    return (qdata.t().contiguous(),)  # (Ntile, Mtile); scale is an input, not a returned output
-
-
-def colwise_precalc_dq_f(q, scale):
-    # q is (N, M) transposed frame; scale (1, N) -> transpose to (N, 1) to broadcast over q's cols.
-    return q.float() * scale.t()
-
-
-# ---------------------------------------------------------------------------
-# The recipe: float8 tensorwise (per-tensor) scaling.
-#
-# Unlike the block recipes, the scale is a single per-tensor value that needs a GLOBAL
-# reduction over the whole tensor -- that reduction is NOT tile-invariant, so it lives
-# OUTSIDE flex_tile_map (`float8_tensorwise_scale`; the "call something else" kernel
-# from api.py's docstring). Given that precomputed scale, quantization is just dividing
-# every element by one fixed scalar -- identical across tiles, hence tile-invariant -- so
-# it runs INSIDE flex_tile_map via an `f` that takes the scale as an explicit REPLICATE
-# aux input (handed whole to every tile).
-# ---------------------------------------------------------------------------
-def float8_tensorwise_scale(x):
-    """Per-tensor scale (global reduction; computed outside flex_tile_map)."""
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    amax = x.abs().amax().clamp(min=1e-12).to(torch.float32)
-    return (amax / fp8_max).to(torch.float32)  # scalar forward scale
-
-
-def float8_tensorwise_f(x, scale, **kwargs):
-    """Tile-invariant `f` taking the precomputed per-tensor `scale` as an explicit aux input
-    (REPLICATE: the same scalar scale is used for every tile)."""
-    qdata = (x.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
-    return qdata, scale
-
-
-# ---------------------------------------------------------------------------
-# The recipe: nvfp4 with global scale (two-level) + swizzled inner scale.
-#
-# Two-level scaling like v1 nvfp4_with_gs (recipes.py:255-320): a per-tensor fp32 OUTER
-# scale plus a per-16-element e4m3 INNER scale, with fp4-packed qdata. The outer scale is
-# a GLOBAL amax reduction -- not tile-invariant -- so (like tensorwise) it is computed
-# OUTSIDE flex_tile_map (`nvfp4_gs_scale`) and passed in as a REPLICATE aux input. The inner scale is
-# additionally swizzled into the NVIDIA blocked layout and returned as the 4D block grid
-# `(n_row_blocks, n_col_blocks, 32, 16)`, so MANUAL_TILE's cat recomposition reproduces the
-# full-tensor swizzle under both row and column splits (cf. mxfp8 swizzle).
-# ---------------------------------------------------------------------------
-def nvfp4_gs_scale(x):
-    """Per-tensor fp32 outer scale (global reduction; computed outside flex_tile_map)."""
-    outer_amax = x.abs().to(torch.float32).amax()
-    return outer_amax / (F8E4M3_MAX * F4_E2M1_MAX)
-
-
-def nvfp4_gs_swizzle_f(x, outer_scale, **kwargs):
-    """Tile-invariant `f` taking the precomputed per-tensor `outer_scale` as an explicit aux
-    input (REPLICATE: the same scalar outer scale is used for every tile)."""
-    *lead, last = x.shape
-    x_b = x.reshape(*lead, last // 16, 16)
-    local_amax = x_b.abs().amax(dim=-1, keepdim=True)
-    # inner e4m3 block scale, relative to the outer scale.
-    inner = torch.clamp(
-        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_scale,
-        min=E4M3_EPS, max=F8E4M3_MAX,
-    ).to(torch.float8_e4m3fn)
-    # cast: divide by (outer * inner), clamp to fp4 range, pack two per byte.
-    reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
-    data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
-    qdata_b = pack_uint4(f32_to_f4_unpacked(data_scaled)).view(torch.float4_e2m1fn_x2)
-    qdata = qdata_b.reshape(*lead, last // 2)
-    inner_swizzled = _to_blocked_4d(inner.squeeze(-1))
-    return qdata, inner_swizzled
-
-
-# ---------------------------------------------------------------------------
-# Dequant: recover fp32 from (qdata, scale) by broadcasting the scale back over qdata.
-# The swizzle recipe un-swizzles the scale first; the dim-M recipe reuses the plain 1x128
-# dequant and the test transposes the result back to (M, N).
-# ---------------------------------------------------------------------------
-def _e8m0_to_fp32(scale):
-    # inverse of mxfp8_floor_f's cast: e8m0 biased exponent -> fp32 pow2 factor.
-    biased_i32 = scale.contiguous().view(torch.uint8).to(torch.int32)
-    scale_fp32 = (biased_i32 << 23).view(torch.float32)
-    return torch.clamp(scale_fp32, min=2.0**-126)
-
-
-def deepseek_1x128_dq_f(q, scale):
-    M, N = q.shape
-    nb = N // 128
-    return (q.float().reshape(M, nb, 128) * scale.reshape(M, nb, 1)).reshape(M, N)
-
-
-def deepseek_128x128_dq_f(q, scale):
-    M, N = q.shape
-    n1, n2 = M // 128, N // 128
-    return (q.float().reshape(n1, 128, n2, 128) * scale.reshape(n1, 1, n2, 1)).reshape(M, N)
-
-
-def mxfp8_floor_dq_f(q, scale):
-    M, N = q.shape
-    nb = N // 32
-    s = _e8m0_to_fp32(scale).reshape(M, nb, 1)
-    return (q.float().reshape(M, nb, 32) * s).reshape(M, N)
-
-
-def dq_tensorwise(q, scale):
-    return q.float() * scale
-
-
-def mxfp8_floor_swizzle_dq_f(q, scale):
-    # un-swizzle the 4D block grid back to (M, N//32) e8m0, then dequant as mxfp8.
-    M, N = q.shape
-    rows, cols = M, N // 32
-    scale_e8m0 = _from_blocked_4d(scale, rows, cols)
-    return mxfp8_floor_dq_f(q, scale_e8m0)
-
-
-def nvfp4_gs_swizzle_dq_f(q, inner_swizzled, outer_scale):
-    """Dequant taking the per-tensor `outer_scale` as an explicit arg (symmetric with the
-    lifted quant `nvfp4_gs_swizzle_f`)."""
-    # q: (M, N//2) packed fp4; N = 2 * packed cols.
-    M, half = q.shape
-    N = half * 2
-    cols = N // 16  # number of 16-blocks per row (== inner scale cols)
-    # unpack fp4 -> fp32 in (M, N).
-    unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, N)
-    # un-swizzle inner scale (4D block grid) back to (M, cols) e4m3 -> fp32.
-    inner = _from_blocked_4d(inner_swizzled, M, cols)
-    inner_fp32 = inner.to(torch.float32).reshape(M, cols, 1)
-    return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer_scale).reshape(M, N)
-
-
-# ---------------------------------------------------------------------------
-# The recipe: nvfp4 with a 128x128-BLOCKED outer scale (instead of a global scalar).
-#
-# Same two-level nvfp4 as nvfp4_gs_swizzle_f, but the outer scale is one value per 128x128
-# block -- shape (M//128, N//128) -- computed outside and passed as an AuxKind.TILE aux. The
-# framework hands `f` the sub-block of the outer scale covering the current tile; `f`
-# block-broadcasts it to per-element (option-4 pattern: expand+reshape, no materialized (M,N)
-# scale). Because 128 is a multiple of the 16-element inner block, the outer is constant within
-# each 16-group, so one representative per 16-group aligns with the inner scale.
-# ---------------------------------------------------------------------------
-def nvfp4_blocked_outer_scale(x, blk=128):
-    """Per-128x128-block fp32 outer scale (block reduction; computed outside flex_tile_map).
-    Returns shape (M//blk, N//blk)."""
-    Mb, Nb = x.shape[0] // blk, x.shape[1] // blk
-    block_amax = x.abs().to(torch.float32).reshape(Mb, blk, Nb, blk).amax(dim=(1, 3))
-    return block_amax / (F8E4M3_MAX * F4_E2M1_MAX)  # (Mb, Nb)
-
-
-def nvfp4_blocked_outer_f(x, outer_blocked, **kwargs):
-    """Tile-invariant `f`: nvfp4 cast with a 128x128-blocked outer scale (AuxKind.TILE).
-
-    Instead of expanding the outer scale to per-element, reshape `x` so the outer block grid is
-    explicit -- (Mb, rows_per_block, Nb, n16_per_block, 16) -- and let `outer_blocked` broadcast
-    against it via size-1 axes. Each outer element then maps directly to its block slice of the
-    input; the full (M, N) outer scale is never materialized.
-    """
-    M, N = x.shape
-    Mb, Nb = outer_blocked.shape
-    rpb, cpb = M // Mb, N // Nb          # rows / cols per outer block (e.g. 128, 128)
-    n16 = cpb // 16                      # inner 16-groups per outer block along N
-    # block-grid view: last dim is the 16-element inner block.
-    x_b = x.reshape(Mb, rpb, Nb, n16, 16)
-    outer_b = outer_blocked[:, None, :, None, None]     # (Mb, 1, Nb, 1, 1), broadcasts
-    local_amax = x_b.abs().amax(dim=-1, keepdim=True)   # (Mb, rpb, Nb, n16, 1)
-    inner = torch.clamp(
-        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_b,
-        min=E4M3_EPS, max=F8E4M3_MAX,
-    ).to(torch.float8_e4m3fn)
-    reciprocal = (1.0 / outer_b) / inner.to(torch.float32)
-    data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
-    qdata = pack_uint4(f32_to_f4_unpacked(data_scaled)).view(torch.float4_e2m1fn_x2).reshape(M, N // 2)
-    # inner scale back to (M, N//16) row-major, then swizzle.
-    inner_swizzled = _to_blocked_4d(inner.squeeze(-1).reshape(M, N // 16))
-    return qdata, inner_swizzled
-
-
-def nvfp4_blocked_outer_dq_f(q, inner_swizzled, outer_blocked):
-    """Dequant for nvfp4_blocked_outer_f. Reshapes onto the outer block grid so `outer_blocked`
-    broadcasts via size-1 axes (no materialized (M, N) outer scale), mirroring the quant."""
-    M, half = q.shape
-    N = half * 2
-    Mb, Nb = outer_blocked.shape
-    rpb, cpb = M // Mb, N // Nb
-    n16 = cpb // 16
-    unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, N)
-    inner = _from_blocked_4d(inner_swizzled, M, N // 16)
-    # block-grid view: (Mb, rpb, Nb, n16, 16); outer broadcasts on the block axes.
-    data = unpacked.reshape(Mb, rpb, Nb, n16, 16)
-    inner_b = inner.to(torch.float32).reshape(Mb, rpb, Nb, n16, 1)
-    outer_b = outer_blocked[:, None, :, None, None]
-    return (data * inner_b * outer_b).reshape(M, N)
-
-
-# ---------------------------------------------------------------------------
-# The recipe: mxfp8 FLOOR with an elementwise bias added before quant.
-#
-# `bias` is the same shape as the input -> AuxKind.TILE with divisor (1, 1): the framework
-# partitions it exactly like the input (one bias element per input element). `f` just adds it
-# and runs the existing mxfp8 cast; dequant is the plain mxfp8 dequant (the bias is folded in).
-# ---------------------------------------------------------------------------
-def mxfp8_bias_f(x, bias, **kwargs):
-    """Tile-invariant `f`: add an elementwise `bias` (AuxKind.TILE, per-element) then mxfp8."""
-    return mxfp8_floor_f(x + bias.to(x.dtype))
+# All single-kernel quant recipes have migrated to quant_cast_gold (see
+# quant_cast_gold/recipes.py); their Gold objects (and precompute helpers like
+# `nvfp4_blocked_outer_scale`) are imported above. Only the non-quant examples (RHT,
+# stochastic rounding) remain defined locally below, alongside the RecipeV2 constructions.
 
 
 # Reduction constraints check `actual` (the real, possibly-ragged tile extent) so a severed
 # reduction block is rejected at the edge; swizzle-atom constraints check `padded` (the nominal
 # tile size, so ragged edge tiles are exempt -- recovers the old full_tile_multiple_of semantics).
-DEEPSEEK_1X128 = Recipe(
-    quant=deepseek_1x128_f,
-    dequant=deepseek_1x128_dq_f,
+# Migrated to quant_cast_gold: pt_ref_fn/correctness_fn come straight from the Gold object,
+# RecipeV2 adds only the tiling constraint.
+DEEPSEEK_1X128 = RecipeV2.from_gold(
+    Deepseek1x128Gold,
     valid_tile_size_fn=lambda ts, a, p: a[1] % 128 == 0,
 )
-DEEPSEEK_128X128 = Recipe(
-    quant=deepseek_128x128_f,
-    dequant=deepseek_128x128_dq_f,
+DEEPSEEK_128X128 = RecipeV2.from_gold(
+    Deepseek128x128Gold,
     valid_tile_size_fn=lambda ts, a, p: a[0] % 128 == 0 and a[1] % 128 == 0,
 )
 # dim-M: `f` transposes the tile + reduces last dim; caller pairs it with
-# output_kinds=SWAP_TILE_INDEX for the grid transpose. dequant is the plain 1x128 dequant (it
-# works in the (K, M) transposed frame); the test transposes the dequant result back to (M, N).
-# After the within-tile transpose the reduced (last) dim is the tile's original ROWS, so rows
-# must be a 128-multiple (checked on `actual`).
-DEEPSEEK_1X128_DIM_M = Recipe(
-    quant=deepseek_1x128_dim_m_f,
-    dequant=deepseek_1x128_dq_f,
+# output_kinds=SWAP_TILE_INDEX for the grid transpose. correctness_fn works in the (K, M)
+# transposed frame and transposes back before comparing to `x`. After the within-tile
+# transpose the reduced (last) dim is the tile's original ROWS, so rows must be a
+# 128-multiple (checked on `actual`).
+# TODO(future): the recipe framework needs a new field to test correctness for both
+# the reference function as well as the backend specified function, right now this
+# is not intuitive.
+DEEPSEEK_1X128_DIM_M = RecipeV2.from_gold(
+    Deepseek1x128DimMGold,
     valid_tile_size_fn=lambda ts, a, p: a[0] % 128 == 0,
 )
 # rowwise / colwise: the tile must span the reduced dim (predicate forces it to equal the tensor
 # extent), so the framework's tile-size search selects a full-span tile.
-ROWWISE_FP8 = Recipe(
-    quant=rowwise_fp8_f,
-    dequant=rowwise_fp8_dq_f,
+ROWWISE_FP8 = RecipeV2.from_gold(
+    RowwiseFp8Gold,
     valid_tile_size_fn=lambda ts, a, p: a[1] == ts[1],  # span all columns
 )
-COLWISE_FP8 = Recipe(
-    quant=colwise_fp8_f,
-    dequant=colwise_fp8_dq_f,
+COLWISE_FP8 = RecipeV2.from_gold(
+    ColwiseFp8Gold,
     valid_tile_size_fn=lambda ts, a, p: a[0] == ts[0],  # span all rows
 )
 # rowwise with a precalculated (M, 1) scale passed as an AuxKind.ROW aux input; the divide is
-# tile-invariant under plain 2D tiling (no tiling constraint needed).
-ROWWISE_PRECALC = Recipe(quant=rowwise_precalc_f, dequant=rowwise_precalc_dq_f)
+# tile-invariant under plain 2D tiling (no tiling constraint needed). aux_fn computes the scale
+# (a global row-reduction, outside flex_tile_map) that pt_ref_fn takes as its second arg.
+ROWWISE_PRECALC = RecipeV2.from_gold(
+    RowwisePrecalcGold,
+    aux_fn=lambda x: (rowwise_precalc_scale(x),),
+    aux_kinds=(AuxKind.ROW,),
+)
 # colwise with a precalculated (1, N) scale (AuxKind.COL) + transposed-contiguous output (pair
 # with output_kinds=SWAP_TILE_INDEX); tile-invariant under plain 2D tiling.
-COLWISE_PRECALC = Recipe(quant=colwise_precalc_f, dequant=colwise_precalc_dq_f)
-MXFP8_FLOOR = Recipe(
-    quant=mxfp8_floor_f,
-    dequant=mxfp8_floor_dq_f,
+COLWISE_PRECALC = RecipeV2.from_gold(
+    ColwisePrecalcGold,
+    aux_fn=lambda x: (colwise_precalc_scale(x),),
+    aux_kinds=(AuxKind.COL,),
+    output_kinds=(OutputKind.SWAP_TILE_INDEX,),
+)
+# reduction (1x32) checked on `actual`.
+MXFP8_FLOOR = RecipeV2.from_gold(
+    Mxfp8FloorGold,
     valid_tile_size_fn=lambda ts, a, p: a[1] % 32 == 0,
 )
 # reduction (1x32) checked on `actual`; swizzle atom (128x128) checked on `padded` (edge-exempt).
-MXFP8_FLOOR_SWIZZLE = Recipe(
-    quant=mxfp8_floor_swizzle_f,
-    dequant=mxfp8_floor_swizzle_dq_f,
+MXFP8_FLOOR_SWIZZLE = RecipeV2.from_gold(
+    Mxfp8FloorSwizzleGold,
     valid_tile_size_fn=lambda ts, a, p: a[1] % 32 == 0 and p[0] % 128 == 0 and p[1] % 128 == 0,
 )
-
-
 # Tensorwise recipe: the per-tensor scale is computed outside (via float8_tensorwise_scale)
-# and passed to flex_tile_map as an explicit aux input (AuxKind.REPLICATE), not bound here.
-FLOAT8_TENSORWISE = Recipe(
-    quant=float8_tensorwise_f,
-    dequant=dq_tensorwise,
+# and passed to pt_ref_fn as an explicit aux input (AuxKind.REPLICATE).
+FLOAT8_TENSORWISE = RecipeV2.from_gold(
+    Float8TensorwiseGold,
+    aux_fn=lambda x: (float8_tensorwise_scale(x),),
+    aux_kinds=(AuxKind.REPLICATE,),
 )
-
-
 # nvfp4 recipe: the per-tensor outer scale is computed outside (via nvfp4_gs_scale) and passed
-# to flex_tile_map / dequant as an explicit aux input (AuxKind.REPLICATE), not bound here.
-# reduction (1x16 inner) on `actual`; swizzle atom (128x64) on `padded` (edge-exempt).
-NVFP4_GS_SWIZZLE = Recipe(
-    quant=nvfp4_gs_swizzle_f,
-    dequant=nvfp4_gs_swizzle_dq_f,
+# to pt_ref_fn as an explicit aux input (AuxKind.REPLICATE). reduction (1x16 inner) on `actual`;
+# swizzle atom (128x64) on `padded` (edge-exempt).
+NVFP4_GS_SWIZZLE = RecipeV2.from_gold(
+    Nvfp4GsSwizzleGold,
     valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0 and p[0] % 128 == 0 and p[1] % 64 == 0,
+    aux_fn=lambda x: (nvfp4_gs_scale(x),),
+    aux_kinds=(AuxKind.REPLICATE,),
 )
-
-
 # nvfp4 with a 128x128-blocked outer scale (computed via nvfp4_blocked_outer_scale) passed as an
 # AuxKind.TILE aux. Same swizzle-atom constraints as NVFP4_GS_SWIZZLE; the 128x128 outer block is
 # coarser than the (128, 64) atom so it adds no new alignment constraint at 128-aligned tiles.
-NVFP4_BLOCKED_OUTER = Recipe(
-    quant=nvfp4_blocked_outer_f,
-    dequant=nvfp4_blocked_outer_dq_f,
+NVFP4_BLOCKED_OUTER = RecipeV2.from_gold(
+    Nvfp4BlockedOuterGold,
     valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0 and p[0] % 128 == 0 and p[1] % 64 == 0,
+    aux_fn=lambda x: (nvfp4_blocked_outer_scale(x),),
+    aux_kinds=(AuxKind.TILE,),
 )
-
-
 # mxfp8 FLOOR with an elementwise bias (same shape as input) added before quant, passed as an
-# AuxKind.TILE aux with divisor (1, 1). Dequant is the plain mxfp8 dequant.
-MXFP8_BIAS = Recipe(
-    quant=mxfp8_bias_f,
-    dequant=mxfp8_floor_dq_f,
+# AuxKind.TILE aux with divisor (1, 1). aux_fn uses a fixed ones-tensor for the generic gold
+# test -- bias isn't derived from `x` (it's an arbitrary same-shape input), so there's no
+# canonical non-trivial choice; Mxfp8BiasGold's correctness_fn only checks shape/dtype.
+MXFP8_BIAS = RecipeV2.from_gold(
+    Mxfp8BiasGold,
     valid_tile_size_fn=lambda ts, a, p: a[1] % 32 == 0,
+    aux_fn=lambda x: (torch.ones_like(x),),
+    aux_kinds=(AuxKind.TILE,),
 )
+RECIPES_V2 = [
+    ("deepseek_1x128", DEEPSEEK_1X128),
+    ("deepseek_128x128", DEEPSEEK_128X128),
+    ("deepseek_1x128_dim_m", DEEPSEEK_1X128_DIM_M),
+    ("rowwise_fp8", ROWWISE_FP8),
+    ("colwise_fp8", COLWISE_FP8),
+    ("rowwise_precalc", ROWWISE_PRECALC),
+    ("colwise_precalc", COLWISE_PRECALC),
+    ("mxfp8_floor", MXFP8_FLOOR),
+    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE),
+    ("float8_tensorwise", FLOAT8_TENSORWISE),
+    ("nvfp4_gs_swizzle", NVFP4_GS_SWIZZLE),
+    ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
+    ("mxfp8_bias", MXFP8_BIAS),
+]
 
 
 # ---------------------------------------------------------------------------
