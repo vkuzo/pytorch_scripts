@@ -34,11 +34,15 @@ class QuantCastSingleKernelGold:
     `example_input_fn(M, K) -> (x, *aux)` builds one representative set of positional
       inputs for `pt_ref_fn` at the given (rows, cols): the tensor `x` plus any extra args
       the recipe takes (a precalculated scale, a bias, an RHT matrix, a PRNG key).
+
+    `perf_description` is a free-form note about the recipe's performance characteristics
+      (filled in manually per recipe); surfaced in the benchmark results.
     """
 
     pt_ref_fn: Callable
     correctness_fn: Callable
     example_input_fn: Callable[[int, int], Tuple[torch.Tensor, ...]]
+    perf_description: str
 
 
 def _compute_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -87,6 +91,7 @@ Deepseek1x128Gold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_1x128_f,
     correctness_fn=_deepseek_1x128_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(1,128) block",
 )
 
 
@@ -139,6 +144,7 @@ Deepseek128x128Gold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_128x128_f,
     correctness_fn=_deepseek_128x128_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(128,128) block",
 )
 
 
@@ -181,6 +187,7 @@ Deepseek1x128DimMGold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_1x128_dim_m_f,
     correctness_fn=_deepseek_1x128_dim_m_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(128,1) block, t-contig",
 )
 
 
@@ -218,6 +225,7 @@ RowwiseFp8Gold = QuantCastSingleKernelGold(
     pt_ref_fn=rowwise_fp8_f,
     correctness_fn=_rowwise_fp8_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(1,-1) block",
 )
 
 
@@ -261,6 +269,7 @@ ColwiseFp8Gold = QuantCastSingleKernelGold(
     pt_ref_fn=colwise_fp8_f,
     correctness_fn=_colwise_fp8_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(-1,1) block, t-contig",
 )
 
 
@@ -314,6 +323,7 @@ RowwisePrecalcGold = QuantCastSingleKernelGold(
     pt_ref_fn=rowwise_precalc_f,
     correctness_fn=_rowwise_precalc_correctness,
     example_input_fn=_rowwise_precalc_inputs,
+    perf_description="elementwise",
 )
 
 
@@ -364,6 +374,7 @@ ColwisePrecalcGold = QuantCastSingleKernelGold(
     pt_ref_fn=colwise_precalc_f,
     correctness_fn=_colwise_precalc_correctness,
     example_input_fn=_colwise_precalc_inputs,
+    perf_description="elementwise",
 )
 
 
@@ -445,6 +456,7 @@ Mxfp8FloorGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_floor_f,
     correctness_fn=_mxfp8_floor_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(1,32) block",
 )
 
 
@@ -543,6 +555,7 @@ Mxfp8FloorSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_floor_swizzle_f,
     correctness_fn=_mxfp8_floor_swizzle_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(1,32) block, swizzle",
 )
 
 
@@ -599,6 +612,7 @@ Float8TensorwiseGold = QuantCastSingleKernelGold(
     pt_ref_fn=float8_tensorwise_f,
     correctness_fn=_float8_tensorwise_correctness,
     example_input_fn=_float8_tensorwise_inputs,
+    perf_description="elementwise",
 )
 
 
@@ -683,6 +697,7 @@ Nvfp4GsSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_f,
     correctness_fn=_nvfp4_gs_swizzle_correctness,
     example_input_fn=_nvfp4_gs_swizzle_inputs,
+    perf_description="(1,16) block, fp4 qdata, swizzle",
 )
 
 
@@ -773,6 +788,7 @@ Nvfp4BlockedOuterGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_blocked_outer_f,
     correctness_fn=_nvfp4_blocked_outer_correctness,
     example_input_fn=_nvfp4_blocked_outer_inputs,
+    perf_description="(1,16) block, fp4 qdata, swizzle",
 )
 
 
@@ -811,6 +827,7 @@ Mxfp8BiasGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_bias_f,
     correctness_fn=_mxfp8_bias_correctness,
     example_input_fn=_mxfp8_bias_inputs,
+    perf_description="",
 )
 
 # ---------------------------------------------------------------------------
@@ -886,6 +903,7 @@ HadamardRht = QuantCastSingleKernelGold(
     pt_ref_fn=hadamard_rht_f,
     correctness_fn=_hadamard_rht_correctness,
     example_input_fn=_hadamard_rht_inputs,
+    perf_description="elementwise RHT",
 )
 
 # ---------------------------------------------------------------------------
@@ -951,6 +969,7 @@ SrF32ToBf16 = QuantCastSingleKernelGold(
     pt_ref_fn=sr_bf16_f,
     correctness_fn=_sr_bf16_unbiased_correctness,
     example_input_fn=_sr_inputs,
+    perf_description="",
 )
 
 
@@ -990,26 +1009,36 @@ SrF32ToBf16Global = QuantCastSingleKernelGold(
     pt_ref_fn=sr_bf16_global_f,
     correctness_fn=_sr_bf16_unbiased_correctness,
     example_input_fn=_sr_inputs,
+    perf_description="elementwise SR with stateless RNG",
 )
 
 
 # (name, gold) index of every golden recipe. Consumed by quant_cast_gold/test.py (correctness)
 # and quant_cast_bench/benchmark.py (bandwidth sweep).
 ALL_RECIPES = [
-    ("fp8_deepseek_1x128", Deepseek1x128Gold),
-    ("fp8_deepseek_128x128", Deepseek128x128Gold),
-    ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
-    ("fp8_rowwise", RowwiseFp8Gold),
-    ("fp8_colwise", ColwiseFp8Gold),
+    # elementwise
+    ("fp8_tensorwise_precalc_scale", Float8TensorwiseGold),
     ("fp8_rowwise_precalc_scale", RowwisePrecalcGold),
     ("fp8_colwise_precalc_scale", ColwisePrecalcGold),
+    # 1x32, 8-bit
     ("mxfp8_floor", Mxfp8FloorGold),
     ("mxfp8_floor_swizzle", Mxfp8FloorSwizzleGold),
-    ("fp8_tensorwise_precalc_scale", Float8TensorwiseGold),
+    # 1x128, 8-bit
+    ("fp8_deepseek_1x128", Deepseek1x128Gold),
+    ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
+    # 128x128, 8-bit
+    ("fp8_deepseek_128x128", Deepseek128x128Gold),
+    # rowwise/colwise, 8-bit
+    ("fp8_rowwise", RowwiseFp8Gold),
+    ("fp8_colwise", ColwiseFp8Gold),
+    # 1x16, 4 bit
     ("nvfp4_swizzle", Nvfp4GsSwizzleGold),
     ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
-    ("mxfp8_bias", Mxfp8BiasGold),
+    # RHT
     ("bf16_rht", HadamardRht),
+    # stochastic rounding
     ("fp32_to_bf16_sr", SrF32ToBf16),
     ("fp32_to_bf16_sr_global_offsets", SrF32ToBf16Global),
+    # debug (not real recipes)
+    ("mxfp8_bias", Mxfp8BiasGold),
 ]

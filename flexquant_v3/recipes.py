@@ -66,6 +66,7 @@ class RecipeV2(QuantCastSingleKernelGold):
             pt_ref_fn=gold.pt_ref_fn,
             correctness_fn=gold.correctness_fn,
             example_input_fn=gold.example_input_fn,
+            perf_description=gold.perf_description,
             valid_tile_size_fn=valid_tile_size_fn,
             aux_kinds=aux_kinds,
             output_kinds=output_kinds,
