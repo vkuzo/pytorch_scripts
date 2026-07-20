@@ -26,6 +26,8 @@ from quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     float8_tensorwise_scale,
     Float8TensorwiseGold,
+    hadamard_rht_matrix,
+    HadamardRht,
     Mxfp8FloorGold,
     Mxfp8FloorSwizzleGold,
     Mxfp8BiasGold,
@@ -188,6 +190,24 @@ MXFP8_BIAS = RecipeV2.from_gold(
     aux_fn=lambda x: (torch.ones_like(x),),
     aux_kinds=(AuxKind.TILE,),
 )
+
+
+# RHT (non-quant): apply the 16x16 orthogonal transform along the last dim. The RHT matrix
+# (built from a fixed +/-1 sign vector) is passed as a REPLICATE aux; a column tile must keep
+# 16-groups intact (a[1] % 16 == 0), else it would sever a transform block. Correctness is the
+# roundtrip check (HadamardRht.correctness_fn: x recovered via rht.t()).
+def _hadamard_rht_aux(x):
+    # fixed +/-1 sign vector (deterministic, no global-RNG mutation).
+    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    return (hadamard_rht_matrix(sign, x.device, x.dtype),)
+
+
+HADAMARD_RHT = RecipeV2.from_gold(
+    HadamardRht,
+    valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0,
+    aux_fn=_hadamard_rht_aux,
+    aux_kinds=(AuxKind.REPLICATE,),
+)
 RECIPES_V2 = [
     ("deepseek_1x128", DEEPSEEK_1X128),
     ("deepseek_128x128", DEEPSEEK_128X128),
@@ -202,57 +222,8 @@ RECIPES_V2 = [
     ("nvfp4_gs_swizzle", NVFP4_GS_SWIZZLE),
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
     ("mxfp8_bias", MXFP8_BIAS),
+    ("hadamard_rht", HADAMARD_RHT),
 ]
-
-
-# ---------------------------------------------------------------------------
-# A non-quant example: the 16x16 randomized Hadamard transform (RHT). bf16 in, bf16 out,
-# NO scale/aux -- `f` returns a 1-tuple `(out,)`. This is the building block for torchao's
-# RHT-fused nvfp4 kernels (moe_training/nvfp4_training). RHT = diag(sign) @ H, where H is
-# the 16x16 Sylvester-Walsh matrix / sqrt(16); mirrors torchao get_rht_matrix. RHT is
-# orthogonal (its inverse is its transpose) but, with a sign vector, not an involution.
-# ---------------------------------------------------------------------------
-# 16x16 Sylvester-Walsh Hadamard values (torchao hadamard_utils.py get_hadamard_matrix).
-_HADAMARD_16 = [
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1],
-    [1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1],
-    [1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1],
-    [1, 1, 1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1],
-    [1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1],
-    [1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1, 1, 1],
-    [1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, 1, -1],
-    [1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1],
-    [1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1],
-    [1, 1, -1, -1, 1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1],
-    [1, -1, -1, 1, 1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1],
-    [1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 1, 1, 1],
-    [1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1, 1, -1, 1, -1],
-    [1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1, 1, 1, -1, -1],
-    [1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1],
-]
-
-
-def _hadamard_16_matrix(device, dtype):
-    """16x16 Sylvester-Walsh Hadamard matrix scaled by 1/sqrt(16) (orthonormal)."""
-    return torch.tensor(_HADAMARD_16, dtype=dtype, device=device) / (16**0.5)
-
-
-def hadamard_rht_matrix(sign_vector, device, dtype):
-    """RHT = diag(sign) @ H (torchao get_rht_matrix). `sign_vector` is a length-16 tensor."""
-    H = _hadamard_16_matrix(device, dtype)
-    return torch.diag(sign_vector.to(device=device, dtype=dtype)) @ H
-
-
-def hadamard_rht_f(x, rht, **kwargs):
-    """Tile-invariant `f` applying the 16x16 RHT along the last dim.
-
-    `rht` is the RHT matrix (built via `hadamard_rht_matrix`), passed as an explicit aux input
-    (REPLICATE: the same matrix is used for every tile). Returns a 1-tuple `(out,)` -- no scale.
-    """
-    *lead, last = x.shape
-    out = (x.reshape(*lead, last // 16, 16) @ rht).reshape(*lead, last)
-    return (out,)
 
 
 # ---------------------------------------------------------------------------

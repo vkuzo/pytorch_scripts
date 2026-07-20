@@ -16,8 +16,6 @@ from recipes import (
     MXFP8_FLOOR,
     MXFP8_FLOOR_SWIZZLE,
     RECIPES_V2,
-    hadamard_rht_f,
-    hadamard_rht_matrix,
     sr_bf16_f,
     sr_bf16_global_f,
 )
@@ -25,13 +23,6 @@ from recipes import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
-
-
-def _compute_error(x, y):
-    # torchao's `compute_error` (quantization/utils.py:63) -- SQNR in dB.
-    return 20 * torch.log10(
-        torch.linalg.vector_norm(x) / torch.linalg.vector_norm(x - y)
-    )
 
 
 def _qdata_equal(a, b):
@@ -52,55 +43,10 @@ def _qdata_equal(a, b):
 # test_flex_tile_map_ref_correctness, test_flex_tile_map_backends_keep_numerics.
 
 
-# randomized Hadamard transform (RHT): a non-quant example. `f` returns a 1-tuple `(out,)`
-# (no scale) and takes the RHT matrix as a REPLICATE aux input, identical across backends.
-def _rht_sign_vector():
-    torch.manual_seed(0)
-    return torch.randint(0, 2, (16,), device="cuda") * 2 - 1  # length-16 +/-1
-
-
-def _rht_matrix():
-    return hadamard_rht_matrix(_rht_sign_vector(), "cuda", torch.bfloat16)
-
-
-def test_hadamard_rht_matches_reference():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    rht = _rht_matrix()
-    (out,) = flex_tile_map(x, hadamard_rht_f, aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
-    (out_ref,) = hadamard_rht_f(x, rht)
-
-    assert out.shape == (512, 512)
-    assert out.dtype == torch.bfloat16
-    assert torch.equal(out, out_ref)
-
-
-def test_hadamard_rht_backends_match():
-    # single-output f: 256 // 2 == 128 is a multiple of 16, so quadrants don't sever a
-    # 16-group -> tile invariant. Exercises the generalized single-output _manual_tile.
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    rht = _rht_matrix()
-    kw = dict(aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
-    (out_ref,) = flex_tile_map(x, hadamard_rht_f, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    (out_tile,) = flex_tile_map(x, hadamard_rht_f, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-
-    assert torch.equal(out_tile, out_ref)
-
-
-def test_hadamard_rht_roundtrip_sqnr():
-    # RHT is orthogonal, so its inverse is its transpose (NOT applying it twice).
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    rht = _rht_matrix()
-    (y,) = flex_tile_map(x, hadamard_rht_f, aux_inputs=(rht,), aux_kinds=(AuxKind.REPLICATE,))
-
-    M, N = x.shape
-    x_rec = (y.reshape(M, N // 16, 16) @ rht.t()).reshape(M, N)
-    assert _compute_error(x.float(), x_rec.float()) > 25.0
+# the randomized Hadamard transform (RHT) is now a RecipeV2 (HADAMARD_RHT in recipes.py), so
+# it's covered by the generic RECIPES_V2 suite: test_ref_correctness (raw fn roundtrip),
+# test_flex_tile_map_ref_correctness (REFERENCE backend), and
+# test_flex_tile_map_backends_keep_numerics (REFERENCE == MANUAL_TILE bit-exact).
 
 
 # stochastic rounding fp32 -> bf16: non-quant, single-output `(out,)`, and by design NOT

@@ -765,6 +765,73 @@ Mxfp8BiasGold = QuantCastSingleKernelGold(
     correctness_fn=_mxfp8_bias_correctness,
 )
 
+# ---------------------------------------------------------------------------
+# Golden recipe: the 16x16 randomized Hadamard transform (RHT). A non-quant example: bf16
+# in, bf16 out, NO scale/aux output -- pt_ref_fn returns a 1-tuple `(out,)`. Building block
+# for torchao's RHT-fused nvfp4 kernels. RHT = diag(sign) @ H, where H is the 16x16
+# Sylvester-Walsh matrix / sqrt(16); mirrors torchao get_rht_matrix. RHT is orthogonal (its
+# inverse is its transpose) but, with a sign vector, not an involution. The RHT matrix is
+# passed to pt_ref_fn as an explicit input (a REPLICATE aux under flex_tile_map).
+# ---------------------------------------------------------------------------
+# 16x16 Sylvester-Walsh Hadamard values (torchao hadamard_utils.py get_hadamard_matrix).
+_HADAMARD_16 = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1],
+    [1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1],
+    [1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1],
+    [1, 1, 1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1],
+    [1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1],
+    [1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1, 1, 1],
+    [1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, 1, -1],
+    [1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1],
+    [1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1],
+    [1, 1, -1, -1, 1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1],
+    [1, -1, -1, 1, 1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1],
+    [1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 1, 1, 1],
+    [1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1, 1, -1, 1, -1],
+    [1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1, 1, 1, -1, -1],
+    [1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1],
+]
+
+
+def _hadamard_16_matrix(device, dtype):
+    """16x16 Sylvester-Walsh Hadamard matrix scaled by 1/sqrt(16) (orthonormal)."""
+    return torch.tensor(_HADAMARD_16, dtype=dtype, device=device) / (16**0.5)
+
+
+def hadamard_rht_matrix(sign_vector, device, dtype):
+    """RHT = diag(sign) @ H (torchao get_rht_matrix). `sign_vector` is a length-16 tensor."""
+    H = _hadamard_16_matrix(device, dtype)
+    return torch.diag(sign_vector.to(device=device, dtype=dtype)) @ H
+
+
+def hadamard_rht_f(x, rht, **kwargs):
+    """Apply the 16x16 RHT along the last dim. `rht` is the RHT matrix (built via
+    `hadamard_rht_matrix`), an explicit input. Returns a 1-tuple `(out,)` -- no scale."""
+    *lead, last = x.shape
+    out = (x.reshape(*lead, last // 16, 16) @ rht).reshape(*lead, last)
+    return (out,)
+
+
+def _hadamard_rht_correctness(
+    inputs: Tuple[torch.Tensor, torch.Tensor], outputs: Tuple[torch.Tensor]
+) -> None:
+    """RHT is orthogonal, so its transpose inverts it: recover `x` from the transformed output
+    (NOT by applying RHT twice) and assert high SQNR. There's no scale to dequant here."""
+    x, rht = inputs
+    (y,) = outputs
+    M, N = x.shape
+    x_rec = (y.reshape(M, N // 16, 16) @ rht.t()).reshape(M, N)
+    sqnr = _compute_error(x.float(), x_rec.float())
+    threshold = 25.0
+    assert sqnr > threshold, f"hadamard_rht: roundtrip sqnr={sqnr.item():.2f} dB below {threshold} dB"
+
+
+HadamardRht = QuantCastSingleKernelGold(
+    pt_ref_fn=hadamard_rht_f,
+    correctness_fn=_hadamard_rht_correctness,
+)
+
 
 # (recipe_name, gold) -- an index of migrated recipes for discoverability.
 RECIPES = [
