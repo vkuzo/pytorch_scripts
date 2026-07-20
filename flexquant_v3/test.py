@@ -13,26 +13,11 @@ from api import AuxKind, FlexTileMapBackend, OutputKind, flex_tile_map
 from recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
-    DEEPSEEK_128X128,
-    FLOAT8_TENSORWISE,
-    MXFP8_BIAS,
     MXFP8_FLOOR,
     MXFP8_FLOOR_SWIZZLE,
-    COLWISE_FP8,
-    COLWISE_PRECALC,
-    NVFP4_BLOCKED_OUTER,
-    NVFP4_GS_SWIZZLE,
     RECIPES_V2,
-    ROWWISE_FP8,
-    ROWWISE_PRECALC,
-    RecipeV2,
-    float8_tensorwise_scale,
     hadamard_rht_f,
     hadamard_rht_matrix,
-    nvfp4_blocked_outer_scale,
-    colwise_precalc_scale,
-    nvfp4_gs_scale,
-    rowwise_precalc_scale,
     sr_bf16_f,
     sr_bf16_global_f,
 )
@@ -40,24 +25,6 @@ from recipes import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
-
-
-# (recipe_name, recipe, scale shape+dtype, qdata_dtype, flat_compare, sqnr_min).
-# These recipes are all NORMAL orientation (no tile-index swap). The dim-M recipe, which uses
-# OutputKind.SWAP_TILE_INDEX, has its own dedicated tests (test_deepseek_dim_m_*).
-# qdata_dtype: fp4 packs two values per byte (float4_e2m1fn_x2) and is compared via its
-# uint8 view; everything else compares as fp32 (see _qdata_equal).
-# flat_compare: retained per recipe but now always False -- the swizzled scale is a 4D
-# block grid (n_row_blocks, n_col_blocks, 32, 16), which is tile-invariant, so REFERENCE
-# and MANUAL_TILE produce the SAME shape and compare bit-exact (no flatten needed).
-# sqnr_min: fp8 e4m3 recipes clear ~20 dB; the mxfp8 e8m0 pow2 scale is coarser (15 dB).
-# mxfp8_floor_swizzle scale: (256, 8) block scale -> nrb=2, ncb=2 -> (2, 2, 32, 16).
-RECIPES = [
-    ("deepseek_1x128", DEEPSEEK_1X128, (512, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
-    ("deepseek_128x128", DEEPSEEK_128X128, (512 // 128, 512 // 128), torch.float32, torch.float8_e4m3fn, False, 20.0),
-    ("mxfp8_floor", MXFP8_FLOOR, (512, 512 // 32), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
-    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE, (4, 4, 32, 16), torch.float8_e8m0fnu, torch.float8_e4m3fn, False, 15.0),
-]
 
 
 def _compute_error(x, y):
@@ -75,89 +42,14 @@ def _qdata_equal(a, b):
     return torch.equal(a.to(torch.float32), b.to(torch.float32))
 
 
-def _recipe_kernel(recipe):
-    """The flex_tile_map kernel `f` for either a v1 Recipe (`.quant`) or a migrated
-    RecipeV2 (`.pt_ref_fn`) -- the RECIPES table mixes both while migration is ongoing."""
-    return recipe.pt_ref_fn if isinstance(recipe, RecipeV2) else recipe.quant
+# float8_tensorwise is covered by the generic RECIPES_V2 suite: test_ref_correctness (raw fn),
+# test_flex_tile_map_ref_correctness (REFERENCE backend), and test_flex_tile_map_backends_keep_numerics
+# (REFERENCE == MANUAL_TILE bit-exact). No dedicated matches-reference test needed.
 
 
-def test_float8_tensorwise_matches_reference():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    kernel = FLOAT8_TENSORWISE.pt_ref_fn
-    # scale computed outside flex_tile_map, passed in as a REPLICATE aux input. `f` returns
-    # only qdata (the scale is an input, not a returned output).
-    scale = float8_tensorwise_scale(x)
-    (qdata,) = flex_tile_map(
-        x,
-        kernel,
-        aux_inputs=(scale,),
-        aux_kinds=(AuxKind.REPLICATE,),
-        valid_tile_size_fn=FLOAT8_TENSORWISE.valid_tile_size_fn,
-    )
-    (qdata_ref,) = kernel(x, scale)
-
-    # shapes / dtypes
-    assert qdata.shape == (512, 512)
-    assert qdata.dtype == torch.float8_e4m3fn
-
-    # bit-exact vs reference (matches v1/v2 discipline)
-    assert torch.equal(qdata.to(torch.float32), qdata_ref.to(torch.float32))
-
-
-# nvfp4 with global scale needs the runtime outer scale (a REPLICATE aux input), so -- like
-# tensorwise -- it lives in dedicated tests rather than the static RECIPES table.
-def test_nvfp4_gs_swizzle_matches_reference():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    kernel = NVFP4_GS_SWIZZLE.pt_ref_fn
-    # outer scale computed outside, passed in as a REPLICATE aux input.
-    outer = nvfp4_gs_scale(x)
-    qdata, scale = flex_tile_map(
-        x,
-        kernel,
-        aux_inputs=(outer,),
-        aux_kinds=(AuxKind.REPLICATE,),
-        valid_tile_size_fn=NVFP4_GS_SWIZZLE.valid_tile_size_fn,
-    )
-    qdata_ref, scale_ref = kernel(x, outer)
-
-    # shapes / dtypes: packed fp4 qdata + swizzled e4m3 inner scale as a 4D block grid.
-    # inner scale is (256, 256//16) = (256, 16) -> nrb=2, ncb=4 -> (2, 4, 32, 16).
-    assert qdata.shape == (512, 256)
-    assert qdata.dtype == torch.float4_e2m1fn_x2
-    assert scale.shape == (4, 8, 32, 16)
-    assert scale.dtype == torch.float8_e4m3fn
-
-    assert _qdata_equal(qdata, qdata_ref)
-    assert torch.equal(scale, scale_ref)
-
-
-def test_nvfp4_gs_swizzle_backends_match():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    kernel = NVFP4_GS_SWIZZLE.pt_ref_fn
-    outer = nvfp4_gs_scale(x)
-    kw = dict(
-        aux_inputs=(outer,),
-        aux_kinds=(AuxKind.REPLICATE,),
-        valid_tile_size_fn=NVFP4_GS_SWIZZLE.valid_tile_size_fn,
-    )
-    qdata_ref, scale_ref = flex_tile_map(
-        x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw
-    )
-    qdata_tile, scale_tile = flex_tile_map(
-        x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw
-    )
-
-    # exercises the _manual_tile packed-fp4 cat (via uint8 view).
-    assert _qdata_equal(qdata_tile, qdata_ref)
-    # swizzled scale is a 4D block grid: tile-invariant, so same shape AND bit-exact.
-    assert scale_tile.shape == scale_ref.shape
-    assert torch.equal(scale_tile, scale_ref)
+# nvfp4_gs_swizzle correctness (raw fn, REFERENCE backend, and REFERENCE == MANUAL_TILE
+# bit-exact) is covered by the generic RECIPES_V2 suite: test_ref_correctness,
+# test_flex_tile_map_ref_correctness, test_flex_tile_map_backends_keep_numerics.
 
 
 # randomized Hadamard transform (RHT): a non-quant example. `f` returns a 1-tuple `(out,)`
@@ -280,63 +172,11 @@ def test_sr_bf16_global_tiling_invariant():
     assert abs(out_ref.float().mean().item() - v) < 2e-3  # still unbiased
 
 
-@pytest.mark.parametrize(
-    "recipe, scale_shape, scale_dtype, qdata_dtype",
-    [(r, scale_shape, scale_dtype, qdata_dtype) for _, r, scale_shape, scale_dtype, qdata_dtype, _, _ in RECIPES],
-    ids=[name for name, *_ in RECIPES],
-)
-def test_matches_reference(recipe, scale_shape, scale_dtype, qdata_dtype):
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-    kernel = _recipe_kernel(recipe)
-
-    qdata, scale = flex_tile_map(
-        x,
-        kernel,
-        valid_tile_size_fn=recipe.valid_tile_size_fn,
-    )
-    qdata_ref, scale_ref = kernel(x)
-
-    # shapes / dtypes
-    assert qdata.dtype == qdata_dtype
-    assert scale.shape == scale_shape
-    assert scale.dtype == scale_dtype
-
-    # bit-exact vs reference (matches v1/v2 discipline)
-    assert _qdata_equal(qdata, qdata_ref)
-    assert torch.equal(scale, scale_ref)
-
-
-@pytest.mark.parametrize(
-    "recipe, flat_compare",
-    [(r, flat_compare) for _, r, _, _, _, flat_compare, _ in RECIPES],
-    ids=[name for name, *_ in RECIPES],
-)
-def test_backends_match(recipe, flat_compare):
-    # every recipe is tile-invariant, so the MANUAL_TILE backend must match REFERENCE
-    # exactly. 256 // 2 == 128 keeps the quadrant split on a 128x128 tile boundary.
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-    kernel = _recipe_kernel(recipe)
-
-    qdata_ref, scale_ref = flex_tile_map(
-        x,
-        kernel,
-        _backend=FlexTileMapBackend.REFERENCE,
-        valid_tile_size_fn=recipe.valid_tile_size_fn,
-    )
-    qdata_tile, scale_tile = flex_tile_map(
-        x,
-        kernel,
-        _backend=FlexTileMapBackend.MANUAL_TILE,
-        valid_tile_size_fn=recipe.valid_tile_size_fn,
-    )
-
-    assert _qdata_equal(qdata_tile, qdata_ref)
-    # every scale (incl. the 4D swizzled block grid) is tile-invariant: same shape, bit-exact.
-    del flat_compare  # retained in RECIPES for column layout; no longer needed here
-    assert scale_tile.shape == scale_ref.shape
-    assert torch.equal(scale_tile, scale_ref)
+# deepseek_1x128, deepseek_128x128, mxfp8_floor, mxfp8_floor_swizzle (and every other recipe)
+# are covered by the generic RECIPES_V2 suite: test_ref_correctness (raw fn), and
+# test_flex_tile_map_ref_correctness / test_flex_tile_map_backends_keep_numerics (REFERENCE
+# backend, and REFERENCE == MANUAL_TILE bit-exact). No per-recipe matches-reference /
+# backends-match tests needed.
 
 
 @pytest.mark.parametrize(
@@ -344,7 +184,29 @@ def test_backends_match(recipe, flat_compare):
     RECIPES_V2,
     ids=[name for name, _ in RECIPES_V2],
 )
-def test_gold_correctness(name, recipe):
+def test_ref_correctness(name, recipe):
+    # tests that running correctness_fn on the outputs of the reference fn itself passes --
+    # i.e. the gold recipe is internally consistent (pt_ref_fn's outputs clear its own
+    # correctness_fn), independent of flex_tile_map. Mirrors test_flex_tile_map_correctness
+    # but calls pt_ref_fn directly on the whole tensor instead of tiling it.
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+
+    aux = recipe.aux_fn(x) if recipe.aux_fn is not None else ()
+    inputs = (x, *aux)
+
+    outputs = recipe.pt_ref_fn(*inputs)
+    recipe.correctness_fn(inputs, outputs)  # raises AssertionError on failure
+
+
+@pytest.mark.parametrize(
+    "name, recipe",
+    RECIPES_V2,
+    ids=[name for name, _ in RECIPES_V2],
+)
+def test_flex_tile_map_ref_correctness(name, recipe):
+    # tests that running correctness_fn on the outputs of flex_tile_map passes
+
     torch.manual_seed(0)
     x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
 
@@ -363,6 +225,36 @@ def test_gold_correctness(name, recipe):
     )
     recipe.correctness_fn(inputs, outputs)  # raises AssertionError on failure
 
+@pytest.mark.parametrize(
+    "name, recipe",
+    RECIPES_V2,
+    ids=[name for name, _ in RECIPES_V2],
+)
+def test_flex_tile_map_backends_keep_numerics(name, recipe):
+    # every RecipeV2 is tile-invariant, so the MANUAL_TILE backend must produce bit-identical
+    # outputs to REFERENCE. Compares every output tensor (qdata + any scale/aux outputs)
+    # exactly via _qdata_equal (packed fp4 via its uint8 view; everything else -- fp8_e4m3,
+    # e8m0, fp32, 4D swizzle grids -- as a bit-exact fp32 compare).
+    torch.manual_seed(0)
+    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+
+    aux = recipe.aux_fn(x) if recipe.aux_fn is not None else ()
+    kw = dict(
+        aux_inputs=aux,
+        aux_kinds=recipe.aux_kinds,
+        output_kinds=recipe.output_kinds,
+        valid_tile_size_fn=recipe.valid_tile_size_fn,
+    )
+    ref = flex_tile_map(x, recipe.pt_ref_fn, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    tile = flex_tile_map(x, recipe.pt_ref_fn, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
+
+    assert len(ref) == len(tile), f"{name}: output count {len(tile)} != {len(ref)}"
+    for i, (r, t) in enumerate(zip(ref, tile)):
+        assert r.shape == t.shape and r.dtype == t.dtype, (
+            f"{name} output {i}: shape/dtype mismatch ({t.shape}/{t.dtype} vs {r.shape}/{r.dtype})"
+        )
+        assert _qdata_equal(t, r), f"{name} output {i}: MANUAL_TILE differs from REFERENCE"
+
 
 # dim-M deepseek: `f` transposes the tile + reduces last dim, and OutputKind.SWAP_TILE_INDEX
 # grid-transposes the placement. Together they reproduce deepseek_1x128_f(x.t()) -- the dim-M
@@ -370,38 +262,9 @@ def test_gold_correctness(name, recipe):
 _DIM_M_SWAP = (OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX)
 
 
-def test_deepseek_dim_m_matches_reference():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-    kernel = DEEPSEEK_1X128_DIM_M.pt_ref_fn
-
-    qdata, scale = flex_tile_map(
-        x,
-        kernel,
-        output_kinds=_DIM_M_SWAP,
-        valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn,
-    )
-    # reference: the old SWAP_0_AND_1_AXES layout == plain 1x128 on the transposed input.
-    qdata_ref, scale_ref = kernel(x)
-    assert qdata.shape == (512, 512)
-    assert scale.shape == (512, 512 // 128)
-    assert _qdata_equal(qdata, qdata_ref)
-    assert torch.equal(scale, scale_ref)
-
-
-def test_deepseek_dim_m_backends_match():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    kernel = DEEPSEEK_1X128_DIM_M.pt_ref_fn
-    kw = dict(output_kinds=_DIM_M_SWAP, valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn)
-    qr, sr = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qt, st = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-    assert _qdata_equal(qt, qr)
-    assert st.shape == sr.shape
-    assert torch.equal(st, sr)
-
-
+# dim-M whole-tensor correctness and REFERENCE == MANUAL_TILE (square) are covered by the
+# generic RECIPES_V2 suite (DEEPSEEK_1X128_DIM_M carries output_kinds=SWAP_TILE_INDEX). The
+# non-square case below is kept: it uniquely exercises the grid-transpose with P != Q.
 def test_deepseek_dim_m_non_square():
     # non-square input exercises the grid-transpose (P != Q): a 384x512 input produces a
     # (512, 384) qdata / (512, 3) scale swapped-grid output; REFERENCE == MANUAL_TILE bit-exact.
@@ -418,80 +281,10 @@ def test_deepseek_dim_m_non_square():
     assert torch.equal(st, sr)
 
 
-# rowwise / colwise fp8: the scale reduces over a whole row/column, so tiling must span that dim
-# (valid_tile_size_fn forces the tile to span all columns / all rows). REFERENCE ==
-# MANUAL_TILE bit-exact proves the spanning tile keeps the full-dim reduction intact.
-def test_rowwise_fp8_backends_match():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    kernel = ROWWISE_FP8.pt_ref_fn
-    kw = dict(valid_tile_size_fn=ROWWISE_FP8.valid_tile_size_fn)
-    qr, sr = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qt, st = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-    assert sr.shape == (512, 1)
-    assert _qdata_equal(qt, qr)
-    assert torch.equal(st, sr)
-
-
-# rowwise with a PRECALCULATED (M, 1) scale passed as an AuxKind.ROW aux input. The divide is
-# tile-invariant under plain 2D tiling (each tile gets its rows' slice of the scale, broadcast
-# across columns), so -- unlike ROWWISE_FP8 -- no tiling constraint is needed.
-def test_rowwise_precalc_row_aux_backends_match():
-    torch.manual_seed(0)
-    x = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
-
-    kernel = ROWWISE_PRECALC.pt_ref_fn
-    scale = rowwise_precalc_scale(x)  # (512, 1)
-    assert scale.shape == (512, 1)
-    kw = dict(aux_inputs=(scale,), aux_kinds=(AuxKind.ROW,))  # 2D tiling (default)
-    (qr,) = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    (qt,) = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-
-    # matches applying the precalc scale directly, and REFERENCE == MANUAL_TILE bit-exact.
-    (q_direct,) = kernel(x, scale)
-    assert _qdata_equal(qr, q_direct)
-    assert _qdata_equal(qt, qr)
-
-
-# colwise with a PRECALCULATED (1, N) scale passed as an AuxKind.COL aux input, writing the
-# output transposed-contiguous + OutputKind.SWAP_TILE_INDEX. Tile-invariant under plain 2D tiling
-# (each tile gets its columns' slice of the scale, broadcast across rows); non-square input makes
-# the transposed (N, M) layout observable.
-def test_colwise_precalc_col_aux_backends_match():
-    torch.manual_seed(0)
-    x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
-
-    kernel = COLWISE_PRECALC.pt_ref_fn
-    scale = colwise_precalc_scale(x)  # (1, 384)
-    assert scale.shape == (1, 384)
-    kw = dict(aux_inputs=(scale,), aux_kinds=(AuxKind.COL,), output_kinds=(OutputKind.SWAP_TILE_INDEX,))
-    (qr,) = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    (qt,) = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-
-    assert qr.shape == (384, 512)  # transposed (N, M)
-    (q_direct,) = kernel(x, scale)
-    assert _qdata_equal(qr, q_direct)
-    assert _qdata_equal(qt, qr)
-
-
-# colwise transposes its outputs locally + SWAP_TILE_INDEX, so the emitted layout is the
-# transposed (N, M) qdata / (N, 1) scale. Use a non-square input so the transpose is observable.
-_COLWISE_SWAP = (OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX)
-
-
-def test_colwise_fp8_backends_match():
-    torch.manual_seed(0)
-    x = torch.randn(512, 384, dtype=torch.bfloat16, device="cuda")
-
-    kernel = COLWISE_FP8.pt_ref_fn
-    kw = dict(valid_tile_size_fn=COLWISE_FP8.valid_tile_size_fn, output_kinds=_COLWISE_SWAP)
-    qr, sr = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qt, st = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-    assert qr.shape == (384, 512)  # transposed (N, M)
-    assert sr.shape == (384, 1)  # transposed (N, 1)
-    assert _qdata_equal(qt, qr)
-    assert torch.equal(st, sr)
+# rowwise_fp8, colwise_fp8, rowwise_precalc, and colwise_precalc are covered by the generic
+# RECIPES_V2 suite (their RecipeV2 objects carry the needed valid_tile_size_fn / aux_fn /
+# aux_kinds / output_kinds): test_ref_correctness, test_flex_tile_map_ref_correctness, and
+# test_flex_tile_map_backends_keep_numerics (REFERENCE == MANUAL_TILE bit-exact).
 
 
 # input padding (`pad_input_to_multiple_of`): a ragged input (e.g. LLM decode/prefill token
@@ -557,7 +350,7 @@ def test_pad_backends_match(recipe, pad_to):
     # tiling in both paths, so the two backends see the identical padded tensor).
     torch.manual_seed(0)
     x = torch.randn(200, 300, dtype=torch.bfloat16, device="cuda")
-    kernel = _recipe_kernel(recipe)
+    kernel = recipe.pt_ref_fn
     kw = dict(
         pad_input_to_multiple_of=pad_to,
         valid_tile_size_fn=recipe.valid_tile_size_fn,
@@ -587,69 +380,6 @@ def test_pad_matches_manual_pad():
     assert torch.equal(scale, scale_ref)
 
 
-# AuxKind.TILE: nvfp4 with a 128x128-blocked outer scale. The framework slices the outer scale
-# (2, 2) to the sub-block covering each tile; `f` block-broadcasts it. Divisor = 256//2 = 128.
-def test_nvfp4_blocked_outer_matches_reference():
-    torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
-
-    kernel = NVFP4_BLOCKED_OUTER.pt_ref_fn
-    outer = nvfp4_blocked_outer_scale(x)  # (2, 2)
-    assert outer.shape == (2, 2)
-    qdata, scale = flex_tile_map(
-        x,
-        kernel,
-        aux_inputs=(outer,),
-        aux_kinds=(AuxKind.TILE,),
-        valid_tile_size_fn=NVFP4_BLOCKED_OUTER.valid_tile_size_fn,
-    )
-    qdata_ref, scale_ref = kernel(x, outer)
-
-    assert qdata.shape == (256, 128)
-    assert qdata.dtype == torch.float4_e2m1fn_x2
-    assert scale.shape == (2, 4, 32, 16)
-    assert _qdata_equal(qdata, qdata_ref)
-    assert torch.equal(scale, scale_ref)
-
-
-def test_nvfp4_blocked_outer_backends_match():
-    # the real proof TILE slicing + f's block-broadcast compose: REFERENCE == MANUAL_TILE.
-    torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
-
-    kernel = NVFP4_BLOCKED_OUTER.pt_ref_fn
-    outer = nvfp4_blocked_outer_scale(x)
-    kw = dict(
-        aux_inputs=(outer,),
-        aux_kinds=(AuxKind.TILE,),
-        valid_tile_size_fn=NVFP4_BLOCKED_OUTER.valid_tile_size_fn,
-    )
-    qdata_ref, scale_ref = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qdata_tile, scale_tile = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-
-    assert _qdata_equal(qdata_tile, qdata_ref)
-    assert scale_tile.shape == scale_ref.shape
-    assert torch.equal(scale_tile, scale_ref)
-
-
-# test_nvfp4_blocked_outer_sqnr_vs_high_precision has migrated to quant_cast_gold (see
-# quant_cast_gold/recipes.py) and is now covered by the generic test_gold_correctness above.
-
-
-# AuxKind.TILE with divisor (1, 1): an elementwise bias (same shape as input) added before mxfp8.
-def test_mxfp8_bias_backends_match():
-    torch.manual_seed(0)
-    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
-    bias = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
-
-    kernel = MXFP8_BIAS.pt_ref_fn
-    kw = dict(aux_inputs=(bias,), aux_kinds=(AuxKind.TILE,), valid_tile_size_fn=MXFP8_BIAS.valid_tile_size_fn)
-    qdata_ref, scale_ref = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
-    qdata_tile, scale_tile = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-
-    # matches a direct (whole-tensor) bias-add + quant, and REFERENCE == MANUAL_TILE.
-    qdata_direct, scale_direct = kernel(x, bias)
-    assert _qdata_equal(qdata_ref, qdata_direct)
-    assert torch.equal(scale_ref, scale_direct)
-    assert _qdata_equal(qdata_tile, qdata_ref)
-    assert torch.equal(scale_tile, scale_ref)
+# nvfp4_blocked_outer (AuxKind.TILE) and mxfp8_bias (AuxKind.TILE, divisor (1,1)) are covered
+# by the generic RECIPES_V2 suite: test_ref_correctness, test_flex_tile_map_ref_correctness,
+# and test_flex_tile_map_backends_keep_numerics (REFERENCE == MANUAL_TILE bit-exact).
