@@ -632,54 +632,84 @@ def _f32_to_f4_code_tl(x):
     return (code | sign_lp) & 0xF
 
 
+# --- MSLK-derived helpers (ported from meta-pytorch/MSLK mslk/quantize/triton/fp4_quantize.py) ---
+@triton.jit
+def _nvfp4_scale_swizzle_offsets(offs_m):
+    # within-atom (128x4) swizzle offsets for rows `offs_m` (cols broadcast over arange(4)); a
+    # 128x4 layout is 32 4x4 sub-layouts. Equals the 4D (32,16) flatten used by _to_blocked_4d.
+    sub_layout_off = (offs_m % 32) * 16
+    sub_layout_row = offs_m // 32
+    return sub_layout_off + sub_layout_row * 4 + tl.arange(0, 4)[None, :]
+
+
+@triton.jit
+def _convert_fp32_to_fp4_packed(x_pairs):
+    # hardware fp32 -> packed fp4 e2m1 (RNE, saturating), two values per byte (first->low nibble,
+    # second->high nibble). Verbatim from MSLK's convert_fp32_to_fp4_packed.
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+        .reg .b8 byte0, byte1, byte2, byte3;
+        cvt.rn.satfinite.e2m1x2.f32 byte0, $5, $1;
+        cvt.rn.satfinite.e2m1x2.f32 byte1, $6, $2;
+        cvt.rn.satfinite.e2m1x2.f32 byte2, $7, $3;
+        cvt.rn.satfinite.e2m1x2.f32 byte3, $8, $4;
+        mov.b32 $0, {byte0, byte1, byte2, byte3};
+        }
+        """,
+        constraints=("=r,r,r,r,r,r,r,r,r"),
+        args=x_pairs,
+        dtype=tl.uint8,
+        is_pure=True,
+        pack=4,
+    )
+
+
 # ---------------------------------------------------------------------------
 # nvfp4 with a per-tensor (global) outer scale: 1x16 inner blocks, e4m3 inner scale, fp4-packed
-# qdata, inner scale written to the swizzled 4D grid. Mirrors nvfp4_gs_swizzle_f.
-# Grid: (cdiv(M, BM), N // 16).
+# qdata, inner scale written to the swizzled 4D grid. Mirrors nvfp4_gs_swizzle_f, restructured
+# after MSLK's triton_quantize_nvfp4 kernel: each program handles one 128x4 swizzle atom = 128
+# rows x 64 cols (= 4 inner groups), so the scale store is a coherent per-atom write and the fp4
+# encode uses the hardware `cvt.rn.satfinite.e2m1x2.f32`. Requires M % 128 == 0 and N % 64 == 0.
+# Numerics: the inner e4m3 scale / reciprocal / data-scaling are identical to the gold reference
+# (bit-exact); only the fp4 encoding may differ from gold's f32_to_f4_unpacked on rare RNE ties
+# (both round-to-nearest-even + saturate to +-6). Grid: (N // 64, M // 128).
 # ---------------------------------------------------------------------------
 @triton.jit
-def _nvfp4_swizzle_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, M, N, sxm, sxn, qsm, qsn, NCB, BM: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_g = tl.program_id(1)  # 16-group index along N
-    offs_m = pid_m * BM + tl.arange(0, BM)
-    m_mask = offs_m < M
-    offs_n = pid_g * 16 + tl.arange(0, 16)
-    x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=m_mask[:, None]).to(tl.float32)
-    amax = tl.max(tl.abs(x), axis=1)  # (BM,)
+def _nvfp4_swizzle_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, sxm, sxn, M, N, NCB):
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    offs_m = pid_m * 128 + tl.arange(0, 128)[:, None]
+    offs_n = pid_n * 64 + tl.arange(0, 64)[None, :]
+    x = tl.load(x_ptr + offs_m * sxm + offs_n * sxn).to(tl.float32)  # (128, 64)
+    x_blocks = x.reshape(128, 4, 16)
+    amax = tl.max(tl.abs(x_blocks), axis=2)  # (128, 4)
     outer = tl.load(outer_ptr)  # per-tensor scalar
     inner_val = tl.minimum(tl.maximum((amax / 6.0) / outer, 0.015625), 448.0)
-    inner_e4 = inner_val.to(tl.float8e4nv)
-    recip = (1.0 / outer) / inner_e4.to(tl.float32)  # (BM,)
-    data = tl.minimum(tl.maximum(x * recip[:, None], -6.0), 6.0)  # (BM, 16)
-    code = _f32_to_f4_code_tl(data)  # (BM, 16)
-    lo, hi = tl.split(tl.reshape(code, (BM, 8, 2)))  # even -> low nibble, odd -> high nibble
-    packed = (lo | (hi << 4)).to(tl.uint8)  # (BM, 8)
-    q_off = offs_m[:, None] * qsm + (pid_g * 8 + tl.arange(0, 8))[None, :] * qsn
-    tl.store(q_ptr + q_off, packed, mask=m_mask[:, None])
-    # swizzled inner-scale store (e4m3): pre-swizzle position (row=offs_m, col=pid_g)
-    br = offs_m // 128
-    r128 = offs_m % 128
-    a = r128 // 32
-    b = r128 % 32
-    bc = pid_g // 4
-    c4 = pid_g % 4
-    flat = ((br * NCB + bc) * 32 + b) * 16 + (a * 4 + c4)
-    tl.store(s_ptr + flat, inner_e4.to(tl.uint8, bitcast=True), mask=m_mask)
+    inner_e4 = inner_val.to(tl.float8e4nv)  # (128, 4)
+    recip = (1.0 / outer) / inner_e4.to(tl.float32)  # (128, 4)
+    x_blocks = x_blocks * recip[:, :, None]  # (128, 4, 16); cvt saturates to +-6
+    # coherent swizzled scale store: atom (pid_m, pid_n) at flat offset (pid_m*NCB + pid_n)*512.
+    layout_off = (pid_m * NCB + pid_n) * (128 * 4)
+    scale_offs = layout_off + _nvfp4_scale_swizzle_offsets(tl.arange(0, 128)[:, None])
+    tl.store(s_ptr + scale_offs, inner_e4)
+    # hardware fp4 pack: (128,4,16) -> (128,32,2) pairs -> (128,32) packed bytes.
+    q = _convert_fp32_to_fp4_packed(x_blocks.reshape(128, 32, 2).split())
+    q_offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
+    tl.store(q_ptr + offs_m * (N // 2) + q_offs_n, q)
 
 
 def nvfp4_swizzle_triton(x, outer_scale, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
+    assert M % 128 == 0 and N % 64 == 0, "MSLK-style nvfp4 kernel needs M%128==0 and N%64==0"
     q = torch.empty(M, N // 2, dtype=torch.uint8, device=x.device)
-    n_scale_cols = N // 16
-    nrb = (M + 127) // 128
-    ncb = (n_scale_cols + 3) // 4
-    s = torch.zeros(nrb, ncb, 32, 16, dtype=torch.uint8, device=x.device)
-    grid = (triton.cdiv(M, 64), N // 16)
-    _nvfp4_swizzle_kernel[grid](
-        x, outer_scale, q, s, M, N, x.stride(0), x.stride(1), q.stride(0), q.stride(1), ncb, BM=64
-    )
-    return q.view(torch.float4_e2m1fn_x2), s.view(torch.float8_e4m3fn)
+    nrb = M // 128
+    ncb = (N // 16) // 4  # == N // 64
+    s = torch.empty(nrb, ncb, 32, 16, dtype=torch.float8_e4m3fn, device=x.device)
+    grid = (N // 64, M // 128)
+    _nvfp4_swizzle_kernel[grid](x, outer_scale, q, s, x.stride(0), x.stride(1), M, N, ncb)
+    return q.view(torch.float4_e2m1fn_x2), s
 
 
 NVFP4_SWIZZLE = QuantCastTritonRecipe.from_gold(
