@@ -13,54 +13,17 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quant_cast_gold.recipes import (
-    ColwiseFp8Gold,
-    ColwisePrecalcGold,
-    Deepseek1x128DimMGold,
-    Deepseek1x128Gold,
-    Deepseek128x128Gold,
-    Float8TensorwiseGold,
-    HadamardRht,
-    Mxfp8BiasGold,
-    Mxfp8FloorGold,
-    Mxfp8FloorSwizzleGold,
-    Nvfp4BlockedOuterGold,
-    Nvfp4GsSwizzleGold,
-    RowwiseFp8Gold,
-    RowwisePrecalcGold,
-    SrF32ToBf16,
-    SrF32ToBf16Global,
-)
+from quant_cast_gold.recipes import ALL_RECIPES
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
 
 
-GOLD_CASES = [
-    ("deepseek_1x128", Deepseek1x128Gold),
-    ("deepseek_128x128", Deepseek128x128Gold),
-    ("deepseek_1x128_dim_m", Deepseek1x128DimMGold),
-    ("rowwise_fp8", RowwiseFp8Gold),
-    ("colwise_fp8", ColwiseFp8Gold),
-    ("rowwise_precalc", RowwisePrecalcGold),
-    ("colwise_precalc", ColwisePrecalcGold),
-    ("mxfp8_floor", Mxfp8FloorGold),
-    ("mxfp8_floor_swizzle", Mxfp8FloorSwizzleGold),
-    ("float8_tensorwise", Float8TensorwiseGold),
-    ("nvfp4_gs_swizzle", Nvfp4GsSwizzleGold),
-    ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
-    ("mxfp8_bias", Mxfp8BiasGold),
-    ("hadamard_rht", HadamardRht),
-    ("sr_bf16", SrF32ToBf16),
-    ("sr_bf16_global", SrF32ToBf16Global),
-]
-
-
 @pytest.mark.parametrize(
     "name, gold",
-    GOLD_CASES,
-    ids=[name for name, _ in GOLD_CASES],
+    ALL_RECIPES,
+    ids=[name for name, _ in ALL_RECIPES],
 )
 def test_ref_correctness(name, gold):
     # each gold recipe is internally consistent: pt_ref_fn's own outputs clear its correctness_fn.
