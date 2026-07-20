@@ -500,6 +500,60 @@ Mxfp8FloorDimMGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
+# Golden recipe: mxfp8 FLOOR with square 32x32 blocks (one e8m0 scale per 32x32 block).
+# Block structure mirrors deepseek_128x128_f (32 instead of 128); scale logic is mxfp8_floor's.
+# ---------------------------------------------------------------------------
+def mxfp8_32x32_floor_f(x, **kwargs):
+    *lead, d1, d2 = x.shape
+    n1, n2 = d1 // 32, d2 // 32
+    x_b = (
+        x.reshape(*lead, n1, 32, n2, 32)
+        .transpose(-3, -2)
+        .contiguous()
+        .reshape(*lead, n1, n2, 32 * 32)
+    )
+    amax = x_b.abs().amax(dim=-1, keepdim=True)  # (..., n1, n2, 1)
+    scale_e8m0 = _amax_to_e8m0_floor(amax)  # e8m0, (..., n1, n2, 1)
+    qdata_b = (x_b.to(torch.float32) / _e8m0_to_fp32(scale_e8m0)).to(torch.float8_e4m3fn)
+    qdata = (
+        qdata_b.reshape(*lead, n1, n2, 32, 32)
+        .transpose(-3, -2)
+        .contiguous()
+        .reshape(*lead, d1, d2)
+    )
+    return qdata, scale_e8m0.squeeze(-1)  # scale (M//32, N//32)
+
+
+def mxfp8_32x32_floor_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # inverse: un-block the e8m0 scale over the 32x32 grid (mirrors deepseek_128x128_dq_f).
+    M, N = q.shape
+    n1, n2 = M // 32, N // 32
+    s = _e8m0_to_fp32(scale).reshape(n1, 1, n2, 1)
+    return (q.float().reshape(n1, 32, n2, 32) * s).reshape(M, N)
+
+
+def _mxfp8_32x32_floor_correctness(
+    inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """Assert dequant(outputs) recovers `x` with SQNR above threshold. e8m0 pow2 scale is coarse,
+    so the threshold matches mxfp8_floor's (15 dB), not the fp8 recipes' (20 dB)."""
+    (x,) = inputs
+    qdata, scale = outputs
+    x_hat = mxfp8_32x32_floor_dq_f(qdata, scale)
+    sqnr = _compute_error(x.float(), x_hat.float())
+    threshold = 15.0
+    assert sqnr > threshold, f"mxfp8_32x32_floor: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+
+
+Mxfp832x32FloorGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_32x32_floor_f,
+    correctness_fn=_mxfp8_32x32_floor_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(32,32) block",
+)
+
+
+# ---------------------------------------------------------------------------
 # Golden recipe: mxfp8 FLOOR with swizzled (NVIDIA 32x4x4 blocked) scale.
 #
 # Same quantization as mxfp8_floor_f, but the e8m0 scale is emitted in the blocked layout
@@ -1063,6 +1117,7 @@ ALL_RECIPES = [
     ("mxfp8_floor", Mxfp8FloorGold),
     ("mxfp8_floor_swizzle", Mxfp8FloorSwizzleGold),
     ("mxfp8_floor_dim_m", Mxfp8FloorDimMGold),
+    ("mxfp8_32x32_floor", Mxfp832x32FloorGold),
     # 1x128, 8-bit
     ("fp8_deepseek_1x128", Deepseek1x128Gold),
     ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
