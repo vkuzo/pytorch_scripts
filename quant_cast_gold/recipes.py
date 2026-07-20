@@ -4,15 +4,15 @@ Each `QuantCastSingleKernelGold` pairs a plain-PyTorch reference kernel (`pt_ref
 the function that would be handed to flex_tile_map as `f`) with a `correctness_fn`
 that asserts a candidate set of outputs is "close enough" to `pt_ref_fn`'s own
 semantics. This package is intentionally independent of flexquant_v3 -- it must not
-import from it, since it exists to grade it. Migrated incrementally, recipe by
-recipe (see `RECIPES` below for the full list; flexquant_v3/recipes.py holds the
-recipes not yet migrated).
+import from it, since it exists to grade it. flexquant_v3/recipes.py imports these
+gold objects and wraps them as `RecipeV2` (adding the flex_tile_map tiling metadata).
 """
 
 from dataclasses import dataclass
 from typing import Callable, Tuple
 
 import torch
+import torch.func._random as prng
 
 from quant_cast_gold.utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uint4
 
@@ -832,20 +832,97 @@ HadamardRht = QuantCastSingleKernelGold(
     correctness_fn=_hadamard_rht_correctness,
 )
 
+# ---------------------------------------------------------------------------
+# Golden recipe: stochastic rounding (SR) fp32 -> bf16. A non-quant example. bf16 shares
+# fp32's 8-bit exponent, so this is the simplest SR target -- no exponent rebias, no packing,
+# no scale, no subnormal edge case: just dither the 16 discarded mantissa bits, then truncate.
+# pt_ref_fn returns a 1-tuple `(out,)`; the Philox key is passed as an explicit input (a
+# REPLICATE aux under flex_tile_map). SR is unbiased: a value between two bf16 grid points
+# rounds up with probability p_up = (x-lo)/(hi-lo), so E[SR(x)] = x.
+# ---------------------------------------------------------------------------
+def _sr_bf16_dither(x, rand16):
+    """Apply a uniform 16-bit dither `rand16` to `x` (fp32) then truncate to bf16.
 
-# (recipe_name, gold) -- an index of migrated recipes for discoverability.
-RECIPES = [
-    ("deepseek_1x128", Deepseek1x128Gold),
-    ("deepseek_128x128", Deepseek128x128Gold),
-    ("deepseek_1x128_dim_m", Deepseek1x128DimMGold),
-    ("rowwise_fp8", RowwiseFp8Gold),
-    ("colwise_fp8", ColwiseFp8Gold),
-    ("rowwise_precalc", RowwisePrecalcGold),
-    ("colwise_precalc", ColwisePrecalcGold),
-    ("mxfp8_floor", Mxfp8FloorGold),
-    ("mxfp8_floor_swizzle", Mxfp8FloorSwizzleGold),
-    ("float8_tensorwise", Float8TensorwiseGold),
-    ("nvfp4_gs_swizzle", Nvfp4GsSwizzleGold),
-    ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
-    ("mxfp8_bias", Mxfp8BiasGold),
-]
+    dither the 16 mantissa bits fp32->bf16 drops, then truncate them (mask off the low 16
+    bits). -65536 == 0xFFFF0000 as int32; .to(bfloat16) is exact since the low bits are zero.
+    """
+    xi = x.contiguous().view(torch.int32) + rand16
+    xi = xi & -65536
+    return xi.view(torch.float32).to(torch.bfloat16)
+
+
+def sr_bf16_f(x, key, **kwargs):
+    """fp32 -> bf16 stochastic rounding, keyed on the TILE-LOCAL element layout.
+
+    `key` is a torch.func._random (stateless counter-based Philox) PRNG key, an explicit input
+    (a REPLICATE aux under flex_tile_map). One uniform is drawn per element in tile-local order,
+    so offsets repeat across tiles and tiling CHANGES the rounding -- NOT tile-invariant, kept
+    as the counterexample. Returns `(out,)`.
+    """
+    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
+    # uniform [0, 1) per element from the Philox key, scaled to a uniform 16-bit dither.
+    u = prng.uniform(key, tuple(x.shape))
+    rand16 = (u * (1 << 16)).to(torch.int32)  # uniform int in [0, 2**16)
+    return (_sr_bf16_dither(x, rand16),)
+
+
+def _sr_bf16_unbiased_correctness(
+    inputs: Tuple[torch.Tensor, torch.Tensor], outputs: Tuple[torch.Tensor]
+) -> None:
+    """SR's defining property, checked on a CONSTANT input `x` (value v in [1, 2), where the
+    bf16 grid spacing is 2**-7): every output lands on one of the two bracketing bf16 grid
+    points, and the mean is ~= v (unbiased). `x` must be constant so the per-element draws share
+    the same two neighbors and the mean estimates E[SR(v)]."""
+    x, _key = inputs
+    (out,) = outputs
+    v = x.flatten()[0].item()
+    lo = torch.tensor(v, dtype=torch.bfloat16).float().item()  # RTN neighbor (round down)
+    hi = torch.tensor(v + 2**-7, dtype=torch.bfloat16).float().item()
+    assert lo < v < hi, f"sr_bf16: v={v} not strictly between bf16 neighbors ({lo}, {hi})"
+    uniq = set(out.float().unique().tolist())
+    assert uniq <= {lo, hi}, f"sr_bf16: unexpected values {uniq - {lo, hi}}"
+    assert abs(out.float().mean().item() - v) < 1e-3, "sr_bf16: mean not unbiased"
+
+
+SrF32ToBf16 = QuantCastSingleKernelGold(
+    pt_ref_fn=sr_bf16_f,
+    correctness_fn=_sr_bf16_unbiased_correctness,
+)
+
+
+def sr_bf16_global_f(x, key, **kwargs):
+    """Tiling-INVARIANT fp32 -> bf16 stochastic rounding: keys the dither on each element's
+    GLOBAL position in the parent tensor, so the draws don't shift with tiling (the tile-invariant
+    counterpart to `sr_bf16_f`, which keys on tile-local order and so is NOT tile-invariant).
+
+    The framework supplies the tile's global origin and row stride via kwargs, read here as
+    `global_row`, `global_col`, `num_col`. Each element's global flat index is
+    `(global_row + i) * num_col + (global_col + j)`; we build a per-element Philox key
+    `[seed, global_index]` (vectorized, no host sync) and draw one uniform each. Because the
+    index is global, element (i, j) gets the same draw regardless of which tile it lands in, so
+    REFERENCE == MANUAL_TILE bit-for-bit. Returns `(out,)`.
+    """
+    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
+    global_row = kwargs["global_row"]
+    global_col = kwargs["global_col"]
+    num_col = kwargs["num_col"]
+    M, N = x.shape
+    # per-element global flat index (int64 arithmetic; uint64 mul is unsupported on cuda).
+    i = (global_row + torch.arange(M, device=x.device)).view(-1, 1)
+    j = (global_col + torch.arange(N, device=x.device)).view(1, -1)
+    gidx = (i * num_col + j).reshape(-1).to(torch.int64)
+    # per-element Philox key [seed, global_index]; seed = key[0:1] (a slice, not .item(), so this
+    # stays traceable / survives the FakeTensor shape-probe).
+    seed = key[0:1].to(torch.int64).expand(gidx.numel())
+    keys = torch.stack([seed, gidx], dim=-1).to(torch.uint64)
+    u = prng.uniform(keys, (gidx.numel(),)).reshape(M, N)
+    rand16 = (u * (1 << 16)).to(torch.int32)
+    return (_sr_bf16_dither(x, rand16),)
+
+
+# same unbiasedness check as SrF32ToBf16 -- the two variants differ only in RNG keying (global
+# position vs tile-local order), not in the SR property each output must satisfy.
+SrF32ToBf16Global = QuantCastSingleKernelGold(
+    pt_ref_fn=sr_bf16_global_f,
+    correctness_fn=_sr_bf16_unbiased_correctness,
+)

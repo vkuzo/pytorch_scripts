@@ -39,6 +39,8 @@ from quant_cast_gold.recipes import (
     rowwise_precalc_scale,
     RowwiseFp8Gold,
     RowwisePrecalcGold,
+    SrF32ToBf16,
+    SrF32ToBf16Global,
 )
 
 
@@ -208,6 +210,26 @@ HADAMARD_RHT = RecipeV2.from_gold(
     aux_fn=_hadamard_rht_aux,
     aux_kinds=(AuxKind.REPLICATE,),
 )
+# stochastic rounding fp32 -> bf16 (tile-LOCAL, from SrF32ToBf16 gold). The DELIBERATE
+# non-tile-invariant counterexample: the dither is keyed on tile-local element order, so
+# MANUAL_TILE rounds differently from REFERENCE (test_flex_tile_map_backends_keep_numerics is
+# skipped for it -- see the skip in test.py). SR also needs a special test input (fp32, and a
+# constant value for its unbiasedness check) that the generic tests build by recipe name. The
+# PRNG key is a REPLICATE aux built via prng.key(seed).
+SR_BF16 = RecipeV2.from_gold(
+    SrF32ToBf16,
+    aux_fn=lambda x: (prng.key(0, device=x.device),),
+    aux_kinds=(AuxKind.REPLICATE,),
+)
+# tiling-INVARIANT SR (from SrF32ToBf16Global): keys the dither on each element's GLOBAL
+# position, so REFERENCE == MANUAL_TILE bit-for-bit (unlike SR_BF16). Same fp32 constant test
+# input and REPLICATE PRNG-key aux as SR_BF16. Its backend check is still skipped in the generic
+# suite (kept alongside SR_BF16); the invariance is asserted by test_sr_bf16_global_tiling_invariant.
+SR_BF16_GLOBAL = RecipeV2.from_gold(
+    SrF32ToBf16Global,
+    aux_fn=lambda x: (prng.key(0, device=x.device),),
+    aux_kinds=(AuxKind.REPLICATE,),
+)
 RECIPES_V2 = [
     ("deepseek_1x128", DEEPSEEK_1X128),
     ("deepseek_128x128", DEEPSEEK_128X128),
@@ -223,73 +245,8 @@ RECIPES_V2 = [
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
     ("mxfp8_bias", MXFP8_BIAS),
     ("hadamard_rht", HADAMARD_RHT),
+    ("sr_bf16", SR_BF16),
+    ("sr_bf16_global", SR_BF16_GLOBAL),
 ]
 
 
-# ---------------------------------------------------------------------------
-# A non-quant example: stochastic rounding (SR) fp32 -> bf16. bf16 shares fp32's 8-bit
-# exponent, so this is the simplest SR target -- no exponent rebias, no packing, no scale,
-# no subnormal edge case: just dither the 16 discarded mantissa bits, then truncate. `f`
-# returns a 1-tuple `(out,)`. Building block for the SR fp4 path (torchao _pack_fp4 +
-# cvt.rs) and mirrors rs_tutorial/rs.py, specialized fp32 -> bf16.
-#
-# SR is unbiased: a value between two bf16 grid points rounds up with probability
-# p_up = (x-lo)/(hi-lo). Adding a uniform 16-bit int to the fp32 bit pattern then
-# truncating carries into the kept bits with exactly that probability, so E[SR(x)] = x.
-# ---------------------------------------------------------------------------
-def _sr_bf16_dither(x, rand16):
-    """Apply a uniform 16-bit dither `rand16` to `x` (fp32) then truncate to bf16.
-
-    dither the 16 mantissa bits fp32->bf16 drops, then truncate them (mask off the low 16
-    bits). -65536 == 0xFFFF0000 as int32; .to(bfloat16) is exact since the low bits are zero.
-    """
-    xi = x.contiguous().view(torch.int32) + rand16
-    xi = xi & -65536
-    return xi.view(torch.float32).to(torch.bfloat16)
-
-
-def sr_bf16_f(x, key, **kwargs):
-    """`f` doing fp32 -> bf16 stochastic rounding, keyed on the TILE-LOCAL element layout.
-
-    `key` is a torch.func._random (stateless counter-based Philox) PRNG key, passed as an
-    explicit aux input (AuxKind.REPLICATE: the same key is handed to every tile) rather than
-    built from a closed-over seed. One uniform is drawn per element in tile-local order, so
-    offsets repeat across tiles and tiling CHANGES the rounding -- NOT tile-invariant, kept as
-    the counterexample. `sr_bf16_global_f` is the tiling-invariant version. Returns `(out,)`.
-    """
-    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
-    # uniform [0, 1) per element from the Philox key, scaled to a uniform 16-bit dither.
-    # TODO(future): expose random integer generation directly in PyTorch
-    # instead of having to do a multiply here
-    u = prng.uniform(key, tuple(x.shape))
-    rand16 = (u * (1 << 16)).to(torch.int32)  # uniform int in [0, 2**16)
-    return (_sr_bf16_dither(x, rand16),)
-
-
-def sr_bf16_global_f(x, key, **kwargs):
-    """Tiling-invariant fp32 -> bf16 stochastic rounding: keys the dither on each element's
-    GLOBAL position in the parent tensor, so the draws don't shift with tiling.
-
-    The framework supplies the tile's global origin and row stride via kwargs, read here as
-    `global_row`, `global_col`, `num_col`. Each element's global flat index is
-    `(global_row + i) * num_col + (global_col + j)`; we build a per-element Philox key
-    `[seed, global_index]` (vectorized, no host sync) and draw one uniform each. Because the
-    index is global, element (i, j) gets the same draw regardless of which tile it lands in, so
-    REFERENCE == MANUAL_TILE bit-for-bit. Returns `(out,)`.
-    """
-    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
-    global_row = kwargs["global_row"]
-    global_col = kwargs["global_col"]
-    num_col = kwargs["num_col"]
-    M, N = x.shape
-    # per-element global flat index (int64 arithmetic; uint64 mul is unsupported on cuda).
-    i = (global_row + torch.arange(M, device=x.device)).view(-1, 1)
-    j = (global_col + torch.arange(N, device=x.device)).view(1, -1)
-    gidx = (i * num_col + j).reshape(-1).to(torch.int64)
-    # per-element Philox key [seed, global_index]; seed = key[0:1] (a slice, not .item(), so this
-    # stays traceable / survives the FakeTensor shape-probe).
-    seed = key[0:1].to(torch.int64).expand(gidx.numel())
-    keys = torch.stack([seed, gidx], dim=-1).to(torch.uint64)
-    u = prng.uniform(keys, (gidx.numel(),)).reshape(M, N)
-    rand16 = (u * (1 << 16)).to(torch.int32)
-    return (_sr_bf16_dither(x, rand16),)
