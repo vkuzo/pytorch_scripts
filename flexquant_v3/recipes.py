@@ -112,6 +112,8 @@ DEEPSEEK_128X128 = RecipeV2.from_gold(
 DEEPSEEK_1X128_DIM_M = RecipeV2.from_gold(
     Deepseek1x128DimMGold,
     valid_tile_size_fn=lambda ts, a, p: a[0] % 128 == 0,
+    # `f` writes both outputs transposed locally; the grid swap yields the (K, M) layout.
+    output_kinds=(OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX),
 )
 # rowwise / colwise: the tile must span the reduced dim (predicate forces it to equal the tensor
 # extent), so the framework's tile-size search selects a full-span tile.
@@ -122,6 +124,8 @@ ROWWISE_FP8 = RecipeV2.from_gold(
 COLWISE_FP8 = RecipeV2.from_gold(
     ColwiseFp8Gold,
     valid_tile_size_fn=lambda ts, a, p: a[0] == ts[0],  # span all rows
+    # `f` writes both outputs transposed locally; the grid swap yields the (N, M) layout.
+    output_kinds=(OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX),
 )
 # rowwise with a precalculated (M, 1) scale passed as an AuxKind.ROW aux input; the divide is
 # tile-invariant under plain 2D tiling (no tiling constraint needed). aux_fn computes the scale
