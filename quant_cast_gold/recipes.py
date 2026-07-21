@@ -604,6 +604,60 @@ Mxfp8FloorDimMGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
+# mxfp8 FLOOR in BOTH directions in one pass. Reads x as-is and reduces it two ways -- dim-K (1x32
+# blocks along columns) and dim-M (32x1 blocks along rows) -- returning FOUR outputs. Models a fused
+# kernel that reads x once and emits both the rowwise (dim-K) and transposed (dim-M) mxfp8-floor
+# quantizations. The mxfp8 analog of deepseek_1x128_dim_km_f (block 32, e8m0 FLOOR scales, divide).
+# ---------------------------------------------------------------------------
+def mxfp8_floor_dim_km_f(x, **kwargs):
+    """One pass over x, reducing in both directions. Returns
+    (qdata_k (M,N), scale_k (M,N//32), qdata_m (N,M), scale_m (N,M//32)) with e8m0 scales:
+    dim-K matches mxfp8_floor_f, dim-M matches mxfp8_floor_dim_m_f (transposed outputs).
+    Requires M % 32 == 0 and N % 32 == 0.
+    """
+    M, N = x.shape
+    xf = x.to(torch.float32)  # read x once; both reshapes below are views of this buffer
+    # dim-K: 1x32 blocks along the last dim
+    xk = xf.reshape(M, N // 32, 32)
+    sk = _amax_to_e8m0_floor(xk.abs().amax(dim=-1, keepdim=True))
+    qk = (xk / _e8m0_to_fp32(sk)).to(torch.float8_e4m3fn).reshape(M, N)
+    # dim-M: 32x1 blocks along rows (reduce over the 32 within-block rows)
+    xm = xf.reshape(M // 32, 32, N)
+    sm = _amax_to_e8m0_floor(xm.abs().amax(dim=1, keepdim=True))
+    qm = (xm / _e8m0_to_fp32(sm)).to(torch.float8_e4m3fn).reshape(M, N)
+    # dim-M outputs in transposed (N,M)/(N,M//32) layout (matches Mxfp8FloorDimMGold);
+    # .t().contiguous() is applied to OUTPUTS only, never to the input.
+    return qk, sk.squeeze(-1), qm.t().contiguous(), sm.squeeze(1).t().contiguous()
+
+
+def _mxfp8_floor_dim_km_correctness(
+    inputs: Tuple[torch.Tensor, ...],
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """Both quantizations must dequant back to `x` with SQNR above threshold: the dim-K pair
+    directly, the dim-M pair in the transposed frame (reusing mxfp8_floor_dq_f, then .t())."""
+    (x,) = inputs
+    qk, sk, qm, sm = outputs
+    sqnr_k = _compute_error(x.float(), mxfp8_floor_dq_f(qk, sk).float())
+    sqnr_m = _compute_error(x.float(), mxfp8_floor_dq_f(qm, sm).t().float())
+    threshold = 15.0
+    assert sqnr_k > threshold, (
+        f"mxfp8_floor_dim_km (dim-k): sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
+    )
+    assert sqnr_m > threshold, (
+        f"mxfp8_floor_dim_km (dim-m): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
+    )
+
+
+Mxfp8FloorDimKmGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_floor_dim_km_f,
+    correctness_fn=_mxfp8_floor_dim_km_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(1,32) dim-k + (32,1) dim-m, one pass, t-contig",
+)
+
+
+# ---------------------------------------------------------------------------
 # Golden recipe: mxfp8 FLOOR with square 32x32 blocks (one e8m0 scale per 32x32 block).
 # Block structure mirrors deepseek_128x128_f (32 instead of 128); scale logic is mxfp8_floor's.
 # ---------------------------------------------------------------------------
@@ -1221,6 +1275,7 @@ ALL_RECIPES = [
     ("mxfp8_floor", Mxfp8FloorGold),
     ("mxfp8_floor_swizzle", Mxfp8FloorSwizzleGold),
     ("mxfp8_floor_dim_m", Mxfp8FloorDimMGold),
+    ("mxfp8_floor_dim_km", Mxfp8FloorDimKmGold),
     ("mxfp8_32x32_floor", Mxfp832x32FloorGold),
     # 1x128, 8-bit
     ("fp8_deepseek_1x128", Deepseek1x128Gold),
