@@ -63,6 +63,11 @@ def _bench_one(recipe, M, K, mode):
     torch.manual_seed(0)
     torch._dynamo.reset()
     inputs = recipe.example_input_fn(M, K)  # (x, *aux)
+    # Some recipes (e.g. fp32_to_bf16_sr_global_offsets) consume flex_tile_map framework kwargs
+    # naming the tile's global origin + parent row stride. The benchmark runs the whole tensor as a
+    # single tile, so origin = (0, 0) and num_col = the full width. Every recipe fn takes **kwargs,
+    # so these are ignored by the recipes that don't use them (verified across all benchmarked fns).
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
     # "triton"/"cute": run the recipe's hand-written kernel directly; "compile": torch.compile the
     # plain-PyTorch reference fn.
     if mode == "triton":
@@ -73,7 +78,7 @@ def _bench_one(recipe, M, K, mode):
         fn = torch.compile(recipe.pt_ref_fn, fullgraph=True)
 
     def run():
-        return fn(*inputs)
+        return fn(*inputs, **tile_kwargs)
 
     outputs = run()
     bytes_per_iter = _bytes_moved(inputs, outputs)
