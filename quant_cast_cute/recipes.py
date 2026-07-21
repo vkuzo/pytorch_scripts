@@ -422,20 +422,72 @@ MXFP8_FLOOR = QuantCastCuteRecipe.from_gold(Mxfp8FloorGold, cute_fn=mxfp8_floor_
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR dim-M: 32-row blocks down M, transposed outputs (N, M) / (N, M//32). Like the
-# deepseek dim-M variant, this is exactly mxfp8_floor on the transposed view x.t() (reduce its
-# last dim = 32 rows of x; the (N, M)-contiguous output view is the transpose). Reuse the kernel.
+# mxfp8 FLOOR dim-M: 32-row blocks down M, transposed outputs (N, M) / (N, M//32). The reduction is
+# down columns of x, and the output is transposed -- feeding x.t() to mxfp8_floor makes EVERY load
+# uncoalesced (ncu: DRAM 4.6%, store 32 sectors/request). Instead we read x NATIVELY in coalesced
+# (32,32) tiles, do a SHARED-MEMORY TRANSPOSE, and store coalesced:
+#   - thread t loads column t of the tile (warp reads 32 contiguous rows -> coalesced), computes
+#     that column's e8m0 scale intra-thread (no cross-thread reduce), quantizes its 32 rows;
+#   - each thread writes its quantized column into a padded (32x33) smem tile (col write is
+#     conflict-free; 33 pad makes the row read conflict-free too), __syncthreads;
+#   - thread t reads row t of smem and does a COALESCED transposed store (tv stride (1,32): adjacent
+#     threads -> adjacent output columns). qdata lands in y.t() (M,N)-view = the (N,M) transpose.
+# Result: ~35% of B200 peak at 16384 (7x over the x.t() reuse), ld/st ~2 sectors/request (coalesced),
+# on par with mxfp8_32x32. Remaining ceiling is ~50% occupancy (64 regs/thread, 1 warp/block).
 # ---------------------------------------------------------------------------
+@cute.kernel
+def _mxfp8_dim_m_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Tensor, cX: cute.Tensor,
+                        tv_col: cute.Layout, tv_store: cute.Layout, m_blocks: cutlass.Int32):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    smem = cutlass.utils.SmemAllocator()
+    sT = smem.allocate_tensor(gY.element_type, cute.make_layout((32, 33), stride=(33, 1)),
+                              byte_alignment=16)
+    # phase 1: coalesced column load, per-column amax + e8m0 quantize into a register column
+    thrX = cute.composition(gX[(None, bidx)], tv_col)[(tidx, None)]
+    thrC = cute.composition(cX[(None, bidx)], tv_col)[(tidx, None)]
+    frgX = cute.make_rmem_tensor(cute.get(tv_col, mode=[1]), gX.element_type)
+    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type), thrX, frgX)
+    v = frgX.load().to(cutlass.Float32)
+    amax = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+    sfp, biased = _e8m0_floor(amax)
+    sflat[thrC[0][1] * m_blocks + (thrC[0][0] // 32)] = biased.to(sflat.element_type)  # s[col, rb]
+    frgYc = cute.make_rmem_tensor(cute.get(tv_col, mode=[1]), gY.element_type)
+    frgYc.store((v / sfp).to(gY.element_type))
+    # transpose through smem: thread t writes its column, __sync, then reads its row
+    for r in cutlass.range_constexpr(32):
+        sT[r, tidx] = frgYc[r]
+    cute.arch.sync_threads()
+    frgYr = cute.make_rmem_tensor(cute.get(tv_store, mode=[1]), gY.element_type)
+    for c in cutlass.range_constexpr(32):
+        frgYr[c] = sT[tidx, c]
+    # phase 2: coalesced transposed store (into the y.t() view)
+    thrY = cute.composition(gY[(None, bidx)], tv_store)[(tidx, None)]
+    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type), frgYr, thrY)
+
+
+@cute.jit
+def _mxfp8_dim_m_jit(mX, mY, sflat, m_blocks: cutlass.Constexpr):
+    tv_col = cute.make_layout((32, 32), stride=(32, 1))    # thread t -> column t (32 rows)
+    tv_store = cute.make_layout((32, 32), stride=(1, 32))  # thread t -> row t; value c -> col c
+    gX = cute.zipped_divide(mX, (32, 32))
+    gY = cute.zipped_divide(mY, (32, 32))
+    cX = cute.zipped_divide(cute.make_identity_tensor(mX.shape), (32, 32))
+    _mxfp8_dim_m_kernel(gX, gY, sflat, cX, tv_col, tv_store, cutlass.Int32(m_blocks)).launch(
+        grid=[cute.size(gX, mode=[1]), 1, 1], block=[32, 1, 1])
+
+
 def mxfp8_floor_dim_m_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
+    assert M % 32 == 0 and N % 32 == 0, "mxfp8_floor_dim_m cute kernel needs M,N % 32 == 0"
     y = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)  # transposed output
     s_u8 = torch.empty(N, M // 32, dtype=torch.uint8, device=x.device)
-    mX = from_dlpack(x.t()).mark_layout_dynamic()  # (N, M) strided view; reduce its last dim
-    mY = from_dlpack(y).mark_layout_dynamic()
-    mS = from_dlpack(s_u8).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_floor_dim_m", M, N), _mxfp8_floor_jit, mX, mY, mS)
-    fn(mX, mY, mS)
+    mX = from_dlpack(x, assumed_align=16).mark_layout_dynamic()      # read x natively (coalesced)
+    mY = from_dlpack(y.t(), assumed_align=16).mark_layout_dynamic()  # (M,N)-view of the (N,M) output
+    sflat = from_dlpack(s_u8.reshape(-1)).mark_layout_dynamic()
+    fn = _compiled(("mxfp8_floor_dim_m", M, N), _mxfp8_dim_m_jit, mX, mY, sflat, M // 32)
+    fn(mX, mY, sflat)
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
