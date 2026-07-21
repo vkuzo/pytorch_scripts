@@ -235,6 +235,67 @@ Deepseek1x128DimMGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
+# Golden recipe: deepseek fp8 1x128 in BOTH directions in one pass. Reads x as-is (no input
+# transpose/contiguous) and reduces it two ways -- dim-K (1x128 blocks along columns) and dim-M
+# (128x1 blocks along rows) -- returning FOUR outputs. Models a fused kernel that reads x once and
+# emits both the rowwise (dim-K) and transposed (dim-M) fp8 quantizations. NOT built by calling the
+# two existing recipe fns (which would read/reshape x twice); the reductions share one fp32 view of x.
+# ---------------------------------------------------------------------------
+def deepseek_1x128_dim_km_f(x, **kwargs):
+    """One pass over x, reducing in both directions. Returns
+    (qdata_k (M,N), scale_k (M,N//128), qdata_m (N,M), scale_m (N,M//128)):
+    dim-K matches deepseek_1x128_f, dim-M matches deepseek_1x128_dim_m_f (transposed outputs).
+    Requires M % 128 == 0 and N % 128 == 0.
+    """
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    M, N = x.shape
+    xf = x.to(torch.float32)  # read x once; both reshapes below are views of this buffer
+    # dim-K: 1x128 blocks along the last dim
+    xk = xf.reshape(M, N // 128, 128)
+    scale_k = xk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / fp8_max
+    qdata_k = (xk * (1.0 / scale_k)).to(torch.float8_e4m3fn).reshape(M, N)
+    # dim-M: 128x1 blocks along rows (reduce over the 128 within-block rows)
+    xm = xf.reshape(M // 128, 128, N)
+    scale_m = xm.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / fp8_max
+    qdata_m = (xm * (1.0 / scale_m)).to(torch.float8_e4m3fn).reshape(M, N)
+    # dim-M outputs in transposed (N,M)/(N,M//128) layout (matches Deepseek1x128DimMGold);
+    # .t().contiguous() is applied to OUTPUTS only, never to the input.
+    return (
+        qdata_k,
+        scale_k.squeeze(-1),
+        qdata_m.t().contiguous(),
+        scale_m.squeeze(1).t().contiguous(),
+    )
+
+
+def _deepseek_1x128_dim_km_correctness(
+    inputs: Tuple[torch.Tensor, ...],
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """Both quantizations must dequant back to `x` with SQNR above threshold: the dim-K pair
+    directly, the dim-M pair in the transposed frame (reusing deepseek_1x128_dq_f, then .t())."""
+    (x,) = inputs
+    qk, sk, qm, sm = outputs
+    sqnr_k = _compute_error(x.float(), deepseek_1x128_dq_f(qk, sk).float())
+    sqnr_m = _compute_error(x.float(), deepseek_1x128_dq_f(qm, sm).t().float())
+    threshold = 20.0
+    assert sqnr_k > threshold, (
+        f"deepseek_1x128_dim_km (dim-k): sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
+    )
+    assert sqnr_m > threshold, (
+        f"deepseek_1x128_dim_km (dim-m): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
+    )
+
+
+Deepseek1x128DimKmGold = QuantCastSingleKernelGold(
+    pt_ref_fn=deepseek_1x128_dim_km_f,
+    correctness_fn=_deepseek_1x128_dim_km_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(1,128) dim-k + (128,1) dim-m, one pass, t-contig",
+)
+
+
+# ---------------------------------------------------------------------------
 # Golden recipe: rowwise fp8 (one scale per row, amax over all columns).
 # ---------------------------------------------------------------------------
 def rowwise_fp8_f(x, **kwargs):
@@ -1164,6 +1225,7 @@ ALL_RECIPES = [
     # 1x128, 8-bit
     ("fp8_deepseek_1x128", Deepseek1x128Gold),
     ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
+    ("fp8_deepseek_1x128_dim_km", Deepseek1x128DimKmGold),
     # 128x128, 8-bit
     ("fp8_deepseek_128x128", Deepseek128x128Gold),
     # rowwise/colwise, 8-bit
