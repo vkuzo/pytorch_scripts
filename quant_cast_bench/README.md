@@ -111,6 +111,22 @@ nvfp4_swizzle                        0.1373  5010.9       62.6%  (1,16) block, f
   applies the transform in registers, and writes 16 (or a Triton matmul template tuned for the skinny
   shape) would approach the relu ceiling.
 
+* `nvfp4_swizzle` (compile) runs at only ~23% peak (vs the Triton kernel's 62.6%), because inductor
+  splits it into **3 separate kernels** instead of one fused pass:
+  1. per-16-block `amax` reduction (reads `x` → block amaxes),
+  2. quantize: reads **`x` again** + outer scale + amaxes, computes the inner e4m3 scale and the fp4
+     data, writes packed nvfp4 (this kernel does contain the hardware `cvt.rn.satfinite.e2m1x2.f32`
+     fp4 encode — see `_f32_to_packed_fp4`),
+  3. a `permute/transpose` scatter that writes the swizzled inner scale.
+  So `x` is streamed **twice** (the quantize can't fuse with the reduction it depends on) and the
+  swizzle is a separate scatter. The hand-written Triton kernel collapses all of this into **one**
+  pass — load each block once, reduce to amax in-register, quantize from those registers, and write
+  both the fp4 data and the swizzled scale — which is the bulk of the 62.6% vs 23% gap. Note the fp4
+  encode itself is *not* the bottleneck (~60% in isolation); adding the hardware `cvt` (gated to
+  compile via `inline_asm_elementwise`, like torchao's `_to_mx_rceil`) only moved it 20.7% → 23%.
+  Fix direction: a single fused reduce+quantize+swizzle kernel (what Triton/CUDA do), which inductor
+  won't generate here.
+
 * `fp32_to_bf16_sr_global_offsets` (compile) runs at only ~6.2% peak — ~3.2× slower than
   `fp32_to_bf16_sr` (19.6%) for identical dithering math. The difference is how the Philox draw is
   keyed. Both use `torch.func._random.uniform` (experimental stateless Philox → unfused
