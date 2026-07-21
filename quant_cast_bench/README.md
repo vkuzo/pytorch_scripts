@@ -12,14 +12,14 @@ for the shape.
 * square quant block sizes (32x32, 128x128, etc)
   - For example, on fp8_deepseek_128x128, inductor 44.3% peak mem -> triton 77.1% peak mem
 * reductions across M-dim, or K-dim and M-dim in the same kernel
-  - For example, on mxfp8_floor_dim_m, inductor 17.5% peak mem -> triton 57.8% peak mem
+  - For example, on mxfp8_floor_dim_m, inductor 17.5% peak mem -> triton 59.9% peak mem
 * fp4
   - nvfp4_swizzle with plain pytorch ops: inductor 20.7% peak mem -> triton with inline asm 62.6% peak mem
 
 ## triton gaps vs SOL (CUDA / CUTLASS / cute)
 
 * reductions across M-dim, or K-dim and M-dim in the same kernel
-  - For example, on mxfp8_floor_dim_m, triton 57.8% peak mem -> CUDA 67.7% peak mem
+  - For example, on mxfp8_floor_dim_m, triton 59.9% peak mem -> CUDA 67.7% peak mem
 
     - The CUDA kernel writes quantized values directly into a transposed smem layout (out_colwise_sh[col][row]) and TMA-stores that smem tile. Triton has no
       user-facing __shared__ + __syncthreads(), so every transpose goes through the compiler's tl.trans — which either (a) produces the uncoalesced 21-sectors/request store, or (b) if you TMA-store it, pays a register→smem
@@ -75,17 +75,17 @@ fp32_to_bf16_sr_global_offsets         3.2413   496.9        6.2%  elementwise S
 shape: (16384, 16384)  mode: triton
 recipe                          gpu_time_ms    gbps    pct_peak  perf_description
 ----------------------------  -------------  ------  ----------  --------------------------------
-relu (baseline)                      0.1784  6019.7       75.2%
-fp8_tensorwise_precalc_scale         0.1422    5663       70.8%  elementwise
-mxfp8_floor_swizzle                  0.1248  6519.5       81.5%  (1,32) block, swizzle
-mxfp8_floor_dim_m                    0.1758  4628.5       57.9%  (32,1) block, t-contig
-mxfp8_32x32_floor                    0.1287  6258.3       78.2%  (32,32) block
-fp8_deepseek_1x128                   0.1341  6066.1       75.8%  (1,128) block
-fp8_deepseek_1x128_dim_m             0.1428  5696.8       71.2%  (128,1) block, t-contig
+relu (baseline)                      0.1783  6021.7       75.3%
+fp8_tensorwise_precalc_scale         0.1422  5663.9       70.8%  elementwise
+mxfp8_floor_swizzle                  0.1248  6517.8       81.5%  (1,32) block, swizzle
+mxfp8_floor_dim_m                    0.1697  4795.7       59.9%  (32,1) block, t-contig
+mxfp8_32x32_floor                    0.1287  6257.2       78.2%  (32,32) block
+fp8_deepseek_1x128                   0.1341  6067.3       75.8%  (1,128) block
+fp8_deepseek_1x128_dim_m             0.1429  5695.9       71.2%  (128,1) block, t-contig
 fp8_deepseek_128x128                 0.1306  6167.0       77.1%  (128,128) block
-fp8_rowwise                          0.1293  6227.6       77.8%  (1,-1) block
-fp8_colwise                          0.2844  2832.2       35.4%  (-1,1) block, t-contig
-nvfp4_swizzle                        0.1373  5011.5       62.6%  (1,16) block, fp4 qdata, swizzle
+fp8_rowwise                          0.1291  6237.9       78.0%  (1,-1) block
+fp8_colwise                          0.2845  2831.1       35.4%  (-1,1) block, t-contig
+nvfp4_swizzle                        0.1373  5010.9       62.6%  (1,16) block, fp4 qdata, swizzle
 ```
 
 ## Known issues
@@ -171,3 +171,34 @@ rand16 = (u * 65536).to(int32)
 
 </td></tr>
 </table>
+
+## Why `mxfp8_floor_dim_m` (59.9%) is slower than `fp8_deepseek_1x128_dim_m` (71.2%)
+
+Both are the same shape of kernel — load a bf16 tile, reduce down M per column, scale, `.to(fp8)`,
+transposed store — and both are memory-bound. The gap is entirely about **register pressure**, which
+decides whether you can afford a *tall* tile (good transposed-store coalescing) at high occupancy.
+
+* **deepseek is light:** one `amax` over the whole 128-row block → one fp32 scale/column, `x/scale`.
+  At a **128-row tile** it uses ~72 reg/thread → 40% occupancy **and** 128-wide coalesced stores
+  (~17.8 sectors/req) → **68.6% DRAM**. It gets both at once.
+* **mxfp8 is heavier:** it reshapes `(RB·32, BN) → (RB, 32, BN)`, reduces per **32-row sub-block**
+  (4 scales/column at RB=4, vs deepseek's 1), and quantizes to e8m0. At the same 128-row tile that
+  needs ~121–127 reg/thread → only ~23% occupancy → ~40–44% DRAM. So the autotuner is forced to a
+  **32-row tile**, which restores occupancy (~40%) but narrows the transposed store to 32-wide
+  (~21.3 sectors/req) → **~60% DRAM**. mxfp8 is stuck in an occupancy-vs-coalescing bind that
+  deepseek's lighter math avoids.
+
+ncu at a matched 128-row tile (`RB=4, BN=64`):
+
+| | reg/thread | occupancy | store sectors/req | DRAM % |
+|---|---|---|---|---|
+| deepseek (its real tile) | 72 | 40.5% | 17.8 | 68.6% |
+| mxfp8 (forced small tile) | 69 | 40.5% | 21.3 | 57–60% |
+| mxfp8 at deepseek's tile | 121–127 | 23.3% | 16.0 | 39–44% |
+
+The register cost is **structural, not the e8m0 math**: replacing the manual e8m0-floor bit
+extraction with the hardware `cvt.rz.satfinite.ue8m0x2.f32` instruction (see the mxfp8 kernel) only
+freed ~6 registers (127→121) and moved the number 57.9% → 59.9% — the bulk of the pressure is the
+fp32 working tile plus the `(RB,32,BN)` reshape and `tl.trans` transpose staging, plus holding 4×
+the per-column scale state. Closing the gap to deepseek would require cutting *that* (e.g. a
+shared-memory transpose to decouple store coalescing from tile height), not cheaper scale math.

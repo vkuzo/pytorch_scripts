@@ -433,6 +433,25 @@ def _amax_to_e8m0_floor_tl(amax):
 
 
 @triton.jit
+def _amax_to_e8m0_floor_cvt(amax):
+    # Blackwell (SM100+) hardware e8m0 FLOOR: `cvt.rz.satfinite.ue8m0x2.f32` rounds toward zero,
+    # which for a non-negative amax is exactly floor of the exponent. Prescale by 2**-8 to fold in
+    # the f8e4m3 max-pow2 offset, so cvt.rz.ue8m0(amax * 2**-8) = 2**(floor(log2 amax) - 8) as the
+    # biased e8m0 exponent -- matching _amax_to_e8m0_floor_tl without the register-heavy bit math.
+    # The x2 op packs two e8m0 into a .b16; we feed 0.0 as the high lane and keep the low byte.
+    a = (amax * 0.00390625).to(tl.float32)  # 2**-8
+    packed = tl.inline_asm_elementwise(
+        asm="cvt.rz.satfinite.ue8m0x2.f32 $0, 0f00000000, $1;",
+        constraints="=h,f",
+        args=[a],
+        dtype=tl.int16,
+        is_pure=True,
+        pack=1,
+    )
+    return packed.to(tl.int32) & 0xFF
+
+
+@triton.jit
 def _e8m0_to_fp32_tl(biased):
     # biased: int32 e8m0 exponent -> fp32 pow2 factor, clamped to the smallest normal.
     fp = (biased << 23).to(tl.float32, bitcast=True)
@@ -561,7 +580,7 @@ def _mxfp8_floor_dim_m_kernel(
     ).to(tl.float32)  # (128, BN)
     xr = tl.reshape(x, (RB, 32, BN))
     amax = tl.max(tl.abs(xr), axis=1)  # (RB, BN): per (row-block, col)
-    biased = _amax_to_e8m0_floor_tl(amax)  # (RB, BN)
+    biased = _amax_to_e8m0_floor_cvt(amax)  # (RB, BN); hardware cvt.rz e8m0 floor
     sfp = _e8m0_to_fp32_tl(biased)
     y = tl.reshape((xr / sfp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
     # transposed qdata store into (N, M): out[n, m] = y[m_in_tile, n]; 128-wide contiguous per row.
