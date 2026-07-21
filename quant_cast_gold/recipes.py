@@ -16,6 +16,49 @@ import torch.func._random as prng
 
 from quant_cast_gold.utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uint4
 
+# Optional hardware fp4 encode: PyTorch core exposes an `inline_asm_elementwise` higher-order op
+# (torch >= 2.12) that can emit `cvt.rn.satfinite.e2m1x2.f32` on Blackwell (SM100+). It only works
+# under torch.compile / fake-tensor tracing (the eager JITerator backend rejects the fp32->uint8
+# dtype change), so recipes gate its use behind `torch.compiler.is_compiling() or is_fake(...)` and
+# fall back to the pure-PyTorch bit-math path otherwise. Mirrors torchao's `_to_mx_rceil`.
+try:
+    from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwise
+    from torch._subclasses.fake_tensor import is_fake
+
+    _HAS_INLINE_ASM = True
+except Exception:  # pragma: no cover - older torch
+    _HAS_INLINE_ASM = False
+
+_SM100 = (
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+)
+
+
+def _f32_to_packed_fp4(data_scaled):
+    """fp32 (already clamped to +-6) -> packed nvfp4 bytes (two e2m1 per byte; even index -> low
+    nibble, odd -> high nibble, matching `pack_uint4(f32_to_f4_unpacked(...))`).
+
+    Under torch.compile on SM100+, uses the hardware `cvt.rn.satfinite.e2m1x2.f32` via the core
+    `inline_asm_elementwise` HOP; otherwise falls back to the pure-PyTorch bit-math encode.
+    """
+    if _HAS_INLINE_ASM and _SM100 and data_scaled.is_cuda and (
+        torch.compiler.is_compiling() or is_fake(data_scaled)
+    ):
+        even = data_scaled[..., 0::2].contiguous().to(torch.float32)  # -> low nibble ($2)
+        odd = data_scaled[..., 1::2].contiguous().to(torch.float32)   # -> high nibble ($1)
+        # cvt d, HI, LO : first source packs into the high nibble, second into the low nibble.
+        packed_u16 = inline_asm_elementwise(
+            odd,
+            even,
+            asm_str=(
+                "{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $1, $2; cvt.u16.u8 $0, t; }"
+            ),
+            constraints="=h,r,r",
+            dtype=torch.uint16,
+        )
+        return packed_u16.to(torch.uint8)
+    return pack_uint4(f32_to_f4_unpacked(data_scaled))
+
 
 @dataclass(frozen=True)
 class QuantCastSingleKernelGold:
@@ -746,7 +789,7 @@ def nvfp4_gs_swizzle_f(x, outer_scale, **kwargs):
     # cast: divide by (outer * inner), clamp to fp4 range, pack two per byte.
     reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
     data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
-    qdata_b = pack_uint4(f32_to_f4_unpacked(data_scaled)).view(torch.float4_e2m1fn_x2)
+    qdata_b = _f32_to_packed_fp4(data_scaled).view(torch.float4_e2m1fn_x2)
     qdata = qdata_b.reshape(*lead, last // 2)
     inner_swizzled = _to_blocked_4d(inner.squeeze(-1))
     return qdata, inner_swizzled
