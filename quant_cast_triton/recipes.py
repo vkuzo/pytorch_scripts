@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quant_cast_gold.recipes import (
     ColwiseFp8Gold,
     ColwisePrecalcGold,
+    Deepseek1x128DimKmGold,
     Deepseek1x128DimMGold,
     Deepseek1x128Gold,
     Deepseek128x128Gold,
@@ -291,6 +292,64 @@ def fp8_deepseek_1x128_dim_m_triton(x, **kwargs):
 
 FP8_DEEPSEEK_1X128_DIM_M = QuantCastTritonRecipe.from_gold(
     Deepseek1x128DimMGold, triton_fn=fp8_deepseek_1x128_dim_m_triton
+)
+
+
+# ---------------------------------------------------------------------------
+# deepseek fp8 1x128 in BOTH directions, ONE pass. Each program owns a 128x128 tile of x (read
+# once): dim-K reduces the 128 columns (one 1x128 block per row) and dim-M reduces the 128 rows
+# (one 128x1 block per column), so a single tile aligns both block reductions. Emits 4 outputs:
+# qdata_k (M,N)/scale_k (M,N//128) like fp8_deepseek_1x128, and qdata_m (N,M)/scale_m (N,M//128)
+# like fp8_deepseek_1x128_dim_m (transposed store). Requires M%128==0 and N%128==0.
+# Grid: (M // 128, N // 128).
+# ---------------------------------------------------------------------------
+@triton.autotune(
+    configs=[triton.Config({}, num_warps=w) for w in (2, 4, 8)], key=["M", "N"]
+)
+@triton.jit
+def _fp8_deepseek_1x128_dim_km_kernel(
+    x_ptr, yk_ptr, sk_ptr, ym_ptr, sm_ptr, M, N,
+    sxm, sxn, sykm, sykn, sskm, sskn, symn, symm, ssmn, ssmm,
+):
+    pid_m = tl.program_id(0)  # 128-row block
+    pid_n = tl.program_id(1)  # 128-col block
+    offs_m = pid_m * 128 + tl.arange(0, 128)
+    offs_n = pid_n * 128 + tl.arange(0, 128)
+    x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn).to(tl.float32)  # (128,128)
+    # dim-K: one 1x128 block per row -> reduce over the 128 columns (axis=1).
+    amax_k = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-12)  # (128,) per row
+    scale_k = amax_k / 448.0
+    yk = (x * (1.0 / scale_k)[:, None]).to(tl.float8e4nv)
+    tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, yk)
+    tl.store(sk_ptr + offs_m * sskm + pid_n * sskn, scale_k)
+    # dim-M: one 128x1 block per column -> reduce over the 128 rows (axis=0); transposed store.
+    amax_m = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-12)  # (128,) per column
+    scale_m = amax_m / 448.0
+    ym = (x * (1.0 / scale_m)[None, :]).to(tl.float8e4nv)  # (128,128) in (row, col)
+    # out[n, m] = ym[row, col] with n=offs_n[col], m=offs_m[row] -> store tl.trans(ym) into (N, M).
+    tl.store(ym_ptr + offs_n[:, None] * symn + offs_m[None, :] * symm, tl.trans(ym))
+    tl.store(sm_ptr + offs_n * ssmn + pid_m * ssmm, scale_m)
+
+
+def fp8_deepseek_1x128_dim_km_triton(x, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % 128 == 0 and N % 128 == 0, "dim_km kernel needs M%128==0 and N%128==0"
+    yk = torch.empty_like(x, dtype=torch.float8_e4m3fn)          # (M, N)
+    sk = torch.empty(M, N // 128, dtype=torch.float32, device=x.device)
+    ym = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)  # (N, M) transposed
+    sm = torch.empty(N, M // 128, dtype=torch.float32, device=x.device)
+    grid = (M // 128, N // 128)
+    _fp8_deepseek_1x128_dim_km_kernel[grid](
+        x, yk, sk, ym, sm, M, N,
+        x.stride(0), x.stride(1), yk.stride(0), yk.stride(1), sk.stride(0), sk.stride(1),
+        ym.stride(0), ym.stride(1), sm.stride(0), sm.stride(1),
+    )
+    return yk, sk, ym, sm
+
+
+FP8_DEEPSEEK_1X128_DIM_KM = QuantCastTritonRecipe.from_gold(
+    Deepseek1x128DimKmGold, triton_fn=fp8_deepseek_1x128_dim_km_triton
 )
 
 
@@ -868,6 +927,7 @@ ALL_RECIPES = [
     # 1x128, 8-bit
     ("fp8_deepseek_1x128", FP8_DEEPSEEK_1X128),
     ("fp8_deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
+    ("fp8_deepseek_1x128_dim_km", FP8_DEEPSEEK_1X128_DIM_KM),
     # 128x128, 8-bit
     ("fp8_deepseek_128x128", FP8_DEEPSEEK_128X128),
     # rowwise/colwise, 8-bit
