@@ -357,7 +357,19 @@ FP8_ROWWISE = QuantCastTritonRecipe.from_gold(RowwiseFp8Gold, triton_fn=fp8_roww
 # ---------------------------------------------------------------------------
 # fp8 colwise (full-span): one fp32 scale per column, amax over ALL rows; transposed-contiguous
 # output (N, M) and scale (N, 1). Two passes over M. Mirrors colwise_fp8_f. Grid: (cdiv(N, BN),).
+# Perf: like rowwise, eviction hints keep the amax pass resident (evict_last) for the quant pass
+# (evict_first); autotune (BM, BN). The (BM, BN) tile is transposed in registers (tl.trans) so the
+# store to the (N, M) output is a coalesced BM-wide run per output row.
 # ---------------------------------------------------------------------------
+_COLWISE_CONFIGS = [
+    triton.Config({"BM": bm, "BN": bn}, num_warps=w)
+    for bm in (256, 512, 1024)
+    for bn in (16, 32, 64)
+    for w in (4, 8)
+]
+
+
+@triton.autotune(configs=_COLWISE_CONFIGS, key=["M", "N"])
 @triton.jit
 def _fp8_colwise_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, BM: tl.constexpr, BN: tl.constexpr):
     pid_n = tl.program_id(0)
@@ -369,7 +381,7 @@ def _fp8_colwise_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, BM: tl.co
         m_mask = offs_m < M
         x = tl.load(
             x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn,
-            mask=m_mask[:, None] & n_mask[None, :], other=0.0,
+            mask=m_mask[:, None] & n_mask[None, :], other=0.0, eviction_policy="evict_last",
         ).to(tl.float32)
         amax = tl.maximum(amax, tl.max(tl.abs(x), axis=0))
     amax = tl.maximum(amax, 1e-12)
@@ -379,7 +391,10 @@ def _fp8_colwise_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, BM: tl.co
         offs_m = i * BM + tl.arange(0, BM)
         m_mask = offs_m < M
         mask = m_mask[:, None] & n_mask[None, :]
-        x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=mask).to(tl.float32)
+        x = tl.load(
+            x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=mask,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
         y = (x * inv[None, :]).to(tl.float8e4nv)  # (BM, BN)
         out_off = offs_n[:, None] * sym + offs_m[None, :] * syn  # transposed (N, M)
         tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None] & m_mask[None, :])
@@ -391,9 +406,9 @@ def fp8_colwise_triton(x, **kwargs):
     M, N = x.shape
     y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     s = torch.empty(N, 1, dtype=torch.float32, device=x.device)
-    grid = (triton.cdiv(N, 32),)
+    grid = lambda meta: (triton.cdiv(N, meta["BN"]),)  # noqa: E731
     _fp8_colwise_kernel[grid](
-        x, y, s, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1), BM=256, BN=32
+        x, y, s, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1)
     )
     return y, s
 
@@ -463,22 +478,34 @@ MXFP8_FLOOR = QuantCastTritonRecipe.from_gold(Mxfp8FloorGold, triton_fn=mxfp8_fl
 
 # ---------------------------------------------------------------------------
 # mxfp8 FLOOR 32x32: one e8m0 scale per 32x32 block. Mirrors mxfp8_32x32_floor_f.
-# Grid: (M // 32, N // 32).
+# Perf: one 32x32 block per program is tiny/low-intensity. Batch CB col-blocks per program
+# (32 rows x CB*32 cols), reshaping to (32, CB, 32) and reducing the row + within-block dims;
+# autotune CB and num_warps. Grid: (M // 32, cdiv(N, CB*32)).
 # ---------------------------------------------------------------------------
+_MXFP8_32X32_CONFIGS = [
+    triton.Config({"CB": cb}, num_warps=w) for cb in (2, 4, 8, 16) for w in (2, 4, 8)
+]
+
+
+@triton.autotune(configs=_MXFP8_32X32_CONFIGS, key=["M", "N"])
 @triton.jit
-def _mxfp8_32x32_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * 32 + tl.arange(0, 32)
-    offs_n = pid_n * 32 + tl.arange(0, 32)
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=mask).to(tl.float32)
-    amax = tl.max(tl.abs(x))  # scalar over the whole 32x32 block
-    biased = _amax_to_e8m0_floor_tl(amax)
+def _mxfp8_32x32_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn, CB: tl.constexpr):
+    pid_rb = tl.program_id(0)  # 32-row block
+    pid_cb = tl.program_id(1)  # group of CB 32-col blocks
+    offs_m = pid_rb * 32 + tl.arange(0, 32)
+    offs_n = pid_cb * (CB * 32) + tl.arange(0, CB * 32)
+    n_mask = offs_n < N
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=n_mask[None, :], other=0.0
+    ).to(tl.float32)  # (32, CB*32)
+    xr = tl.reshape(x, (32, CB, 32))
+    amax = tl.max(tl.max(tl.abs(xr), axis=2), axis=0)  # (CB,): within-block cols, then 32 rows
+    biased = _amax_to_e8m0_floor_tl(amax)  # (CB,)
     sfp = _e8m0_to_fp32_tl(biased)
-    y = (x / sfp).to(tl.float8e4nv)
-    tl.store(y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn, y, mask=mask)
-    tl.store(s_ptr + pid_m * ssm + pid_n * ssn, biased.to(tl.uint8))
+    y = tl.reshape((xr / sfp[None, :, None]).to(tl.float8e4nv), (32, CB * 32))
+    tl.store(y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn, y, mask=n_mask[None, :])
+    s_cols = pid_cb * CB + tl.arange(0, CB)
+    tl.store(s_ptr + pid_rb * ssm + s_cols * ssn, biased.to(tl.uint8), mask=s_cols < (N // 32))
 
 
 def mxfp8_32x32_floor_triton(x, **kwargs):
@@ -486,7 +513,7 @@ def mxfp8_32x32_floor_triton(x, **kwargs):
     M, N = x.shape
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s_u8 = torch.empty(M // 32, N // 32, dtype=torch.uint8, device=x.device)
-    grid = (M // 32, N // 32)
+    grid = lambda meta: (M // 32, triton.cdiv(N, meta["CB"] * 32))  # noqa: E731
     _mxfp8_32x32_kernel[grid](
         x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1),
         s_u8.stride(0), s_u8.stride(1),
@@ -501,34 +528,54 @@ MXFP8_32X32_FLOOR = QuantCastTritonRecipe.from_gold(
 
 # ---------------------------------------------------------------------------
 # mxfp8 FLOOR dim-M: 32-row blocks down M, one e8m0 scale per (32-row-block, col); transposed
-# outputs (N, M) / (N, M//32). Mirrors mxfp8_floor_dim_m_f. Grid: (M // 32, cdiv(N, BN)).
+# outputs (N, M) / (N, M//32). Mirrors mxfp8_floor_dim_m_f.
+# Perf: process RB=4 row-blocks (128 rows) x BN cols per program so the transposed store writes
+# 128-wide contiguous runs per output row (was 32-wide); reshape (128, BN) -> (4, 32, BN) and
+# reduce the within-block 32. Requires M % 128 == 0. Grid: (M // 128, cdiv(N, BN)).
 # ---------------------------------------------------------------------------
+_DIM_M_CONFIGS = [
+    triton.Config({"BN": bn}, num_warps=w) for bn in (32, 64, 128, 256) for w in (2, 4, 8)
+]
+
+
+@triton.autotune(configs=_DIM_M_CONFIGS, key=["M", "N"])
 @triton.jit
 def _mxfp8_floor_dim_m_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn, BN: tl.constexpr):
+    RB: tl.constexpr = 4  # 32-row blocks per program (128 rows)
     pid_rb = tl.program_id(0)
     pid_n = tl.program_id(1)
-    offs_m = pid_rb * 32 + tl.arange(0, 32)
+    offs_m = pid_rb * (RB * 32) + tl.arange(0, RB * 32)  # 128 rows
     offs_n = pid_n * BN + tl.arange(0, BN)
     n_mask = offs_n < N
-    x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=n_mask[None, :]).to(tl.float32)
-    amax = tl.max(tl.abs(x), axis=0)  # (BN,) per column
-    biased = _amax_to_e8m0_floor_tl(amax)
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=n_mask[None, :]
+    ).to(tl.float32)  # (128, BN)
+    xr = tl.reshape(x, (RB, 32, BN))
+    amax = tl.max(tl.abs(xr), axis=1)  # (RB, BN): per (row-block, col)
+    biased = _amax_to_e8m0_floor_tl(amax)  # (RB, BN)
     sfp = _e8m0_to_fp32_tl(biased)
-    y = (x / sfp[None, :]).to(tl.float8e4nv)  # (32, BN)
-    out_off = offs_n[:, None] * sym + offs_m[None, :] * syn  # transposed (N, M)
+    y = tl.reshape((xr / sfp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
+    # transposed qdata store into (N, M): out[n, m] = y[m_in_tile, n]; 128-wide contiguous per row.
+    out_off = offs_n[:, None] * sym + offs_m[None, :] * syn
     tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None])
-    tl.store(s_ptr + offs_n * ssm + pid_rb * ssn, biased.to(tl.uint8), mask=n_mask)
+    # transposed scale store into (N, M//32): out_scale[n, pid_rb*RB + rb] = biased[rb, n]
+    s_cols = pid_rb * RB + tl.arange(0, RB)
+    tl.store(
+        s_ptr + offs_n[:, None] * ssm + s_cols[None, :] * ssn, tl.trans(biased.to(tl.uint8)),
+        mask=n_mask[:, None],
+    )
 
 
 def mxfp8_floor_dim_m_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
+    assert M % 128 == 0, "mxfp8_floor_dim_m fast kernel needs M%128==0"
     y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     s_u8 = torch.empty((N, M // 32), dtype=torch.uint8, device=x.device)
-    grid = (M // 32, triton.cdiv(N, 64))
+    grid = lambda meta: (M // 128, triton.cdiv(N, meta["BN"]))  # noqa: E731
     _mxfp8_floor_dim_m_kernel[grid](
         x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1),
-        s_u8.stride(0), s_u8.stride(1), BN=64,
+        s_u8.stride(0), s_u8.stride(1),
     )
     return y, s_u8.view(torch.float8_e8m0fnu)
 
