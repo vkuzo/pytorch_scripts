@@ -63,9 +63,14 @@ def _bench_one(recipe, M, K, mode):
     torch.manual_seed(0)
     torch._dynamo.reset()
     inputs = recipe.example_input_fn(M, K)  # (x, *aux)
-    # "compile": torch.compile the plain-PyTorch reference fn. "triton": run the recipe's
-    # hand-written Triton kernel directly (QuantCastTritonRecipe.triton_fn).
-    fn = recipe.triton_fn if mode == "triton" else torch.compile(recipe.pt_ref_fn, fullgraph=True)
+    # "triton"/"cute": run the recipe's hand-written kernel directly; "compile": torch.compile the
+    # plain-PyTorch reference fn.
+    if mode == "triton":
+        fn = recipe.triton_fn
+    elif mode == "cute":
+        fn = recipe.cute_fn
+    else:
+        fn = torch.compile(recipe.pt_ref_fn, fullgraph=True)
 
     def run():
         return fn(*inputs)
@@ -94,13 +99,17 @@ def main(
     assert "B200" in device_name, f"this benchmark assumes B200, got {device_name!r}"
 
     mode = mode or "compile"
-    assert mode in ("compile", "triton"), f"mode must be 'compile' or 'triton', got {mode!r}"
+    assert mode in ("compile", "triton", "cute"), (
+        f"mode must be 'compile', 'triton', or 'cute', got {mode!r}"
+    )
 
-    # "compile" sweeps the gold recipes (torch.compile their pt_ref_fn); "triton" sweeps the
-    # QuantCastTritonRecipe set (run their hand-written triton_fn). Both recipe kinds carry
-    # example_input_fn / perf_description, so the rest of the sweep is identical.
+    # "compile" sweeps the gold recipes (torch.compile their pt_ref_fn); "triton"/"cute" sweep the
+    # hand-written kernel sets (triton_fn / cute_fn). All recipe kinds carry example_input_fn /
+    # perf_description, so the rest of the sweep is identical.
     if mode == "triton":
         from quant_cast_triton.recipes import ALL_RECIPES as recipes_all
+    elif mode == "cute":
+        from quant_cast_cute.recipes import ALL_RECIPES as recipes_all
     else:
         recipes_all = ALL_RECIPES
 
