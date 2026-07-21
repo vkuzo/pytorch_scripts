@@ -529,19 +529,28 @@ MXFP8_32X32_FLOOR = QuantCastTritonRecipe.from_gold(
 # ---------------------------------------------------------------------------
 # mxfp8 FLOOR dim-M: 32-row blocks down M, one e8m0 scale per (32-row-block, col); transposed
 # outputs (N, M) / (N, M//32). Mirrors mxfp8_floor_dim_m_f.
-# Perf: process RB=4 row-blocks (128 rows) x BN cols per program so the transposed store writes
-# 128-wide contiguous runs per output row (was 32-wide); reshape (128, BN) -> (4, 32, BN) and
-# reduce the within-block 32. Requires M % 128 == 0. Grid: (M // 128, cdiv(N, BN)).
+# Perf: process RB 32-row blocks x BN cols per program; reshape (RB*32, BN) -> (RB, 32, BN) and
+# reduce the within-block 32. This kernel is memory-bound and OCCUPANCY-limited: the fp32 tile is
+# register-heavy, so a large (RB*32, BN) tile spills registers and collapses occupancy (ncu: RB=4
+# BN=128 -> 210 reg/thread, 12% warps active, 30% DRAM). Bandwidth here comes from device-wide
+# TMA/load parallelism = occupancy (see the tma_occupancy_not_pipelining note), NOT from wider
+# coalesced stores -- shrinking the tile *worsens* store coalescing yet nearly doubles BW (RB=1
+# BN=64 W=1 -> 69 reg/thread, 40% warps active, 57% DRAM). So we autotune RB (not fix it) and
+# include few-warp configs. Requires M % 128 == 0. Grid: (M // (RB*32), cdiv(N, BN)).
 # ---------------------------------------------------------------------------
 _DIM_M_CONFIGS = [
-    triton.Config({"BN": bn}, num_warps=w) for bn in (32, 64, 128, 256) for w in (2, 4, 8)
+    triton.Config({"BN": bn, "RB": rb}, num_warps=w)
+    for rb in (1, 2, 4)
+    for bn in (32, 64, 128, 256)
+    for w in (1, 2, 4)
 ]
 
 
 @triton.autotune(configs=_DIM_M_CONFIGS, key=["M", "N"])
 @triton.jit
-def _mxfp8_floor_dim_m_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn, BN: tl.constexpr):
-    RB: tl.constexpr = 4  # 32-row blocks per program (128 rows)
+def _mxfp8_floor_dim_m_kernel(
+    x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn, BN: tl.constexpr, RB: tl.constexpr
+):
     pid_rb = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_rb * (RB * 32) + tl.arange(0, RB * 32)  # 128 rows
@@ -572,7 +581,7 @@ def mxfp8_floor_dim_m_triton(x, **kwargs):
     assert M % 128 == 0, "mxfp8_floor_dim_m fast kernel needs M%128==0"
     y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     s_u8 = torch.empty((N, M // 32), dtype=torch.uint8, device=x.device)
-    grid = lambda meta: (M // 128, triton.cdiv(N, meta["BN"]))  # noqa: E731
+    grid = lambda meta: (M // (meta["RB"] * 32), triton.cdiv(N, meta["BN"]))  # noqa: E731
     _mxfp8_floor_dim_m_kernel[grid](
         x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1),
         s_u8.stride(0), s_u8.stride(1),
