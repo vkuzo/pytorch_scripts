@@ -14,7 +14,7 @@ for the shape.
 * reductions across M-dim, or K-dim and M-dim in the same kernel
   - For example, on mxfp8_floor_dim_m, inductor 17.5% peak mem -> triton 59.9% peak mem
 * fp4
-  - nvfp4_swizzle with plain pytorch ops: inductor 20.7% peak mem -> triton with inline asm 62.6% peak mem
+  - nvfp4_swizzle: inductor 23.3% peak mem -> triton 62.6% peak mem
 
 ## triton gaps vs SOL (CUDA / CUTLASS / cute)
 
@@ -63,7 +63,7 @@ fp8_deepseek_1x128_dim_m               0.2466  3299.6       41.2%  (128,1) block
 fp8_deepseek_128x128                    0.227  3548.3       44.4%  (128,128) block
 fp8_rowwise                            0.1225    6577       82.2%  (1,-1) block
 fp8_colwise                            0.3873  2079.6       26.0%  (-1,1) block, t-contig
-nvfp4_swizzle                          0.4151  1657.2       20.7%  (1,16) block, fp4 qdata, swizzle
+nvfp4_swizzle                          0.3692  1863.0       23.3%  (1,16) block, fp4 qdata, swizzle
 bf16_rht                               0.4595  2336.5       29.2%  elementwise RHT
 fp32_to_bf16_sr                        1.0288  1565.6       19.6%
 fp32_to_bf16_sr_global_offsets         3.2413   496.9        6.2%  elementwise SR with stateless RNG
