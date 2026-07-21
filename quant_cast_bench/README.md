@@ -54,20 +54,21 @@ shape: (16384, 16384)  mode: compile
 recipe                            gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------------  -------------  ------  ----------  -------------------------------------------------
 relu (baseline)                        0.1792  5993.2       74.9%
-fp8_tensorwise_precalc_scale           0.1431  5629.1       70.4%  elementwise
-mxfp8_floor_swizzle                      0.13  6256.8       78.2%  (1,32) block, swizzle
-mxfp8_floor_dim_m                       0.581  1400.5       17.5%  (32,1) block, t-contig
-mxfp8_32x32_floor                      0.3793  2123.8       26.5%  (32,32) block
-fp8_deepseek_1x128                     0.1319  6171.2       77.1%  (1,128) block
-fp8_deepseek_1x128_dim_m               0.2498  3257.3       40.7%  (128,1) block, t-contig
-fp8_deepseek_1x128_dim_km              0.3808  2863.6       35.8%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-fp8_deepseek_128x128                    0.227  3547.4       44.3%  (128,128) block
-fp8_rowwise                            0.1224  6578.3       82.2%  (1,-1) block
-fp8_colwise                            0.3929  2049.9       25.6%  (-1,1) block, t-contig
-nvfp4_swizzle                          0.3658  1880.5       23.5%  (1,16) block, fp4 qdata, swizzle
-bf16_rht                               0.4597    2336       29.2%  elementwise RHT
-fp32_to_bf16_sr                        0.6821  2361.3       29.5%
-fp32_to_bf16_sr_global_offsets         2.8957   556.2        7.0%  elementwise SR with stateless RNG
+fp8_tensorwise_precalc_scale            0.143  5632.1       70.4%  elementwise
+mxfp8_floor_swizzle                    0.1301  6256.2       78.2%  (1,32) block, swizzle
+mxfp8_floor_dim_m                      0.5811  1400.3       17.5%  (32,1) block, t-contig
+mxfp8_floor_dim_km                     0.7127  1530.1       19.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                      0.3793  2123.7       26.5%  (32,32) block
+fp8_deepseek_1x128                     0.1318  6171.9       77.1%  (1,128) block
+fp8_deepseek_1x128_dim_m               0.2498  3257.7       40.7%  (128,1) block, t-contig
+fp8_deepseek_1x128_dim_km              0.3808  2863.4       35.8%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+fp8_deepseek_128x128                    0.227    3548       44.4%  (128,128) block
+fp8_rowwise                            0.1224  6577.4       82.2%  (1,-1) block
+fp8_colwise                            0.3928  2050.4       25.6%  (-1,1) block, t-contig
+nvfp4_swizzle                          0.3658  1880.2       23.5%  (1,16) block, fp4 qdata, swizzle
+bf16_rht                               0.4596  2336.1       29.2%  elementwise RHT
+fp32_to_bf16_sr                        0.6822    2361       29.5%
+fp32_to_bf16_sr_global_offsets         2.8956   556.2        7.0%  elementwise SR with stateless RNG
 ```
 
 ### `--mode triton`
@@ -80,6 +81,7 @@ relu (baseline)                      0.1792  5992.8       74.9%
 fp8_tensorwise_precalc_scale         0.1422    5663       70.8%  elementwise
 mxfp8_floor_swizzle                  0.1248  6518.6       81.5%  (1,32) block, swizzle
 mxfp8_floor_dim_m                    0.1692  4810.2       60.1%  (32,1) block, t-contig
+mxfp8_floor_dim_km                   0.2893  3769.3       47.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
 mxfp8_32x32_floor                    0.1287  6257.8       78.2%  (32,32) block
 fp8_deepseek_1x128                   0.1341    6068       75.9%  (1,128) block
 fp8_deepseek_1x128_dim_m             0.1506  5404.2       67.6%  (128,1) block, t-contig
@@ -146,6 +148,17 @@ nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, f
   for dim-M), and all four outputs are written (dim-M transposed). It lands near the standalone
   `fp8_deepseek_1x128_dim_m` (~68%) rather than the standalone dim-K (~76%), because the transposed
   dim-M store is the binding cost — dim-K rides the already-loaded tile essentially for free.
+
+* `mxfp8_floor_dim_km` (compile ~19.1%, triton ~47.1%) — the mxfp8-floor analog of the above (1×32
+  dim-K + 32×1 dim-M, e8m0 scales). Same story under compile: inductor generates **3 kernels reading
+  `x` 3×** (dim-K fused reduce+quantize; dim-M amax reduction; dim-M quantize+transpose). The
+  hand-written Triton kernel does the single pass. A first fixed **32×32 tile** version only reached
+  ~30.9% (the transposed dim-M store is only 32-wide, poorly coalesced, and each program does little
+  work); switching to **blocked tiles** (autotuned `RB` 32-row blocks × `BN` cols, reshape per
+  direction — the same lever that fixed `mxfp8_floor_dim_m`) widens the dim-M store and raises
+  occupancy, reaching **47.1%**. Still below deepseek's dim_km (57.8%) because the 32-block
+  granularity means 4× as many e8m0 scales (M/32 vs M/128) plus the per-scale e8m0 bit-math, and the
+  transposed dim-M store remains the binding cost.
 
 * `fp32_to_bf16_sr_global_offsets` (compile) runs at only ~6.2% peak — ~3.2× slower than
   `fp32_to_bf16_sr` (19.6%) for identical dithering math. The difference is how the Philox draw is
